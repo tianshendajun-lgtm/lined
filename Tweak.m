@@ -195,56 +195,92 @@ static void replaceDirFromSrc(NSString *src, NSString *dst) {
     copyDirContents(src, dst);
 }
 
-// 把真实运行态 Talk 数据写回指定槽（登录态/聊天记录持久化）
+// 把真实运行态数据写回指定槽（登录态/聊天记录/附件持久化）
 static void persistRealTalkDataToSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
     ensureSlotDirectories(slot);
 
-    NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
-    NSString *slotAS = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support"];
-    mkdirp(slotAS);
+    NSString *realHome = realHomePath();
+    NSString *slotHome = slotHomePath(slot);
 
-    NSArray *names = @[@"Messages", @"PrivateStore", @"PublicStore"];
-    for (NSString *name in names) {
+    // Application Support 子树
+    NSString *realAS = [realHome stringByAppendingPathComponent:@"Library/Application Support"];
+    NSString *slotAS = [slotHome stringByAppendingPathComponent:@"Library/Application Support"];
+    mkdirp(slotAS);
+    for (NSString *name in @[@"Messages", @"PrivateStore", @"PublicStore"]) {
         NSString *src = [realAS stringByAppendingPathComponent:name];
         NSString *dst = [slotAS stringByAppendingPathComponent:name];
         const char *c = [src fileSystemRepresentation];
         struct stat st;
         if (!c || lstat(c, &st) != 0) continue;
-        if (S_ISLNK(st.st_mode)) {
-            unlink(c);
-            continue;
-        }
+        if (S_ISLNK(st.st_mode)) { unlink(c); continue; }
         if (!S_ISDIR(st.st_mode)) continue;
         replaceDirFromSrc(src, dst);
-        NSLog(@"[LineAccount] persist %@ real -> slot %ld", name, (long)slot);
+        NSLog(@"[LineAccount] persist AS/%@ -> slot %ld", name, (long)slot);
+    }
+
+    // Preferences / Documents：登录态与聊天附件（CFPreferences 也在真实 Preferences）
+    for (NSString *rel in @[@"Library/Preferences", @"Documents"]) {
+        NSString *src = [realHome stringByAppendingPathComponent:rel];
+        NSString *dst = [slotHome stringByAppendingPathComponent:rel];
+        const char *c = [src fileSystemRepresentation];
+        struct stat st;
+        if (!c || lstat(c, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        replaceDirFromSrc(src, dst);
+        NSLog(@"[LineAccount] persist %@ -> slot %ld", rel, (long)slot);
     }
 }
 
 static void loadTalkDataFromSlotToReal(NSInteger slot) {
-    NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
-    NSString *slotAS = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support"];
+    NSString *realHome = realHomePath();
+    NSString *slotHome = slotHomePath(slot);
+    NSString *realAS = [realHome stringByAppendingPathComponent:@"Library/Application Support"];
+    NSString *slotAS = [slotHome stringByAppendingPathComponent:@"Library/Application Support"];
     mkdirp(realAS);
 
-    NSArray *names = @[@"Messages", @"PrivateStore", @"PublicStore"];
-    for (NSString *name in names) {
+    for (NSString *name in @[@"Messages", @"PrivateStore", @"PublicStore"]) {
         NSString *src = [slotAS stringByAppendingPathComponent:name];
         NSString *dst = [realAS stringByAppendingPathComponent:name];
-        // 先清真实目录，再按槽位恢复（空槽 = 新号）
         removePathPOSIX(dst);
         mkdirp(dst);
         NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:src error:nil];
         if (items.count > 0) {
             copyDirContents(src, dst);
-            NSLog(@"[LineAccount] load %@ slot %ld -> real (%lu)", name, (long)slot, (unsigned long)items.count);
+            NSLog(@"[LineAccount] load AS/%@ slot %ld -> real (%lu)", name, (long)slot, (unsigned long)items.count);
         } else {
             if ([name isEqualToString:@"PrivateStore"]) {
                 mkdirp([dst stringByAppendingPathComponent:@"t0"]);
             }
-            NSLog(@"[LineAccount] fresh %@ for slot %ld", name, (long)slot);
+            NSLog(@"[LineAccount] fresh AS/%@ for slot %ld", name, (long)slot);
         }
         NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
         [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:dst error:nil];
+    }
+
+    for (NSString *rel in @[@"Library/Preferences", @"Documents"]) {
+        NSString *src = [slotHome stringByAppendingPathComponent:rel];
+        NSString *dst = [realHome stringByAppendingPathComponent:rel];
+        NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:src error:nil];
+        // Preferences/Documents 不能整目录删（系统/其它进程可能占用）；有槽数据才覆盖拷贝
+        if (items.count == 0) {
+            mkdirp(dst);
+            NSLog(@"[LineAccount] fresh %@ for slot %ld (keep existing real if any)", rel, (long)slot);
+            continue;
+        }
+        mkdirp(dst);
+        // 覆盖同名文件
+        for (NSString *name in items) {
+            // 不碰我们自己的 meta（若误放在 Preferences）
+            if ([name hasPrefix:@"LineAccount"]) continue;
+            NSString *s = [src stringByAppendingPathComponent:name];
+            NSString *d = [dst stringByAppendingPathComponent:name];
+            removePathPOSIX(d);
+            NSError *e = nil;
+            if (![[NSFileManager defaultManager] copyItemAtPath:s toPath:d error:&e]) {
+                NSLog(@"[LineAccount] load %@ fail %@ err=%@", rel, name, e);
+            }
+        }
+        NSLog(@"[LineAccount] load %@ slot %ld -> real (%lu)", rel, (long)slot, (unsigned long)items.count);
     }
 }
 
@@ -450,27 +486,16 @@ static BOOL pathNeedsRemap(NSString *path) {
     if ([path containsString:SLOT_DIR_NAME]) return NO;
     if (g_selectedSlot < 1) return NO;
 
-    // App Group 始终进槽位
+    // 仅隔离「真·Group Containers」路径到槽位 AppGroup。
+    // Documents / Preferences / Caches / Application Support 一律走真实 Home：
+    // - NSHomeDirectory() 未 hook，FM remap 会造成「库在真实路径、附件在槽路径」→ 进聊天闪退
+    // - CFPreferences/NSUserDefaults 不走 NSFileManager，remap Preferences 也无法隔离登录态
     if ([path containsString:@"/Library/Group Containers/"] ||
         [path containsString:@"group.com.linecorp"]) {
-        return YES;
+        // 但 containerURL 已返回真实 Home 时，其下的 group 字符串可能误伤 — 仅匹配系统 Group Containers
+        if ([path containsString:@"/Library/Group Containers/"]) return YES;
     }
 
-    NSString *home = realHomePath();
-    if (![path hasPrefix:home]) return NO;
-
-    // ★ Core Data Talk DB：Library/Application Support 整棵树不 remap
-    // 之前只放行 Messages，父目录/其它子路径仍被映到槽里 → 创建 Line.sqlite ENOENT(2)
-    if ([path containsString:@"/Library/Application Support"]) return NO;
-
-    // 仅隔离这些目录到槽位
-    if ([path containsString:@"/Documents"]) return YES;
-    if ([path containsString:@"/Library/Caches"]) return YES;
-    if ([path containsString:@"/Library/Preferences"]) return YES;
-    if ([path containsString:@"/tmp"] || [path hasSuffix:@"/tmp"] ||
-        [path containsString:@"/TemporaryItems"]) return YES;
-
-    // 默认不 remap，避免再踩 Core Data / 系统路径
     return NO;
 }
 
