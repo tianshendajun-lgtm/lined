@@ -340,18 +340,27 @@ static BOOL pathNeedsRemap(NSString *path) {
     if ([path containsString:SLOT_DIR_NAME]) return NO;
     if (g_selectedSlot < 1) return NO;
 
-    NSString *home = realHomePath();
-    NSString *realAS = [home stringByAppendingPathComponent:@"Library/Application Support"];
-    // 父目录必须留在真实 Home：否则 Messages/Line.sqlite 创建 → ENOENT(2) → unauthorize → exit(0)
-    if ([path isEqualToString:realAS]) return NO;
-    // Talk DB 全程走真实 Messages（选账号时与槽位互相同步），禁止 remap
-    if ([path containsString:@"/Library/Application Support/Messages"]) return NO;
-
-    if ([path hasPrefix:home]) return YES;
+    // App Group 始终进槽位
     if ([path containsString:@"/Library/Group Containers/"] ||
         [path containsString:@"group.com.linecorp"]) {
         return YES;
     }
+
+    NSString *home = realHomePath();
+    if (![path hasPrefix:home]) return NO;
+
+    // ★ Core Data Talk DB：Library/Application Support 整棵树不 remap
+    // 之前只放行 Messages，父目录/其它子路径仍被映到槽里 → 创建 Line.sqlite ENOENT(2)
+    if ([path containsString:@"/Library/Application Support"]) return NO;
+
+    // 仅隔离这些目录到槽位
+    if ([path containsString:@"/Documents"]) return YES;
+    if ([path containsString:@"/Library/Caches"]) return YES;
+    if ([path containsString:@"/Library/Preferences"]) return YES;
+    if ([path containsString:@"/tmp"] || [path hasSuffix:@"/tmp"] ||
+        [path containsString:@"/TemporaryItems"]) return YES;
+
+    // 默认不 remap，避免再踩 Core Data / 系统路径
     return NO;
 }
 
@@ -547,6 +556,9 @@ static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL interm
         return NO;
     }
     NSString *mapped = remapPath(path);
+    if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
+        mkdirp(mapped);
+    }
     if (mapped && ![mapped isEqualToString:path]) {
         url = [NSURL fileURLWithPath:mapped isDirectory:YES];
     }
@@ -562,8 +574,14 @@ static BOOL hooked_createDirectory(id self, SEL _cmd, NSString *path, BOOL inter
         }
         return NO;
     }
+    NSString *mapped = remapPath(path);
+    // Talk DB 相关：强制建齐父目录
+    if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
+        mkdirp(mapped);
+        NSLog(@"[LineAccount] createDir ensure %@", mapped);
+    }
     return ((BOOL(*)(id,SEL,NSString*,BOOL,NSDictionary*,NSError**))orig_createDirectory)
-        (self, _cmd, remapPath(path), intermediates, attr, err);
+        (self, _cmd, mapped, intermediates, attr, err);
 }
 
 static BOOL hooked_fileExists(id self, SEL _cmd, NSString *path) {
@@ -604,8 +622,16 @@ static BOOL hooked_moveItem(id self, SEL _cmd, NSString *src, NSString *dst, NSE
 static BOOL hooked_createFile(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) {
     path = pathFromMaybeBogus(path);
     if (path.length == 0) return NO;
-    return ((BOOL(*)(id,SEL,NSString*,NSData*,NSDictionary*))orig_createFile)
-        (self, _cmd, remapPath(path), data, attr);
+    NSString *mapped = remapPath(path);
+    if ([mapped containsString:@"Line.sqlite"] || [mapped containsString:@"/Messages"] ||
+        [mapped containsString:@"talk.sqlite"]) {
+        mkdirp([mapped stringByDeletingLastPathComponent]);
+        NSLog(@"[LineAccount] createFile %@", mapped);
+    }
+    BOOL ok = ((BOOL(*)(id,SEL,NSString*,NSData*,NSDictionary*))orig_createFile)
+        (self, _cmd, mapped, data, attr);
+    if (!ok) NSLog(@"[LineAccount] createFile FAIL %@", mapped);
+    return ok;
 }
 
 typedef BOOL (*ItemAtURL_t)(id, SEL, NSURL *, NSError **);
