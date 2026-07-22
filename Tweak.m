@@ -1416,7 +1416,7 @@ static void enterAccountSlot(NSInteger slot);
     [self.view addSubview:title];
 
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectZero];
-    sub.text = @"选完直接进入；换号请完全退出 App 再打开";
+    sub.text = @"选完会退出一次，再打开即进入该账号；换号请完全退出后再开";
     sub.textColor = [UIColor colorWithWhite:1 alpha:0.85];
     sub.font = [UIFont systemFontOfSize:14];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -1630,22 +1630,19 @@ static void resumeLINELaunch(void) {
 static void enterAccountSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
 
-    // ★ 选完立刻激活槽位重定向，再放行 LINE —— 此时 LINE 还没读库（若 defer 成功）
+    // ★ 选账号后必须冷启动进槽：中途改 NSHomeDirectory / 放行 didFinish 会秒崩
+    //   （Frida：resume didFinishLaunching 后 ensurePrivateStoreDir FAIL → 进程没）
     ensureSlotDirectories(slot);
     [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
 
-    g_selectedSlot = slot;
-    installHomeDirectoryHook();   // NSHomeDirectory → account_N
-    installLineFileManagerHooks(); // privateFileStoresAreAccessible=YES
-    installTalkDBAccountHooks();
-
     NSMutableDictionary *meta = loadMeta();
     meta[@"selectedSlot"] = @(slot);
-    meta[@"pendingEnter"] = @NO;
+    meta[@"pendingEnter"] = @YES;
     saveMeta(meta);
 
-    NSLog(@"[LineAccount] selected slot %ld — remap ON, resume LINE (no file sync)", (long)slot);
-    resumeLINELaunch();
+    NSLog(@"[LineAccount] selected slot %ld — pendingEnter, exit for clean launch", (long)slot);
+    // 不在本进程 resume LINE；下次启动 constructor 带着槽位从第一行就隔离
+    exit(0);
 }
 
 static void hideLINEWindows(void) {
@@ -1914,20 +1911,50 @@ static void hookAppDelegate(void) {
 __attribute__((constructor))
 static void line_account_init(void) {
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] multi-account: picker BEFORE LINE data load");
+    NSLog(@"[LineAccount] multi-account: picker / pendingEnter cold start");
     NSLog(@"[LineAccount] ========================================");
+
+    (void)realHomePath();
+    mkdirp(slotsRootPath());
+
+    NSMutableDictionary *meta = loadMeta();
+    NSInteger pendingSlot = 0;
+    BOOL pending = [meta[@"pendingEnter"] boolValue];
+    if (meta[@"selectedSlot"]) pendingSlot = [meta[@"selectedSlot"] integerValue];
+
+    // 选账号后 exit 的下一次启动：带着槽位从第一行就隔离，不再弹选择页、不再中途改 Home
+    if (pending && pendingSlot >= 1 && pendingSlot <= ACCOUNT_COUNT) {
+        meta[@"pendingEnter"] = @NO; // 先清，避免异常退出后卡死在「永远 pending」
+        saveMeta(meta);
+
+        g_needPicker = NO;
+        g_blockLINEUI = NO;
+        g_selectedSlot = pendingSlot;
+        g_launchResumed = YES; // 不走 defer
+        g_launchDeferred = NO;
+        g_sceneDeferred = NO;
+
+        ensureSlotDirectories(pendingSlot);
+        installRuntimeHooks();
+        installKeychainHooks();
+        installHomeDirectoryHook();
+        installLineFileManagerHooks();
+        installIntentsCrashGuards();
+        installTalkDBAccountHooks();
+        // 不 hook UIApplicationMain defer；让 LINE 正常启动进已激活的槽
+        NSLog(@"[LineAccount] pendingEnter slot=%ld — direct launch into account", (long)pendingSlot);
+        NSLog(@"[LineAccount] realHome=%@ slotHome=%@", realHomePath(), slotHomePath(pendingSlot));
+        return;
+    }
 
     g_needPicker = YES;
     g_blockLINEUI = YES;
-    g_selectedSlot = -1; // 选择前不 remap
+    g_selectedSlot = -1;
     g_launchResumed = NO;
     g_launchDeferred = NO;
     g_sceneDeferred = NO;
-    (void)realHomePath();
-    mkdirp(slotsRootPath());
     NSLog(@"[LineAccount] realHome=%@ slots=%@", realHomePath(), slotsRootPath());
 
-    // 尽早拦 UIApplicationMain（比 setDelegate 更靠前）
     installRuntimeHooks();
     installKeychainHooks();
     installUIApplicationMainHook();
