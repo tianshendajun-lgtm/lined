@@ -554,6 +554,8 @@ static void installKeychainHooks(void) {
 
 #pragma mark - 账号选择 UI
 
+static void enterAccountSlot(NSInteger slot);
+
 @interface LineAccountPickerController : UIViewController
 @end
 
@@ -621,21 +623,82 @@ static void installKeychainHooks(void) {
 }
 
 - (void)onSelect:(UIButton *)sender {
-    NSInteger slot = sender.tag;
-    ensureSlotDirectories(slot);
-    [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
-
-    // 元数据写在 LineAccountSlots/meta.plist，避免被 remap 弄丢
-    NSMutableDictionary *meta = loadMeta();
-    meta[@"selectedSlot"] = @(slot);
-    meta[@"pendingEnter"] = @YES;
-    saveMeta(meta);
-
-    NSLog(@"[LineAccount] selected account slot %ld, restarting...", (long)slot);
-    exit(0);
+    enterAccountSlot(sender.tag);
 }
 
 @end
+
+#pragma mark - 无重启进入沙盒
+
+static IMP orig_didFinishLaunching = NULL;
+static id g_deferredDelegate = nil;
+static UIApplication *g_deferredApp = nil;
+static NSDictionary *g_deferredOpts = nil;
+static BOOL g_launchDeferred = NO;
+static BOOL g_launchResumed = NO;
+
+static void hideLINEWindows(void);
+static void showAccountPicker(void);
+
+static void dismissPicker(void) {
+    g_blockLINEUI = NO;
+    g_needPicker = NO;
+    if (pickerWindow) {
+        pickerWindow.hidden = YES;
+        pickerWindow.rootViewController = nil;
+        pickerWindow = nil;
+    }
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        w.alpha = 1;
+        w.userInteractionEnabled = YES;
+    }
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                w.alpha = 1;
+                w.userInteractionEnabled = YES;
+            }
+        }
+    }
+}
+
+static void resumeLINELaunch(void) {
+    if (g_launchResumed) return;
+    g_launchResumed = YES;
+
+    dismissPicker();
+
+    if (g_launchDeferred && orig_didFinishLaunching && g_deferredDelegate) {
+        NSLog(@"[LineAccount] resume didFinishLaunching, slot=%ld", (long)g_selectedSlot);
+        ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(
+            g_deferredDelegate,
+            @selector(application:didFinishLaunchingWithOptions:),
+            g_deferredApp,
+            g_deferredOpts);
+    }
+    g_deferredDelegate = nil;
+    g_deferredApp = nil;
+    g_deferredOpts = nil;
+    g_launchDeferred = NO;
+}
+
+static void enterAccountSlot(NSInteger slot) {
+    if (slot < 1 || slot > ACCOUNT_COUNT) return;
+
+    ensureSlotDirectories(slot);
+    [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
+
+    NSMutableDictionary *meta = loadMeta();
+    meta[@"selectedSlot"] = @(slot);
+    meta[@"pendingEnter"] = @NO;
+    saveMeta(meta);
+
+    // 先切沙盒，再放行 LINE（无需重启进程）
+    g_selectedSlot = slot;
+    NSLog(@"[LineAccount] selected slot %ld — continue without restart", (long)slot);
+    resumeLINELaunch();
+}
 
 static void hideLINEWindows(void) {
     if (!g_blockLINEUI) return;
@@ -663,10 +726,7 @@ static void hooked_makeKeyAndVisible(UIWindow *self, SEL _cmd) {
         self.hidden = YES;
         self.alpha = 0;
         self.userInteractionEnabled = NO;
-        // 不让 LINE 窗口成为 key，避免先闪登录页
-        if (pickerWindow) {
-            [pickerWindow makeKeyWindow];
-        }
+        if (pickerWindow) [pickerWindow makeKeyWindow];
         return;
     }
     ((void(*)(id,SEL))orig_makeKeyAndVisible)(self, _cmd);
@@ -706,9 +766,7 @@ static void showAccountPicker(void) {
 
         if (!pickerWindow) {
             if (@available(iOS 13.0, *)) {
-                if (scene) {
-                    pickerWindow = [[UIWindow alloc] initWithWindowScene:scene];
-                }
+                if (scene) pickerWindow = [[UIWindow alloc] initWithWindowScene:scene];
             }
             if (!pickerWindow) {
                 pickerWindow = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
@@ -724,18 +782,14 @@ static void showAccountPicker(void) {
         [pickerWindow makeKeyAndVisible];
         hideLINEWindows();
         g_pickerShown = YES;
-        NSLog(@"[LineAccount] picker shown (block LINE UI)");
+        NSLog(@"[LineAccount] picker shown");
     };
 
-    if ([NSThread isMainThread]) {
-        present();
-    } else {
-        dispatch_async(dispatch_get_main_queue(), present);
-    }
+    if ([NSThread isMainThread]) present();
+    else dispatch_async(dispatch_get_main_queue(), present);
 
-    // 短时轮询，防止 LINE 稍后又把窗口拉起来
     if (g_blockLINEUI) {
-        for (int i = 1; i <= 20; i++) {
+        for (int i = 1; i <= 30; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.05 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (!g_blockLINEUI) return;
@@ -750,54 +804,23 @@ static void showAccountPicker(void) {
     }
 }
 
-#pragma mark - 启动逻辑
-
-static void decideLaunchFlow(void) {
-    NSMutableDictionary *meta = loadMeta();
-    NSInteger saved = [meta[@"selectedSlot"] integerValue];
-    BOOL pending = [meta[@"pendingEnter"] boolValue];
-
-    // 选完账号后的第二次启动：直接进入容器，不弹选择页
-    if (pending && saved >= 1 && saved <= ACCOUNT_COUNT) {
-        g_blockLINEUI = NO;
-        g_needPicker = NO;
-        g_selectedSlot = saved;
-        ensureSlotDirectories(saved);
-        meta[@"pendingEnter"] = @NO;
-        saveMeta(meta);
-        NSLog(@"[LineAccount] enter slot %ld", (long)saved);
-        return;
-    }
-
-    // 打开就出选择页，挡住 LINE 原界面
-    g_needPicker = YES;
-    g_blockLINEUI = YES;
-    g_selectedSlot = 0;
-    ensureSlotDirectories(0);
-    showAccountPicker();
-}
-
-static IMP orig_didFinishLaunching = NULL;
-
 static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
-    // 先盖选择页，再让 LINE 继续初始化（其窗口会被挡住）
-    if (g_needPicker) {
+    // 需要选账号：暂缓 LINE 真正启动，只出选择页
+    if (g_needPicker && !g_launchResumed) {
         g_blockLINEUI = YES;
+        g_launchDeferred = YES;
+        g_deferredDelegate = self;
+        g_deferredApp = app;
+        g_deferredOpts = opts;
         showAccountPicker();
+        NSLog(@"[LineAccount] didFinishLaunching deferred until account selected");
+        return YES; // 告诉系统启动成功，实际业务等选完再跑
     }
 
-    BOOL r = YES;
     if (orig_didFinishLaunching) {
-        r = ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(self, _cmd, app, opts);
+        return ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(self, _cmd, app, opts);
     }
-
-    if (g_needPicker) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            showAccountPicker();
-            hideLINEWindows();
-        });
-    }
-    return r;
+    return YES;
 }
 
 static void hookAppDelegate(void) {
@@ -815,50 +838,36 @@ static void hookAppDelegate(void) {
         }
     }
 
-    // 兜底：主线程尽快出选择页
     dispatch_async(dispatch_get_main_queue(), ^{
-        decideLaunchFlow();
+        if (g_needPicker) showAccountPicker();
     });
 }
 
 __attribute__((constructor))
 static void line_account_init(void) {
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] multi-account dylib loaded");
+    NSLog(@"[LineAccount] multi-account dylib loaded (no-restart mode)");
     NSLog(@"[LineAccount] ========================================");
 
+    // 每次冷启动都先选账号；选完再进沙盒，不杀进程
+    // 清理旧版 pending 重启标记
     NSMutableDictionary *meta = loadMeta();
-    NSInteger saved = [meta[@"selectedSlot"] integerValue];
-    BOOL pending = [meta[@"pendingEnter"] boolValue];
-
-    if (pending && saved >= 1 && saved <= ACCOUNT_COUNT) {
-        // 直接进指定沙盒，不挡 UI、不出选择页
-        g_needPicker = NO;
-        g_blockLINEUI = NO;
-        g_selectedSlot = saved;
-        ensureSlotDirectories(saved);
-        NSLog(@"[LineAccount] pending enter slot %ld", (long)saved);
-    } else {
-        // 一启动就要选择：先用临时槽 + 挡住 LINE 窗口
-        g_needPicker = YES;
-        g_blockLINEUI = YES;
-        g_selectedSlot = 0;
-        ensureSlotDirectories(0);
-        NSLog(@"[LineAccount] bootstrap: show picker first");
+    if (meta[@"pendingEnter"]) {
+        meta[@"pendingEnter"] = @NO;
+        saveMeta(meta);
     }
+
+    g_needPicker = YES;
+    g_blockLINEUI = YES;
+    g_selectedSlot = 0;
+    g_launchResumed = NO;
+    ensureSlotDirectories(0);
 
     installRuntimeHooks();
     installKeychainHooks();
     hookAppDelegate();
 
-    if (g_needPicker) {
-        // 尽早尝试盖住（可能此时还没有 window，后面 didFinishLaunching 会再盖一次）
-        dispatch_async(dispatch_get_main_queue(), ^{
-            showAccountPicker();
-        });
-    } else {
-        // 清掉 pending，避免下次误进
-        meta[@"pendingEnter"] = @NO;
-        saveMeta(meta);
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        showAccountPicker();
+    });
 }
