@@ -496,83 +496,117 @@ static NSString *tokenFromId(id obj) {
     return tokenFromRaw((uintptr_t)(__bridge void *)obj);
 }
 
-static NSURL *syntheticStoreURLTokens(NSString *a, NSString *b) {
+static NSURL *remapFileURL(NSURL *url) {
+    if (!url) return nil;
+    NSString *path = url.path;
+    if (path.length == 0) return url;
+    NSString *mapped = remapPath(path);
+    if (!mapped || [mapped isEqualToString:path]) return url;
+    BOOL isDir = ([url.pathExtension length] == 0);
+    if (isDir) mkdirp(mapped);
+    else mkdirp([mapped stringByDeletingLastPathComponent]);
+    return [NSURL fileURLWithPath:mapped isDirectory:isDir];
+}
+
+// App Group 下真实结构更接近：.../AppGroup/<group>/Library/Application Support/PrivateStore/<token>
+static NSURL *syntheticPrivateStoreURL(NSString *token, NSString *sub) {
     NSInteger slot = activeSlotOrZero();
     ensureSlotDirectories(slot);
-    if (a.length == 0) a = @"store";
-    NSString *path = [[slotHomePath(slot)
-                       stringByAppendingPathComponent:@"Library/Application Support/LineStores"]
-                      stringByAppendingPathComponent:a];
-    if (b.length) path = [path stringByAppendingPathComponent:b];
+    if (token.length == 0) token = @"default";
+    NSString *path = [[[slotHomePath(slot)
+                        stringByAppendingPathComponent:@"AppGroup/group.com.linecorp.line"]
+                       stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]
+                      stringByAppendingPathComponent:token];
+    if (sub.length > 0) {
+        path = [path stringByAppendingPathComponent:sub];
+    }
     mkdirp(path);
     return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
-// + privateFileStoresAreAccessible
+static NSURL *syntheticStoreURLTokens(NSString *a, NSString *b) {
+    return syntheticPrivateStoreURL(a, b);
+}
+
+// + privateFileStoresAreAccessible —— 重签无 App Group 时原实现常为 NO；
+// 强制 YES 会走 store 初始化。必须配合「先 orig 再 nil 兜底」，不能只给空目录。
 static BOOL (*orig_privateFileStoresAreAccessible)(Class, SEL) = NULL;
 static BOOL hooked_privateFileStoresAreAccessible(Class cls, SEL sel) {
     (void)cls; (void)sel;
     return YES;
 }
 
-// 重签包无 App Group：原 fileURL* 内部常对坏状态发消息 → AV。
-// 策略：完全不调 orig，只返回槽内合成路径。
+// 策略：优先调 orig（containerURL 已合成，一般不再 AV）；
+// 返回有效 URL 则 remap；nil 再用 PrivateStore 路径兜底（避免 createDirectoryAtURL:nil）。
 
-// + fileURLForStoreType:  （NSInteger 枚举）
 static NSURL *(*orig_fileURLForStoreType)(Class, SEL, NSInteger) = NULL;
 static NSURL *hooked_fileURLForStoreType(Class cls, SEL sel, NSInteger storeType) {
-    (void)cls; (void)sel;
-    return syntheticStoreURLTokens([NSString stringWithFormat:@"st%ld", (long)storeType], nil);
+    NSURL *url = nil;
+    if (orig_fileURLForStoreType) {
+        url = orig_fileURLForStoreType(cls, sel, storeType);
+    }
+    url = remapFileURL(url);
+    if (url && url.path.length > 0) return url;
+    NSLog(@"[LineAccount] fileURLForStoreType:%ld nil -> PrivateStore", (long)storeType);
+    return syntheticPrivateStoreURL([NSString stringWithFormat:@"st%ld", (long)storeType], nil);
 }
 
-// + fileURLForStore:  （store 也可能是整数枚举）
 static NSURL *(*orig_fileURLForStore)(Class, SEL, id) = NULL;
 static NSURL *hooked_fileURLForStore(Class cls, SEL sel, id store) {
-    (void)cls; (void)sel;
-    return syntheticStoreURLTokens(tokenFromId(store), nil);
+    NSURL *url = orig_fileURLForStore ? orig_fileURLForStore(cls, sel, store) : nil;
+    url = remapFileURL(url);
+    if (url && url.path.length > 0) return url;
+    return syntheticPrivateStoreURL(tokenFromId(store), nil);
 }
 
-// + fileURLForStore:ofType:  （type 几乎肯定是 NSInteger）
 static NSURL *(*orig_fileURLForStoreOfType)(Class, SEL, id, NSInteger) = NULL;
 static NSURL *hooked_fileURLForStoreOfType(Class cls, SEL sel, id store, NSInteger type) {
-    (void)cls; (void)sel;
-    return syntheticStoreURLTokens(tokenFromId(store),
+    NSURL *url = orig_fileURLForStoreOfType ? orig_fileURLForStoreOfType(cls, sel, store, type) : nil;
+    url = remapFileURL(url);
+    if (url && url.path.length > 0) return url;
+    return syntheticPrivateStoreURL(tokenFromId(store),
                                    [NSString stringWithFormat:@"ty%ld", (long)type]);
 }
 
-// + fileURLForStore:substore:
 static NSURL *(*orig_fileURLForStoreSubstore)(Class, SEL, id, id) = NULL;
 static NSURL *hooked_fileURLForStoreSubstore(Class cls, SEL sel, id store, id sub) {
-    (void)cls; (void)sel;
-    return syntheticStoreURLTokens(tokenFromId(store), tokenFromId(sub));
+    NSURL *url = orig_fileURLForStoreSubstore ? orig_fileURLForStoreSubstore(cls, sel, store, sub) : nil;
+    url = remapFileURL(url);
+    if (url && url.path.length > 0) return url;
+    return syntheticPrivateStoreURL(tokenFromId(store), tokenFromId(sub));
 }
 
-// + fileURLForFileNamed:inStore:
 static NSURL *(*orig_fileURLForFileInStore)(Class, SEL, id, id) = NULL;
 static NSURL *hooked_fileURLForFileInStore(Class cls, SEL sel, id name, id store) {
-    (void)cls; (void)sel;
-    NSURL *dir = syntheticStoreURLTokens(tokenFromId(store), nil);
+    NSURL *url = orig_fileURLForFileInStore ? orig_fileURLForFileInStore(cls, sel, name, store) : nil;
+    url = remapFileURL(url);
+    if (url && url.path.length > 0) return url;
+    NSURL *dir = syntheticPrivateStoreURL(tokenFromId(store), nil);
     NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
 
-// + fileURLForFileNamed:inStore:ofType:
 static NSURL *(*orig_fileURLForFileInStoreOfType)(Class, SEL, id, id, NSInteger) = NULL;
 static NSURL *hooked_fileURLForFileInStoreOfType(Class cls, SEL sel, id name, id store, NSInteger type) {
-    (void)cls; (void)sel;
-    NSURL *dir = syntheticStoreURLTokens(tokenFromId(store),
+    NSURL *url = orig_fileURLForFileInStoreOfType
+        ? orig_fileURLForFileInStoreOfType(cls, sel, name, store, type) : nil;
+    url = remapFileURL(url);
+    if (url && url.path.length > 0) return url;
+    NSURL *dir = syntheticPrivateStoreURL(tokenFromId(store),
                                          [NSString stringWithFormat:@"ty%ld", (long)type]);
     NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
 
-// + fileURLForFileNamed:inStore:substore:
 static NSURL *(*orig_fileURLForFileInStoreSub)(Class, SEL, id, id, id) = NULL;
 static NSURL *hooked_fileURLForFileInStoreSub(Class cls, SEL sel, id name, id store, id sub) {
-    (void)cls; (void)sel;
-    NSURL *dir = syntheticStoreURLTokens(tokenFromId(store), tokenFromId(sub));
+    NSURL *url = orig_fileURLForFileInStoreSub
+        ? orig_fileURLForFileInStoreSub(cls, sel, name, store, sub) : nil;
+    url = remapFileURL(url);
+    if (url && url.path.length > 0) return url;
+    NSURL *dir = syntheticPrivateStoreURL(tokenFromId(store), tokenFromId(sub));
     NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
@@ -1076,12 +1110,10 @@ static void enterAccountSlot(NSInteger slot) {
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    // 先切沙盒 + 安装「只合成 URL、不调 orig」的 LFM hooks。
-    // 不装的话 fileURL 为 nil → 点登入后 Swift fatalError(breakpoint)；
-    // 装且调 orig / 把枚举当对象 → libobjc AV。必须走合成路径。
+    // 选账号后装 LFM：accessible=YES + fileURL 优先 orig/remap，nil 才 PrivateStore 兜底
     g_selectedSlot = slot;
     installLineFileManagerHooks();
-    NSLog(@"[LineAccount] selected slot %ld — LFM synthetic hooks on, resume launch", (long)slot);
+    NSLog(@"[LineAccount] selected slot %ld — LFM hybrid (orig+remap, nil fallback)", (long)slot);
     resumeLINELaunch();
 }
 
