@@ -1764,6 +1764,8 @@ static Method ownInstanceMethod(Class cls, SEL sel) {
     return m;
 }
 
+static void (*orig_setDelegate)(id, SEL, id) = NULL;
+
 static void tryHookDidFinishOnDelegate(id del) {
     if (!del || orig_didFinishLaunching) return;
     Class cls = [del class];
