@@ -934,16 +934,51 @@ static void dismissPicker(void) {
         pickerWindow.rootViewController = nil;
         pickerWindow = nil;
     }
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+
+    void (^unhide)(UIWindow *) = ^(UIWindow *w) {
+        if (!w) return;
+        w.hidden = NO;
         w.alpha = 1;
         w.userInteractionEnabled = YES;
+    };
+
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        unhide(w);
     }
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
             if (![s isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                unhide(w);
+            }
+        }
+    }
+}
+
+static void restoreLINEWindows(void) {
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        w.hidden = NO;
+        w.alpha = 1;
+        w.userInteractionEnabled = YES;
+        if (w.rootViewController) {
+            [w makeKeyAndVisible];
+        }
+    }
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)s;
+            for (UIWindow *w in ws.windows) {
+                w.hidden = NO;
                 w.alpha = 1;
                 w.userInteractionEnabled = YES;
+            }
+            // 优先恢复带根控制器的窗口
+            for (UIWindow *w in ws.windows) {
+                if (w.rootViewController) {
+                    [w makeKeyAndVisible];
+                    break;
+                }
             }
         }
     }
@@ -962,11 +997,23 @@ static void resumeLINELaunch(void) {
             @selector(application:didFinishLaunchingWithOptions:),
             g_deferredApp,
             g_deferredOpts);
+    } else {
+        NSLog(@"[LineAccount] resume: launch was NOT deferred (deferred=%d orig=%p del=%p)",
+              (int)g_launchDeferred, orig_didFinishLaunching, g_deferredDelegate);
     }
     g_deferredDelegate = nil;
     g_deferredApp = nil;
     g_deferredOpts = nil;
     g_launchDeferred = NO;
+
+    restoreLINEWindows();
+    // LINE 可能异步建窗，再补几次
+    for (int i = 1; i <= 20; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.1 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            restoreLINEWindows();
+        });
+    }
 }
 
 static void enterAccountSlot(NSInteger slot) {
