@@ -1313,6 +1313,22 @@ static NSString *hooked_NSHomeDirectory(void) {
     return realHomePath();
 }
 
+// ★ 很多 LINE 子系统（Story/广告/Channel/CoreData 等）不走 NSHomeDirectory，
+//   而是走这个 C 函数拿 Application Support / Caches / Documents 根 → 漏到真实 home。
+//   必须一并重定向到槽，否则数据分裂 → 重启时 LINE 判定 session 损坏而注销。
+static NSArray *(*orig_NSSearchPath)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL) = NULL;
+static NSArray *hooked_NSSearchPath(NSSearchPathDirectory dir, NSSearchPathDomainMask mask, BOOL expand) {
+    NSArray *r = orig_NSSearchPath ? orig_NSSearchPath(dir, mask, expand) : nil;
+    if (g_selectedSlot < 1 || r.count == 0) return r;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:r.count];
+    for (NSString *p in r) {
+        NSString *m = remapPath(p);
+        if (m.length && ![m isEqualToString:p]) mkdirp(m);
+        [out addObject:(m ?: p)];
+    }
+    return out;
+}
+
 static void installHomeDirectoryHook(void) {
     static BOOL done = NO;
     if (done) return;
@@ -1321,11 +1337,58 @@ static void installHomeDirectoryHook(void) {
     if (!orig_NSHomeDirectory) {
         orig_NSHomeDirectory = (NSString *(*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory");
     }
-    struct rebinding reb = {
-        "NSHomeDirectory", (void *)hooked_NSHomeDirectory, (void **)&orig_NSHomeDirectory
+    if (!orig_NSSearchPath) {
+        orig_NSSearchPath = (NSArray *(*)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL))
+            dlsym(RTLD_DEFAULT, "NSSearchPathForDirectoriesInDomains");
+    }
+    struct rebinding rebs[2] = {
+        {"NSHomeDirectory", (void *)hooked_NSHomeDirectory, (void **)&orig_NSHomeDirectory},
+        {"NSSearchPathForDirectoriesInDomains", (void *)hooked_NSSearchPath, (void **)&orig_NSSearchPath},
     };
-    rebind_symbols(&reb, 1);
-    NSLog(@"[LineAccount] NSHomeDirectory -> slot when selected");
+    rebind_symbols(rebs, 2);
+    NSLog(@"[LineAccount] NSHomeDirectory + NSSearchPath -> slot when selected");
+}
+
+#pragma mark - CoreData store URL 强制重定向（堵死 split-brain 的关键）
+
+// 不管 LINE 用什么方式拼出 store URL，一律在真正 addPersistentStore 前把它拉回槽。
+// 这样 Talk / Story / 广告 / Channel / HomeTab 等所有 CoreData 都落在同一个 account_N，
+// 重启时账号数据一致 → LINE 不再判定损坏而注销。
+static IMP orig_addPersistentStore = NULL;
+static id hooked_addPersistentStore(id self, SEL _cmd, id storeType, id configuration,
+                                    NSURL *url, NSDictionary *options, NSError **error) {
+    if (url && g_selectedSlot >= 1) {
+        NSString *p = url.path;
+        if (p.length > 0) {
+            NSString *mapped = remapPath(p);
+            if (mapped.length && ![mapped isEqualToString:p]) {
+                mkdirp([mapped stringByDeletingLastPathComponent]);
+                url = [NSURL fileURLWithPath:mapped];
+                NSLog(@"[LineAccount] addPersistentStore remap -> %@", mapped);
+            }
+        }
+    }
+    return ((id(*)(id, SEL, id, id, NSURL *, NSDictionary *, NSError **))orig_addPersistentStore)
+        (self, _cmd, storeType, configuration, url, options, error);
+}
+
+static void installCoreDataRedirect(void) {
+    static BOOL done = NO;
+    if (done) return;
+    Class psc = NSClassFromString(@"NSPersistentStoreCoordinator");
+    if (!psc) {
+        NSLog(@"[LineAccount] NSPersistentStoreCoordinator missing");
+        return;
+    }
+    SEL sel = @selector(addPersistentStoreWithType:configuration:URL:options:error:);
+    Method m = class_getInstanceMethod(psc, sel);
+    if (!m) {
+        NSLog(@"[LineAccount] addPersistentStore selector missing");
+        return;
+    }
+    orig_addPersistentStore = method_setImplementation(m, (IMP)hooked_addPersistentStore);
+    done = YES;
+    NSLog(@"[LineAccount] hooked addPersistentStore -> force slot redirect");
 }
 
 #pragma mark - NSUserDefaults 隔离（登录态的真正存放处）
@@ -1678,7 +1741,8 @@ static void enterAccountSlot(NSInteger slot) {
     g_selectedSlot = slot;
     NSLog(@"[LineAccount] selected slot %ld — activate isolation & resume in-process", (long)slot);
 
-    installHomeDirectoryHook();      // NSHomeDirectory() -> account_N
+    installHomeDirectoryHook();      // NSHomeDirectory() + NSSearchPath -> account_N
+    installCoreDataRedirect();       // 所有 CoreData store URL 强制落到 account_N（堵 split-brain）
     installLineFileManagerHooks();   // PrivateStore 等落到 account_N
     installIntentsCrashGuards();     // 进聊天避免 INVocabulary abort
     installBGTaskCrashGuards();      // 放行后 LINE 注册后台任务会晚，桩掉避免 abort
