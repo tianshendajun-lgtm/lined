@@ -16,6 +16,7 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <sys/stat.h>
+#import <unistd.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -25,9 +26,13 @@
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
 #define PENDING_ENTER_KEY @"LineAccount.PendingEnter" // 选完杀进程后，下次启动直接进该槽
 
-static NSInteger g_selectedSlot = -1;   // 1..4
+static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
 static BOOL g_hooksInstalled = NO;
+static BOOL g_needPicker = NO;      // 本次启动要先选账号
+static BOOL g_blockLINEUI = NO;     // 挡住 LINE 原窗口，避免先闪登录页
+static UIWindow *pickerWindow = nil;
+static IMP orig_makeKeyAndVisible = NULL;
 
 #pragma mark - 路径工具
 
@@ -37,30 +42,62 @@ static NSString *slotsRootPath(void) {
 }
 
 static NSString *slotHomePath(NSInteger slot) {
+    // slot 0 = 选择页前临时容器；1..4 = 正式账号
     return [slotsRootPath() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"account_%ld", (long)slot]];
 }
 
+static void mkdirp(NSString *path) {
+    if (path.length == 0) return;
+    const char *cpath = [path fileSystemRepresentation];
+    if (!cpath) return;
+    // 已存在
+    struct stat st;
+    if (stat(cpath, &st) == 0) return;
+
+    NSString *parent = [path stringByDeletingLastPathComponent];
+    if (parent.length > 0 && ![parent isEqualToString:path] && ![parent isEqualToString:@"/"]) {
+        mkdirp(parent);
+    }
+    mkdir(cpath, 0755);
+}
+
 static void ensureSlotDirectories(NSInteger slot) {
+    // slot==0：选择页出现前的临时沙盒，防止 App Group URL 为 nil
     NSArray *subs = @[
         @"Documents",
         @"Library/Preferences",
         @"Library/Caches",
         @"Library/Application Support",
+        @"Library/Application Support/Messages",
         @"tmp",
         @"AppGroup/group.com.linecorp.line",
         @"AppGroup/group.com.linecorp.Line.encrypted.app",
         @"AppGroup/group.share.com.linecorp.line",
         @"AppGroup/group.com.linecorp.Line.encrypted.share",
+        @"AppGroup/group.com.linecorp.Line.encrypted.standard",
     ];
-    NSFileManager *fm = [NSFileManager defaultManager];
     NSString *root = slotHomePath(slot);
+    mkdirp(root);
     for (NSString *sub in subs) {
-        NSString *path = [root stringByAppendingPathComponent:sub];
-        if (![fm fileExistsAtPath:path]) {
-            [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
-        }
+        mkdirp([root stringByAppendingPathComponent:sub]);
     }
+}
+
+#pragma mark - 元数据（写在 LineAccountSlots 下，不被 remap）
+
+static NSString *metaPlistPath(void) {
+    mkdirp(slotsRootPath());
+    return [slotsRootPath() stringByAppendingPathComponent:@"meta.plist"];
+}
+
+static NSMutableDictionary *loadMeta(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:metaPlistPath()];
+    return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+}
+
+static void saveMeta(NSDictionary *meta) {
+    [meta writeToFile:metaPlistPath() atomically:YES];
 }
 
 static NSString *slotKeyPrefix(NSInteger slot) {
@@ -70,9 +107,10 @@ static NSString *slotKeyPrefix(NSInteger slot) {
 static BOOL pathNeedsRemap(NSString *path) {
     if (path.length == 0) return NO;
     if ([path containsString:SLOT_DIR_NAME]) return NO;
+    // g_selectedSlot>=0 时启用（含临时槽 0）
+    if (g_selectedSlot < 0) return NO;
     NSString *home = NSHomeDirectory();
     if ([path hasPrefix:home]) return YES;
-    // App Group 常见路径片段
     if ([path containsString:@"/Library/Group Containers/"] ||
         [path containsString:@"group.com.linecorp"]) {
         return YES;
@@ -81,7 +119,7 @@ static BOOL pathNeedsRemap(NSString *path) {
 }
 
 static NSString *remapPath(NSString *path) {
-    if (g_selectedSlot < 1 || !pathNeedsRemap(path)) return path;
+    if (g_selectedSlot < 0 || !pathNeedsRemap(path)) return path;
 
     NSString *home = NSHomeDirectory();
     NSString *slotHome = slotHomePath(g_selectedSlot);
@@ -89,16 +127,13 @@ static NSString *remapPath(NSString *path) {
     if ([path hasPrefix:home]) {
         NSString *rel = [path substringFromIndex:home.length];
         if ([rel hasPrefix:@"/"]) rel = [rel substringFromIndex:1];
-        // 不要把槽位根目录自己再映射进去
         if ([rel hasPrefix:SLOT_DIR_NAME]) return path;
         return [slotHome stringByAppendingPathComponent:rel];
     }
 
-    // Group Containers → slot AppGroup
     NSRange r = [path rangeOfString:@"/Library/Group Containers/"];
     if (r.location != NSNotFound) {
         NSString *after = [path substringFromIndex:r.location + r.length];
-        // after: group.com.linecorp.line/...
         return [[slotHome stringByAppendingPathComponent:@"AppGroup"]
                 stringByAppendingPathComponent:after];
     }
@@ -108,7 +143,7 @@ static NSString *remapPath(NSString *path) {
 #pragma mark - Keychain 字典改写
 
 static CFDictionaryRef rewriteKeychainQuery(CFDictionaryRef query, BOOL forWrite) {
-    if (!query || g_selectedSlot < 1) return query;
+    if (!query || g_selectedSlot < 1) return query; // 临时槽 0 不隔离 Keychain
 
     NSDictionary *orig = (__bridge NSDictionary *)query;
     NSMutableDictionary *m = [orig mutableCopy];
@@ -190,17 +225,42 @@ static OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
 }
 
 static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
-    if (g_selectedSlot >= 1 && groupId.length > 0) {
-        NSString *path = [[slotHomePath(g_selectedSlot)
+    // 重签包通常没有 App Group 权限，系统会返回 nil → LINE 直接崩
+    // 所以只要有 groupId，就始终返回我们合成的容器路径
+    if (groupId.length > 0) {
+        NSInteger slot = g_selectedSlot >= 0 ? g_selectedSlot : 0;
+        ensureSlotDirectories(slot);
+        NSString *path = [[slotHomePath(slot)
                            stringByAppendingPathComponent:@"AppGroup"]
                           stringByAppendingPathComponent:groupId];
-        [[NSFileManager defaultManager] createDirectoryAtPath:path
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:nil];
+        mkdirp(path);
         return [NSURL fileURLWithPath:path isDirectory:YES];
     }
-    return orig_containerURL(self, _cmd, groupId);
+    if (orig_containerURL) {
+        return orig_containerURL(self, _cmd, groupId);
+    }
+    return nil;
+}
+
+typedef BOOL (*CreateDirURL_t)(id, SEL, NSURL *, BOOL, NSDictionary *, NSError **);
+static CreateDirURL_t orig_createDirectoryURL = NULL;
+
+static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL intermediates,
+                                      NSDictionary *attr, NSError **err) {
+    if (!url) {
+        NSLog(@"[LineAccount] blocked createDirectoryAtURL:nil");
+        if (err) {
+            *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
+                                   userInfo:@{NSLocalizedDescriptionKey: @"URL is nil (blocked)"}];
+        }
+        return NO; // 不要抛异常
+    }
+    NSString *path = url.path;
+    NSString *mapped = remapPath(path);
+    if (mapped && ![mapped isEqualToString:path]) {
+        url = [NSURL fileURLWithPath:mapped isDirectory:YES];
+    }
+    return orig_createDirectoryURL(self, _cmd, url, intermediates, attr, err);
 }
 
 static BOOL hooked_createDirectory(id self, SEL _cmd, NSString *path, BOOL intermediates, NSDictionary *attr, NSError **err) {
@@ -239,7 +299,7 @@ static BOOL hooked_createFile(id self, SEL _cmd, NSString *path, NSData *data, N
 static NSArray *hooked_URLsForDirectory(id self, SEL _cmd, NSSearchPathDirectory dir, NSSearchPathDomainMask domain) {
     NSArray *urls = ((NSArray*(*)(id,SEL,NSSearchPathDirectory,NSSearchPathDomainMask))orig_URLsForDirectory)
         (self, _cmd, dir, domain);
-    if (g_selectedSlot < 1) return urls;
+    if (g_selectedSlot < 0) return urls;
     NSMutableArray *out = [NSMutableArray array];
     for (NSURL *u in urls) {
         NSString *p = remapPath(u.path);
@@ -258,6 +318,11 @@ static void installRuntimeHooks(void) {
 
     m = class_getInstanceMethod(fm, @selector(createDirectoryAtPath:withIntermediateDirectories:attributes:error:));
     if (m) orig_createDirectory = method_setImplementation(m, (IMP)hooked_createDirectory);
+
+    m = class_getInstanceMethod(fm, @selector(createDirectoryAtURL:withIntermediateDirectories:attributes:error:));
+    if (m) {
+        orig_createDirectoryURL = (CreateDirURL_t)method_setImplementation(m, (IMP)hooked_createDirectoryURL);
+    }
 
     m = class_getInstanceMethod(fm, @selector(fileExistsAtPath:));
     if (m) orig_fileExists = method_setImplementation(m, (IMP)hooked_fileExists);
@@ -494,6 +559,8 @@ static void installKeychainHooks(void) {
 
 @implementation LineAccountPickerController
 
+- (BOOL)prefersStatusBarHidden { return YES; }
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor colorWithRed:0.06 green:0.72 blue:0.35 alpha:1.0];
@@ -522,8 +589,10 @@ static void installKeychainHooks(void) {
 
     for (NSInteger i = 1; i <= ACCOUNT_COUNT; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        NSString *mark = [[NSFileManager defaultManager]
-                          fileExistsAtPath:[slotHomePath(i) stringByAppendingPathComponent:@"Library/Preferences"]]
+        NSString *flag = [slotHomePath(i) stringByAppendingPathComponent:@".used"];
+        NSString *db = [slotHomePath(i) stringByAppendingPathComponent:@"Library/Application Support/Messages/Line.sqlite"];
+        NSString *mark = ([[NSFileManager defaultManager] fileExistsAtPath:flag] ||
+                          [[NSFileManager defaultManager] fileExistsAtPath:db])
                          ? @"已有数据" : @"新建容器";
         [btn setTitle:[NSString stringWithFormat:@"账号 %ld  ·  %@", (long)i, mark]
              forState:UIControlStateNormal];
@@ -554,28 +623,68 @@ static void installKeychainHooks(void) {
 - (void)onSelect:(UIButton *)sender {
     NSInteger slot = sender.tag;
     ensureSlotDirectories(slot);
+    [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
 
-    // 必须在设置 g_selectedSlot 之前写入，否则 Preferences 会被 remap 到槽位目录
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setInteger:slot forKey:SELECTED_SLOT_KEY];
-    [ud setBool:YES forKey:PENDING_ENTER_KEY];
-    [ud synchronize];
+    // 元数据写在 LineAccountSlots/meta.plist，避免被 remap 弄丢
+    NSMutableDictionary *meta = loadMeta();
+    meta[@"selectedSlot"] = @(slot);
+    meta[@"pendingEnter"] = @YES;
+    saveMeta(meta);
 
-    g_selectedSlot = slot;
     NSLog(@"[LineAccount] selected account slot %ld, restarting...", (long)slot);
-    // 冷启动最稳：选完后杀进程，下次带槽位启动（避免 LINE 已初始化串库）
     exit(0);
 }
 
 @end
 
-static UIWindow *pickerWindow = nil;
+static void hideLINEWindows(void) {
+    if (!g_blockLINEUI) return;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w == pickerWindow) continue;
+        w.hidden = YES;
+        w.alpha = 0;
+        w.userInteractionEnabled = NO;
+    }
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w == pickerWindow) continue;
+                w.hidden = YES;
+                w.alpha = 0;
+                w.userInteractionEnabled = NO;
+            }
+        }
+    }
+}
+
+static void hooked_makeKeyAndVisible(UIWindow *self, SEL _cmd) {
+    if (g_blockLINEUI && self != pickerWindow) {
+        self.hidden = YES;
+        self.alpha = 0;
+        self.userInteractionEnabled = NO;
+        // 不让 LINE 窗口成为 key，避免先闪登录页
+        if (pickerWindow) {
+            [pickerWindow makeKeyWindow];
+        }
+        return;
+    }
+    ((void(*)(id,SEL))orig_makeKeyAndVisible)(self, _cmd);
+}
+
+static void installWindowBlockHook(void) {
+    if (orig_makeKeyAndVisible) return;
+    Method m = class_getInstanceMethod([UIWindow class], @selector(makeKeyAndVisible));
+    if (m) {
+        orig_makeKeyAndVisible = method_setImplementation(m, (IMP)hooked_makeKeyAndVisible);
+        NSLog(@"[LineAccount] UIWindow makeKeyAndVisible hooked");
+    }
+}
 
 static void showAccountPicker(void) {
-    if (g_pickerShown) return;
-    g_pickerShown = YES;
+    void (^present)(void) = ^{
+        hideLINEWindows();
 
-    dispatch_async(dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         if (@available(iOS 13.0, *)) {
             for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
@@ -595,60 +704,106 @@ static void showAccountPicker(void) {
             }
         }
 
-        if (@available(iOS 13.0, *)) {
-            if (scene) {
-                pickerWindow = [[UIWindow alloc] initWithWindowScene:scene];
-            }
-        }
         if (!pickerWindow) {
-            pickerWindow = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+            if (@available(iOS 13.0, *)) {
+                if (scene) {
+                    pickerWindow = [[UIWindow alloc] initWithWindowScene:scene];
+                }
+            }
+            if (!pickerWindow) {
+                pickerWindow = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+            }
+            pickerWindow.windowLevel = UIWindowLevelStatusBar + 200;
+            pickerWindow.backgroundColor = [UIColor colorWithRed:0.06 green:0.72 blue:0.35 alpha:1.0];
+            pickerWindow.rootViewController = [LineAccountPickerController new];
         }
-        pickerWindow.windowLevel = UIWindowLevelAlert + 100;
-        pickerWindow.rootViewController = [LineAccountPickerController new];
+
+        pickerWindow.frame = UIScreen.mainScreen.bounds;
         pickerWindow.hidden = NO;
+        pickerWindow.alpha = 1;
         [pickerWindow makeKeyAndVisible];
-        NSLog(@"[LineAccount] picker shown");
-    });
+        hideLINEWindows();
+        g_pickerShown = YES;
+        NSLog(@"[LineAccount] picker shown (block LINE UI)");
+    };
+
+    if ([NSThread isMainThread]) {
+        present();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), present);
+    }
+
+    // 短时轮询，防止 LINE 稍后又把窗口拉起来
+    if (g_blockLINEUI) {
+        for (int i = 1; i <= 20; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.05 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!g_blockLINEUI) return;
+                hideLINEWindows();
+                if (pickerWindow) {
+                    pickerWindow.hidden = NO;
+                    pickerWindow.alpha = 1;
+                    [pickerWindow makeKeyWindow];
+                }
+            });
+        }
+    }
 }
 
 #pragma mark - 启动逻辑
 
 static void decideLaunchFlow(void) {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSInteger saved = [ud integerForKey:SELECTED_SLOT_KEY];
-    BOOL pending = [ud boolForKey:PENDING_ENTER_KEY];
+    NSMutableDictionary *meta = loadMeta();
+    NSInteger saved = [meta[@"selectedSlot"] integerValue];
+    BOOL pending = [meta[@"pendingEnter"] boolValue];
 
     // 选完账号后的第二次启动：直接进入容器，不弹选择页
     if (pending && saved >= 1 && saved <= ACCOUNT_COUNT) {
+        g_blockLINEUI = NO;
+        g_needPicker = NO;
         g_selectedSlot = saved;
         ensureSlotDirectories(saved);
-        [ud setBool:NO forKey:PENDING_ENTER_KEY];
-        [ud synchronize];
+        meta[@"pendingEnter"] = @NO;
+        saveMeta(meta);
         NSLog(@"[LineAccount] enter slot %ld", (long)saved);
         return;
     }
 
-    // 每次正常打开 LINE：先显示账号首页
+    // 打开就出选择页，挡住 LINE 原界面
+    g_needPicker = YES;
+    g_blockLINEUI = YES;
+    g_selectedSlot = 0;
+    ensureSlotDirectories(0);
     showAccountPicker();
 }
 
 static IMP orig_didFinishLaunching = NULL;
 
 static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
+    // 先盖选择页，再让 LINE 继续初始化（其窗口会被挡住）
+    if (g_needPicker) {
+        g_blockLINEUI = YES;
+        showAccountPicker();
+    }
+
     BOOL r = YES;
     if (orig_didFinishLaunching) {
         r = ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(self, _cmd, app, opts);
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        decideLaunchFlow();
-    });
+
+    if (g_needPicker) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            showAccountPicker();
+            hideLINEWindows();
+        });
+    }
     return r;
 }
 
 static void hookAppDelegate(void) {
-    // 尝试 hook 常见 AppDelegate
-    NSArray *names = @[@"AppDelegate", @"LINEAppDelegate", @"NLAppDelegate"];
+    installWindowBlockHook();
+
+    NSArray *names = @[@"AppDelegate", @"LINEAppDelegate", @"NLAppDelegate", @"LineAppDelegate"];
     for (NSString *name in names) {
         Class cls = NSClassFromString(name);
         if (!cls) continue;
@@ -660,9 +815,8 @@ static void hookAppDelegate(void) {
         }
     }
 
-    // 兜底：延迟显示
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    // 兜底：主线程尽快出选择页
+    dispatch_async(dispatch_get_main_queue(), ^{
         decideLaunchFlow();
     });
 }
@@ -673,16 +827,38 @@ static void line_account_init(void) {
     NSLog(@"[LineAccount] multi-account dylib loaded");
     NSLog(@"[LineAccount] ========================================");
 
-    installRuntimeHooks();
-    installKeychainHooks();
+    NSMutableDictionary *meta = loadMeta();
+    NSInteger saved = [meta[@"selectedSlot"] integerValue];
+    BOOL pending = [meta[@"pendingEnter"] boolValue];
 
-    // 尽早读取待进入槽位，让 LINE 初始化前就开始 remap
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSInteger saved = [ud integerForKey:SELECTED_SLOT_KEY];
-    if ([ud boolForKey:PENDING_ENTER_KEY] && saved >= 1 && saved <= ACCOUNT_COUNT) {
+    if (pending && saved >= 1 && saved <= ACCOUNT_COUNT) {
+        // 直接进指定沙盒，不挡 UI、不出选择页
+        g_needPicker = NO;
+        g_blockLINEUI = NO;
         g_selectedSlot = saved;
         ensureSlotDirectories(saved);
+        NSLog(@"[LineAccount] pending enter slot %ld", (long)saved);
+    } else {
+        // 一启动就要选择：先用临时槽 + 挡住 LINE 窗口
+        g_needPicker = YES;
+        g_blockLINEUI = YES;
+        g_selectedSlot = 0;
+        ensureSlotDirectories(0);
+        NSLog(@"[LineAccount] bootstrap: show picker first");
     }
 
+    installRuntimeHooks();
+    installKeychainHooks();
     hookAppDelegate();
+
+    if (g_needPicker) {
+        // 尽早尝试盖住（可能此时还没有 window，后面 didFinishLaunching 会再盖一次）
+        dispatch_async(dispatch_get_main_queue(), ^{
+            showAccountPicker();
+        });
+    } else {
+        // 清掉 pending，避免下次误进
+        meta[@"pendingEnter"] = @NO;
+        saveMeta(meta);
+    }
 }
