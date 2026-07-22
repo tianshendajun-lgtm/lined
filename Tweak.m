@@ -186,6 +186,37 @@ static BOOL copyDirContents(NSString *src, NSString *dst) {
     return YES;
 }
 
+// 换槽时清掉真实 Preferences 里除我们自己以外的条目（否则空槽会继承上一号登录态）
+static void clearRealPreferencesForAccountSwitch(void) {
+    NSString *prefs = [realHomePath() stringByAppendingPathComponent:@"Library/Preferences"];
+    mkdirp(prefs);
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prefs error:nil];
+    for (NSString *name in items) {
+        if ([name hasPrefix:@"LineAccount"]) continue;
+        removePathPOSIX([prefs stringByAppendingPathComponent:name]);
+    }
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [NSUserDefaults resetStandardUserDefaults];
+}
+
+static void clearRealDocuments(void) {
+    NSString *docs = [realHomePath() stringByAppendingPathComponent:@"Documents"];
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
+    for (NSString *name in items) {
+        removePathPOSIX([docs stringByAppendingPathComponent:name]);
+    }
+    mkdirp(docs);
+}
+
+static void clearRealCookiesAndWebKit(void) {
+    NSString *home = realHomePath();
+    for (NSString *rel in @[@"Library/Cookies", @"Library/WebKit"]) {
+        NSString *p = [home stringByAppendingPathComponent:rel];
+        removePathPOSIX(p);
+        mkdirp(p);
+    }
+}
+
 static void replaceDirFromSrc(NSString *src, NSString *dst) {
     mkdirp([dst stringByDeletingLastPathComponent]);
     removePathPOSIX(dst);
@@ -198,12 +229,22 @@ static void replaceDirFromSrc(NSString *src, NSString *dst) {
 // 把真实运行态数据写回指定槽（登录态/聊天记录/附件持久化）
 static void persistRealTalkDataToSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
+    static NSLock *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
+    if (![lock tryLock]) {
+        NSLog(@"[LineAccount] persist skip (busy) slot %ld", (long)slot);
+        return;
+    }
+
     ensureSlotDirectories(slot);
 
     NSString *realHome = realHomePath();
     NSString *slotHome = slotHomePath(slot);
 
-    // Application Support 子树
+    // 尽量把 CFPreferences 刷到磁盘再拷
+    [[NSUserDefaults standardUserDefaults] synchronize];
+
     NSString *realAS = [realHome stringByAppendingPathComponent:@"Library/Application Support"];
     NSString *slotAS = [slotHome stringByAppendingPathComponent:@"Library/Application Support"];
     mkdirp(slotAS);
@@ -219,16 +260,26 @@ static void persistRealTalkDataToSlot(NSInteger slot) {
         NSLog(@"[LineAccount] persist AS/%@ -> slot %ld", name, (long)slot);
     }
 
-    // Preferences / Documents：登录态与聊天附件（CFPreferences 也在真实 Preferences）
-    for (NSString *rel in @[@"Library/Preferences", @"Documents"]) {
+    for (NSString *rel in @[@"Library/Preferences", @"Documents", @"Library/Cookies"]) {
         NSString *src = [realHome stringByAppendingPathComponent:rel];
         NSString *dst = [slotHome stringByAppendingPathComponent:rel];
         const char *c = [src fileSystemRepresentation];
         struct stat st;
-        if (!c || lstat(c, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (!c || lstat(c, &st) != 0) continue;
+        if (S_ISREG(st.st_mode)) {
+            mkdirp([dst stringByDeletingLastPathComponent]);
+            removePathPOSIX(dst);
+            NSError *e = nil;
+            [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:&e];
+            continue;
+        }
+        if (!S_ISDIR(st.st_mode)) continue;
         replaceDirFromSrc(src, dst);
         NSLog(@"[LineAccount] persist %@ -> slot %ld", rel, (long)slot);
     }
+
+    [[NSData data] writeToFile:[slotHome stringByAppendingPathComponent:@".used"] atomically:YES];
+    [lock unlock];
 }
 
 static void loadTalkDataFromSlotToReal(NSInteger slot) {
@@ -237,6 +288,11 @@ static void loadTalkDataFromSlotToReal(NSInteger slot) {
     NSString *realAS = [realHome stringByAppendingPathComponent:@"Library/Application Support"];
     NSString *slotAS = [slotHome stringByAppendingPathComponent:@"Library/Application Support"];
     mkdirp(realAS);
+
+    // ★ 换槽先清登录态：空槽绝不能「保留真实 Preferences」，否则 1/2/3/4 都是同一个号
+    clearRealPreferencesForAccountSwitch();
+    clearRealDocuments();
+    clearRealCookiesAndWebKit();
 
     for (NSString *name in @[@"Messages", @"PrivateStore", @"PublicStore"]) {
         NSString *src = [slotAS stringByAppendingPathComponent:name];
@@ -257,30 +313,36 @@ static void loadTalkDataFromSlotToReal(NSInteger slot) {
         [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:dst error:nil];
     }
 
-    for (NSString *rel in @[@"Library/Preferences", @"Documents"]) {
+    // Preferences：从槽覆盖拷回（已清空真实侧 LINE 相关）
+    NSString *srcPrefs = [slotHome stringByAppendingPathComponent:@"Library/Preferences"];
+    NSString *dstPrefs = [realHome stringByAppendingPathComponent:@"Library/Preferences"];
+    mkdirp(dstPrefs);
+    NSArray *prefItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:srcPrefs error:nil];
+    for (NSString *name in prefItems) {
+        if ([name hasPrefix:@"LineAccount"]) continue;
+        NSString *s = [srcPrefs stringByAppendingPathComponent:name];
+        NSString *d = [dstPrefs stringByAppendingPathComponent:name];
+        removePathPOSIX(d);
+        NSError *e = nil;
+        if (![[NSFileManager defaultManager] copyItemAtPath:s toPath:d error:&e]) {
+            NSLog(@"[LineAccount] load Preferences fail %@ err=%@", name, e);
+        }
+    }
+    [NSUserDefaults resetStandardUserDefaults];
+    NSLog(@"[LineAccount] load Preferences slot %ld -> real (%lu)", (long)slot, (unsigned long)prefItems.count);
+
+    for (NSString *rel in @[@"Documents", @"Library/Cookies"]) {
         NSString *src = [slotHome stringByAppendingPathComponent:rel];
         NSString *dst = [realHome stringByAppendingPathComponent:rel];
         NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:src error:nil];
-        // Preferences/Documents 不能整目录删（系统/其它进程可能占用）；有槽数据才覆盖拷贝
-        if (items.count == 0) {
-            mkdirp(dst);
-            NSLog(@"[LineAccount] fresh %@ for slot %ld (keep existing real if any)", rel, (long)slot);
-            continue;
-        }
+        removePathPOSIX(dst);
         mkdirp(dst);
-        // 覆盖同名文件
-        for (NSString *name in items) {
-            // 不碰我们自己的 meta（若误放在 Preferences）
-            if ([name hasPrefix:@"LineAccount"]) continue;
-            NSString *s = [src stringByAppendingPathComponent:name];
-            NSString *d = [dst stringByAppendingPathComponent:name];
-            removePathPOSIX(d);
-            NSError *e = nil;
-            if (![[NSFileManager defaultManager] copyItemAtPath:s toPath:d error:&e]) {
-                NSLog(@"[LineAccount] load %@ fail %@ err=%@", rel, name, e);
-            }
+        if (items.count > 0) {
+            copyDirContents(src, dst);
+            NSLog(@"[LineAccount] load %@ slot %ld -> real (%lu)", rel, (long)slot, (unsigned long)items.count);
+        } else {
+            NSLog(@"[LineAccount] fresh %@ for slot %ld", rel, (long)slot);
         }
-        NSLog(@"[LineAccount] load %@ slot %ld -> real (%lu)", rel, (long)slot, (unsigned long)items.count);
     }
 }
 
@@ -370,6 +432,14 @@ static void hooked_accountEventAuthorizedAccount(id self, SEL _cmd) {
     // 登录成功后尽快落盘到槽位，避免杀进程后槽位仍空
     if (g_selectedSlot >= 1) {
         persistRealTalkDataToSlot(g_selectedSlot);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            persistRealTalkDataToSlot(g_selectedSlot);
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            persistRealTalkDataToSlot(g_selectedSlot);
+        });
     }
 }
 
