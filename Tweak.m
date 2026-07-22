@@ -75,15 +75,26 @@ static void mkdirp(NSString *path) {
     if (path.length == 0) return;
     const char *cpath = [path fileSystemRepresentation];
     if (!cpath) return;
-    // 已存在
+
     struct stat st;
-    if (stat(cpath, &st) == 0) return;
+    if (lstat(cpath, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return;
+        // 关键点：中间某层若是「文件」而不是目录，后面所有 createDir 都会 ENOENT/FAIL
+        // （PrivateStore/tN 全失败、而 com.naver.nelo 成功，就很像这条链上有文件挡路）
+        unlink(cpath);
+    }
 
     NSString *parent = [path stringByDeletingLastPathComponent];
     if (parent.length > 0 && ![parent isEqualToString:path] && ![parent isEqualToString:@"/"]) {
         mkdirp(parent);
     }
-    mkdir(cpath, 0755);
+    if (mkdir(cpath, 0755) != 0 && errno != EEXIST) {
+        // 再试一次：可能并发创建
+        if (lstat(cpath, &st) == 0 && !S_ISDIR(st.st_mode)) {
+            unlink(cpath);
+        }
+        mkdir(cpath, 0755);
+    }
 }
 
 static void ensureSlotDirectories(NSInteger slot) {
@@ -96,7 +107,7 @@ static void ensureSlotDirectories(NSInteger slot) {
         @"Library/Application Support/Messages",
         @"tmp",
         @"AppGroup/group.com.linecorp.line",
-        // ★ 实测 Talk DB 在这里：AppGroup/.../PrivateStore/t0/Line.sqlite
+        // ★ 实测 Talk DB：AppGroup/.../PrivateStore/t0/Line.sqlite
         @"AppGroup/group.com.linecorp.line/Library",
         @"AppGroup/group.com.linecorp.line/Library/Application Support",
         @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore",
@@ -112,9 +123,10 @@ static void ensureSlotDirectories(NSInteger slot) {
     for (NSString *sub in subs) {
         mkdirp([root stringByAppendingPathComponent:sub]);
     }
-    // 预建一批 PrivateStore/tN，避免登录时并发 createDir 失败 → sqlite ENOENT
+    // 预建 PrivateStore/tN
     NSString *ps = [root stringByAppendingPathComponent:
                     @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore"];
+    mkdirp(ps);
     for (NSInteger i = 0; i <= 128; i++) {
         mkdirp([ps stringByAppendingPathComponent:[NSString stringWithFormat:@"t%ld", (long)i]]);
     }
@@ -123,6 +135,12 @@ static void ensureSlotDirectories(NSInteger slot) {
     NSString *msgDir = [root stringByAppendingPathComponent:@"Library/Application Support/Messages"];
     mkdirp(msgDir);
     [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:msgDir error:nil];
+
+    // 诊断：确认 t0 真是目录
+    NSString *t0 = [ps stringByAppendingPathComponent:@"t0"];
+    struct stat st;
+    NSLog(@"[LineAccount] PrivateStore/t0 is_dir=%d path=%@",
+          (stat([t0 fileSystemRepresentation], &st) == 0 && S_ISDIR(st.st_mode)), t0);
 }
 
 // Talk DB 策略（已证实 symlink 易 ENOENT）：
@@ -546,28 +564,30 @@ static NSString *pathFromMaybeBogus(NSString *path) {
     return path;
 }
 
-// 槽位内 PrivateStore：createDirectory 经常失败（intermediates/权限），直接 POSIX 建齐并返回 YES
-static BOOL ensureSlotPrivateStorePath(NSString *path) {
+// 槽位 AppGroup 下任意目录：POSIX 建齐；已存在也当成功（NSFileManager 对「已存在」常返回 FAIL）
+static BOOL ensureSlotAppGroupDir(NSString *path) {
     if (path.length == 0) return NO;
     if (![path containsString:SLOT_DIR_NAME]) return NO;
-    if (![path containsString:@"PrivateStore"] && ![path containsString:@"Line.sqlite"]) return NO;
+    if (![path containsString:@"/AppGroup/"]) return NO;
+
     NSString *dir = path;
-    if ([path hasSuffix:@".sqlite"] || [path.pathExtension length] > 0) {
+    // Line.sqlite / 带扩展名 → 建父目录
+    NSString *ext = path.pathExtension;
+    if (ext.length > 0) {
         dir = [path stringByDeletingLastPathComponent];
     }
     mkdirp(dir);
     const char *c = [dir fileSystemRepresentation];
     struct stat st;
-    if (c && stat(c, &st) == 0 && S_ISDIR(st.st_mode)) {
+    if (c && lstat(c, &st) == 0 && S_ISDIR(st.st_mode)) {
         return YES;
     }
+    NSLog(@"[LineAccount] ensureSlotAppGroupDir FAIL errno=%d %@", errno, dir);
     return NO;
 }
 
 static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL intermediates,
                                       NSDictionary *attr, NSError **err) {
-    // 若传入的是枚举整数/nil：不要「假装建成功」，直接失败，避免 LINE 后续 Swift 解包其它 nil 崩掉。
-    // 真正的 store 路径应由 LineFileManager fileURL* hook 提供。
     if (isBogusObjPtr((__bridge void *)url)) {
         NSLog(@"[LineAccount] blocked createDirectoryAtURL:bogus %p", (__bridge void *)url);
         if (err) {
@@ -585,8 +605,8 @@ static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL interm
         return NO;
     }
     NSString *mapped = remapPath(path);
-    if (ensureSlotPrivateStorePath(mapped)) {
-        NSLog(@"[LineAccount] createDirURL OK(forced) %@", mapped);
+    // AppGroup 路径：不走 NSFileManager（它对「已存在」/挡路文件常 FAIL），POSIX 建好直接 YES
+    if (ensureSlotAppGroupDir(mapped)) {
         return YES;
     }
     if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
@@ -608,14 +628,11 @@ static BOOL hooked_createDirectory(id self, SEL _cmd, NSString *path, BOOL inter
         return NO;
     }
     NSString *mapped = remapPath(path);
-    if (ensureSlotPrivateStorePath(mapped)) {
-        NSLog(@"[LineAccount] createDir OK(forced) %@", mapped);
+    if (ensureSlotAppGroupDir(mapped)) {
         return YES;
     }
-    // Talk DB 相关：强制建齐父目录
     if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
         mkdirp(mapped);
-        NSLog(@"[LineAccount] createDir ensure %@", mapped);
     }
     return ((BOOL(*)(id,SEL,NSString*,BOOL,NSDictionary*,NSError**))orig_createDirectory)
         (self, _cmd, mapped, intermediates, attr, err);
