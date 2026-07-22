@@ -26,7 +26,6 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define PENDING_ENTER_KEY @"LineAccount.PendingEnter" // 选完杀进程后，下次启动直接进该槽
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -426,57 +425,13 @@ static void dumpTalkDBState(const char *tag) {
 }
 
 static void hooked_accountEventAuthorizedAccount(id self, SEL _cmd) {
-    if (g_selectedSlot >= 1) {
-        // 再次确保真实 Messages / PrivateStore 父目录存在（防登录过程中被删）
-        NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
-        NSString *realMsg = [realAS stringByAppendingPathComponent:@"Messages"];
-        NSString *realPS = [realAS stringByAppendingPathComponent:@"PrivateStore"];
-        mkdirp(realAS);
-        mkdirp(realMsg);
-        mkdirp(realPS);
-        mkdirp([realPS stringByAppendingPathComponent:@"t0"]);
-        dumpTalkDBState("beforeAuthorized");
-    }
+    // 隔离已由 NSHomeDirectory + 路径重定向完成：LINE 直接读写 account_N。
+    // 不再做真实↔槽位互拷（那会用空的真实 Home 覆盖掉槽位里的真实数据）。
+    dumpTalkDBState("beforeAuthorized");
     if (orig_accountAuthorized) {
         ((void (*)(id, SEL))orig_accountAuthorized)(self, _cmd);
     }
     dumpTalkDBState("afterAuthorized");
-    // 登录成功后尽快落盘到槽位，避免杀进程后槽位仍空
-    if (g_selectedSlot >= 1) {
-        persistRealTalkDataToSlot(g_selectedSlot);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            persistRealTalkDataToSlot(g_selectedSlot);
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            persistRealTalkDataToSlot(g_selectedSlot);
-        });
-    }
-}
-
-static void onAppWillPersistTalkData(NSNotification *note) {
-    (void)note;
-    if (g_selectedSlot >= 1) {
-        persistRealTalkDataToSlot(g_selectedSlot);
-    }
-}
-
-static void installTalkDataPersistObservers(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:UIApplicationWillResignActiveNotification
-                    object:nil queue:nil
-                usingBlock:^(NSNotification *n) { onAppWillPersistTalkData(n); }];
-    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
-                    object:nil queue:nil
-                usingBlock:^(NSNotification *n) { onAppWillPersistTalkData(n); }];
-    [nc addObserverForName:UIApplicationWillTerminateNotification
-                    object:nil queue:nil
-                usingBlock:^(NSNotification *n) { onAppWillPersistTalkData(n); }];
-    NSLog(@"[LineAccount] Talk DB persist observers installed");
 }
 
 static void hooked_accountEventUnauthorizeAccountWithLevel(id self, SEL _cmd, NSInteger level) {
@@ -1416,7 +1371,7 @@ static void enterAccountSlot(NSInteger slot);
     [self.view addSubview:title];
 
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectZero];
-    sub.text = @"选完会退出一次，再打开即进入该账号；换号请完全退出后再开";
+    sub.text = @"点选后直接进入该账号；换号请完全退出 LINE 后重新打开";
     sub.textColor = [UIColor colorWithWhite:1 alpha:0.85];
     sub.font = [UIFont systemFontOfSize:14];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -1630,19 +1585,27 @@ static void resumeLINELaunch(void) {
 static void enterAccountSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
 
-    // ★ 选账号后必须冷启动进槽：中途改 NSHomeDirectory / 放行 didFinish 会秒崩
-    //   （Frida：resume didFinishLaunching 后 ensurePrivateStoreDir FAIL → 进程没）
     ensureSlotDirectories(slot);
     [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
 
+    // 仅用于 UI 上标记「已有数据」；不做「重启跳过选择页」用途
     NSMutableDictionary *meta = loadMeta();
     meta[@"selectedSlot"] = @(slot);
-    meta[@"pendingEnter"] = @YES;
     saveMeta(meta);
 
-    NSLog(@"[LineAccount] selected slot %ld — pendingEnter, exit for clean launch", (long)slot);
-    // 不在本进程 resume LINE；下次启动 constructor 带着槽位从第一行就隔离
-    exit(0);
+    // ★ 选中后立刻在本进程激活该槽的隔离，再放行此前被拦住的 LINE 启动。
+    //   关键前提：didFinishLaunching / scene:willConnect 之前已被拦下（未执行），
+    //   所以此刻改 NSHomeDirectory + 路径重定向，LINE 会「全新」初始化到 account_N，
+    //   不存在「已用真实 Home 初始化后再中途改」导致的崩溃。
+    g_selectedSlot = slot;
+    NSLog(@"[LineAccount] selected slot %ld — activate isolation & resume in-process", (long)slot);
+
+    installHomeDirectoryHook();      // NSHomeDirectory() -> account_N
+    installLineFileManagerHooks();   // PrivateStore 等落到 account_N
+    installIntentsCrashGuards();     // 进聊天避免 INVocabulary abort
+    installTalkDBAccountHooks();
+
+    resumeLINELaunch();              // 放行 didFinishLaunching / scene:willConnect
 }
 
 static void hideLINEWindows(void) {
@@ -1910,43 +1873,15 @@ static void hookAppDelegate(void) {
 
 __attribute__((constructor))
 static void line_account_init(void) {
-    NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] multi-account: picker / pendingEnter cold start");
-    NSLog(@"[LineAccount] ========================================");
-
     (void)realHomePath();
     mkdirp(slotsRootPath());
 
-    NSMutableDictionary *meta = loadMeta();
-    NSInteger pendingSlot = 0;
-    BOOL pending = [meta[@"pendingEnter"] boolValue];
-    if (meta[@"selectedSlot"]) pendingSlot = [meta[@"selectedSlot"] integerValue];
+    NSLog(@"[LineAccount] ========================================");
+    NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号");
+    NSLog(@"[LineAccount] ========================================");
 
-    // 选账号后 exit 的下一次启动：带着槽位从第一行就隔离，不再弹选择页、不再中途改 Home
-    if (pending && pendingSlot >= 1 && pendingSlot <= ACCOUNT_COUNT) {
-        meta[@"pendingEnter"] = @NO; // 先清，避免异常退出后卡死在「永远 pending」
-        saveMeta(meta);
-
-        g_needPicker = NO;
-        g_blockLINEUI = NO;
-        g_selectedSlot = pendingSlot;
-        g_launchResumed = YES; // 不走 defer
-        g_launchDeferred = NO;
-        g_sceneDeferred = NO;
-
-        ensureSlotDirectories(pendingSlot);
-        installRuntimeHooks();
-        installKeychainHooks();
-        installHomeDirectoryHook();
-        installLineFileManagerHooks();
-        installIntentsCrashGuards();
-        installTalkDBAccountHooks();
-        // 不 hook UIApplicationMain defer；让 LINE 正常启动进已激活的槽
-        NSLog(@"[LineAccount] pendingEnter slot=%ld — direct launch into account", (long)pendingSlot);
-        NSLog(@"[LineAccount] realHome=%@ slotHome=%@", realHomePath(), slotHomePath(pendingSlot));
-        return;
-    }
-
+    // 每次冷启动都从头来：拦住 LINE、弹选择页；选中后当场激活隔离并放行。
+    // 杀进程重开 = 新的冷启动 = 再次弹选择页。不记忆上次选择。
     g_needPicker = YES;
     g_blockLINEUI = YES;
     g_selectedSlot = -1;
