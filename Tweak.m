@@ -114,66 +114,103 @@ static void ensureSlotDirectories(NSInteger slot) {
     [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:msgDir error:nil];
 }
 
-// 不 hook NSHomeDirectory（启动期 fishhook 会直接崩）。
-// Core Data 用真实 Home/.../Messages/Line.sqlite；把它符号链接到槽位目录即可。
-static void bindRealTalkDBDirToSlot(NSInteger slot) {
-    if (slot < 1) return;
-    ensureSlotDirectories(slot);
-
-    NSString *realAppSupport = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
-    NSString *realMsg = [realAppSupport stringByAppendingPathComponent:@"Messages"];
-    NSString *slotMsg = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
-    mkdirp(realAppSupport);
-    mkdirp(slotMsg);
-
-    const char *realC = [realMsg fileSystemRepresentation];
-    const char *slotC = [slotMsg fileSystemRepresentation];
-    if (!realC || !slotC) return;
-
+// Talk DB 策略（已证实 symlink 易 ENOENT）：
+// - 运行时始终用真实 Home/.../Messages（不 remap）
+// - 选账号时：先把当前真实 Messages 存回旧槽，再把新槽 Messages 拷到真实路径
+static void removePathPOSIX(NSString *path) {
+    if (path.length == 0) return;
+    const char *c = [path fileSystemRepresentation];
+    if (!c) return;
     struct stat st;
-    if (lstat(realC, &st) == 0) {
-        if (S_ISLNK(st.st_mode)) {
-            unlink(realC);
-        } else if (S_ISDIR(st.st_mode)) {
-            // 真实目录已存在：若槽内无库而真实有库，挪到槽；否则备份后替换为链接
-            NSString *slotDb = [slotMsg stringByAppendingPathComponent:@"Line.sqlite"];
-            NSString *realDb = [realMsg stringByAppendingPathComponent:@"Line.sqlite"];
-            struct stat stSlot, stReal;
-            BOOL slotHas = (stat([slotDb fileSystemRepresentation], &stSlot) == 0);
-            BOOL realHas = (stat([realDb fileSystemRepresentation], &stReal) == 0);
-            if (!slotHas && realHas) {
-                NSString *incoming = [slotMsg stringByAppendingString:@".incoming"];
-                const char *incC = [incoming fileSystemRepresentation];
-                unlink(incC);
-                if (rename(realC, incC) == 0) {
-                    // 把内容合并进 slotMsg：简单做法 —— 删空 slotMsg，rename incoming → slotMsg
-                    // slotMsg 已存在且可能为空，先 rename slotMsg 旁路
-                    NSString *emptyBak = [slotMsg stringByAppendingString:@".empty"];
-                    rename([slotMsg fileSystemRepresentation], [emptyBak fileSystemRepresentation]);
-                    rename(incC, [slotMsg fileSystemRepresentation]);
-                }
-            } else {
-                NSString *bak = [realMsg stringByAppendingString:@".bak_lineaccount"];
-                const char *bakC = [bak fileSystemRepresentation];
-                unlink(bakC);
-                rename(realC, bakC);
-            }
-        } else {
-            unlink(realC);
+    if (lstat(c, &st) != 0) return;
+    if (S_ISLNK(st.st_mode) || S_ISREG(st.st_mode)) {
+        unlink(c);
+        return;
+    }
+    // 目录：用系统 rm - 在 ObjC 里用 FileManager 但路径含 SLOT 或真实 Messages 不 remap
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+}
+
+static BOOL copyDirContents(NSString *src, NSString *dst) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    mkdirp(dst);
+    NSError *err = nil;
+    NSArray *items = [fm contentsOfDirectoryAtPath:src error:&err];
+    if (!items) return NO;
+    for (NSString *name in items) {
+        NSString *s = [src stringByAppendingPathComponent:name];
+        NSString *d = [dst stringByAppendingPathComponent:name];
+        removePathPOSIX(d);
+        NSError *e2 = nil;
+        if (![fm copyItemAtPath:s toPath:d error:&e2]) {
+            NSLog(@"[LineAccount] copy fail %@ -> %@ err=%@", s, d, e2);
+            return NO;
         }
     }
+    return YES;
+}
 
-    if (symlink(slotC, realC) != 0) {
-        NSLog(@"[LineAccount] talkdb symlink fail errno=%d %s -> %s", errno, realC, slotC);
-    } else {
-        NSLog(@"[LineAccount] talkdb symlink OK %s -> %s", realC, slotC);
+static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
+    if (slot < 1) return;
+
+    NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
+    NSString *realMsg = [realAS stringByAppendingPathComponent:@"Messages"];
+    NSString *slotMsg = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
+
+    // 1) 真实父目录必须存在
+    mkdirp(realAS);
+    mkdirp([slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support"]);
+    mkdirp(slotMsg);
+    ensureSlotDirectories(slot);
+
+    // 2) 拆掉坏 symlink
+    const char *realC = [realMsg fileSystemRepresentation];
+    struct stat st;
+    if (realC && lstat(realC, &st) == 0 && S_ISLNK(st.st_mode)) {
+        NSLog(@"[LineAccount] removing stale Messages symlink");
+        unlink(realC);
     }
 
-    // 诊断：两边是否都能看到目录
-    struct stat st2;
-    NSLog(@"[LineAccount] talkdb check real link=%d slot dir=%d",
-          (lstat(realC, &st2) == 0 && S_ISLNK(st2.st_mode)),
-          (stat(slotC, &st2) == 0));
+    // 3) 当前真实 Messages → 旧槽
+    if (previousSlot >= 1 && previousSlot <= ACCOUNT_COUNT && previousSlot != slot &&
+        realC && lstat(realC, &st) == 0 && S_ISDIR(st.st_mode)) {
+        NSString *prevMsg = [slotHomePath(previousSlot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
+        mkdirp(prevMsg);
+        NSArray *old = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prevMsg error:nil];
+        for (NSString *n in old) {
+            removePathPOSIX([prevMsg stringByAppendingPathComponent:n]);
+        }
+        copyDirContents(realMsg, prevMsg);
+        NSLog(@"[LineAccount] saved talkdb real -> slot %ld", (long)previousSlot);
+    }
+
+    // 4) 新槽 → 真实 Messages
+    removePathPOSIX(realMsg);
+    mkdirp(realMsg);
+    NSArray *slotItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:slotMsg error:nil];
+    if (slotItems.count > 0) {
+        copyDirContents(slotMsg, realMsg);
+        NSLog(@"[LineAccount] loaded talkdb slot %ld -> real (%lu files)",
+              (long)slot, (unsigned long)slotItems.count);
+    } else {
+        NSLog(@"[LineAccount] fresh talkdb for slot %ld (empty)", (long)slot);
+    }
+
+    NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
+    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realMsg error:nil];
+    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realAS error:nil];
+
+    NSString *realDb = [realMsg stringByAppendingPathComponent:@"Line.sqlite"];
+    NSLog(@"[LineAccount] talkdb ready dir=%@ db_exists=%d",
+          realMsg,
+          [[NSFileManager defaultManager] fileExistsAtPath:realDb]);
+}
+
+static void bindRealTalkDBDirToSlot(NSInteger slot) {
+    NSInteger prev = 0;
+    NSDictionary *meta = loadMeta();
+    if (meta[@"selectedSlot"]) prev = [meta[@"selectedSlot"] integerValue];
+    syncTalkDBForSlot(slot, prev);
 }
 
 #pragma mark - Talk DB / 账号事件（登录成功后失败会 unauthorize + exit(0)）
@@ -199,7 +236,11 @@ static void dumpTalkDBState(const char *tag) {
 
 static void hooked_accountEventAuthorizedAccount(id self, SEL _cmd) {
     if (g_selectedSlot >= 1) {
-        bindRealTalkDBDirToSlot(g_selectedSlot);
+        // 再次确保真实 Messages 父目录存在（防登录过程中被删）
+        NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
+        NSString *realMsg = [realAS stringByAppendingPathComponent:@"Messages"];
+        mkdirp(realAS);
+        mkdirp(realMsg);
         dumpTalkDBState("beforeAuthorized");
     }
     if (orig_accountAuthorized) {
@@ -295,12 +336,15 @@ static NSString *slotKeyPrefix(NSInteger slot) {
 static BOOL pathNeedsRemap(NSString *path) {
     if (path.length == 0) return NO;
     if ([path containsString:SLOT_DIR_NAME]) return NO;
-    // Talk DB（Messages/Line.sqlite）必须走真实 Home + symlink。
-    // 若 remap 到槽路径，NSFileManager 会绕开/毁掉 symlink，Core Data 仍读真实路径 → 加载失败 → unauthorize → exit(0)
-    if ([path containsString:@"/Library/Application Support/Messages"]) return NO;
-    // 仅正式账号槽 remap（选号前不碰）
     if (g_selectedSlot < 1) return NO;
+
     NSString *home = realHomePath();
+    NSString *realAS = [home stringByAppendingPathComponent:@"Library/Application Support"];
+    // 父目录必须留在真实 Home：否则 Messages/Line.sqlite 创建 → ENOENT(2) → unauthorize → exit(0)
+    if ([path isEqualToString:realAS]) return NO;
+    // Talk DB 全程走真实 Messages（选账号时与槽位互相同步），禁止 remap
+    if ([path containsString:@"/Library/Application Support/Messages"]) return NO;
+
     if ([path hasPrefix:home]) return YES;
     if ([path containsString:@"/Library/Group Containers/"] ||
         [path containsString:@"group.com.linecorp"]) {
@@ -1287,18 +1331,18 @@ static void enterAccountSlot(NSInteger slot) {
     ensureSlotDirectories(slot);
     [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
 
+    // 先同步 Talk DB（此时 meta 里仍是旧 selectedSlot），再写 meta
+    g_selectedSlot = slot;
+    installLineFileManagerHooks();
+    bindRealTalkDBDirToSlot(slot);
+    installTalkDBAccountHooks();
+
     NSMutableDictionary *meta = loadMeta();
     meta[@"selectedSlot"] = @(slot);
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    // 选账号后：装 LFM；Messages 不 remap，用 symlink 接到槽位；并 hook 授权/踢下线日志
-    g_selectedSlot = slot;
-    installLineFileManagerHooks();
-    bindRealTalkDBDirToSlot(slot);
-    installTalkDBAccountHooks();
-    NSLog(@"[LineAccount] selected slot %ld — talkdb bound, slot=%@",
-          (long)slot, slotHomePath(slot));
+    NSLog(@"[LineAccount] selected slot %ld — talkdb synced to real Messages", (long)slot);
     resumeLINELaunch();
 }
 
