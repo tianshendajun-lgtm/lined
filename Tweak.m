@@ -1752,16 +1752,24 @@ static void showAccountPicker(void) {
     }
 }
 
-static void (*orig_setDelegate)(id, SEL, id) = NULL;
-
-static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts);
+static Method ownInstanceMethod(Class cls, SEL sel) {
+    if (!cls || !sel) return NULL;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NULL;
+    Class superCls = class_getSuperclass(cls);
+    if (superCls) {
+        Method ms = class_getInstanceMethod(superCls, sel);
+        if (ms == m) return NULL; // 继承自父类，动它会搞崩系统
+    }
+    return m;
+}
 
 static void tryHookDidFinishOnDelegate(id del) {
     if (!del || orig_didFinishLaunching) return;
     Class cls = [del class];
-    Method target = class_getInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
+    Method target = ownInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
     if (!target) {
-        NSLog(@"[LineAccount] delegate %@ has no didFinishLaunching", cls);
+        NSLog(@"[LineAccount] delegate %@ has no OWN didFinishLaunching", cls);
         return;
     }
     orig_didFinishLaunching = method_setImplementation(target, (IMP)hooked_didFinishLaunching);
@@ -1814,24 +1822,21 @@ static void hooked_sceneWillConnect(id self, SEL _cmd, UIScene *scene, UISceneSe
 static void hookSceneDelegates(void) {
     if (orig_sceneWillConnect) return;
     SEL sel = @selector(scene:willConnectToSession:options:);
+    // 不再全表扫描：只碰名字像 LINE Scene 的类，且必须是本类自有方法
     unsigned int n = 0;
     Class *list = objc_copyClassList(&n);
     for (unsigned int i = 0; i < n; i++) {
         Class cls = list[i];
         NSString *name = NSStringFromClass(cls);
-        if ([name hasPrefix:@"UI"] || [name hasPrefix:@"_"]) continue;
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) continue;
-        // 优先 LINE / App 相关
-        BOOL likely = [name containsString:@"Scene"] || [name containsString:@"LINE"] ||
-                      [name containsString:@"Line"] || [name containsString:@"App"];
-        if (!likely && orig_sceneWillConnect) continue;
-        IMP old = method_setImplementation(m, (IMP)hooked_sceneWillConnect);
-        if (!orig_sceneWillConnect) {
-            orig_sceneWillConnect = old;
-            NSLog(@"[LineAccount] hooked scene:willConnect on %@", name);
-            if (likely) break;
+        if ([name hasPrefix:@"UI"] || [name hasPrefix:@"_"] || [name hasPrefix:@"NS"]) continue;
+        if (![name containsString:@"Scene"] && ![name containsString:@"LINE"] && ![name containsString:@"Line"]) {
+            continue;
         }
+        Method m = ownInstanceMethod(cls, sel);
+        if (!m) continue;
+        orig_sceneWillConnect = method_setImplementation(m, (IMP)hooked_sceneWillConnect);
+        NSLog(@"[LineAccount] hooked scene:willConnect on %@", name);
+        break; // 只 hook 一个
     }
     if (list) free(list);
 }
@@ -1843,12 +1848,10 @@ static int hooked_UIApplicationMain(int argc, char **argv, NSString *principal, 
     NSLog(@"[LineAccount] UIApplicationMain principal=%@ delegate=%@", principal, delegateClassName);
     if ([delegateClassName isKindOfClass:[NSString class]] && delegateClassName.length > 0) {
         Class cls = NSClassFromString(delegateClassName);
-        if (cls) {
-            Method m = class_getInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
-            if (m && !orig_didFinishLaunching) {
-                orig_didFinishLaunching = method_setImplementation(m, (IMP)hooked_didFinishLaunching);
-                NSLog(@"[LineAccount] hooked didFinish via UIApplicationMain: %@", delegateClassName);
-            }
+        Method m = ownInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
+        if (m && !orig_didFinishLaunching) {
+            orig_didFinishLaunching = method_setImplementation(m, (IMP)hooked_didFinishLaunching);
+            NSLog(@"[LineAccount] hooked didFinish via UIApplicationMain: %@", delegateClassName);
         }
     }
     installWindowBlockHook();
@@ -1856,7 +1859,10 @@ static int hooked_UIApplicationMain(int argc, char **argv, NSString *principal, 
     if (sd && !orig_setDelegate) {
         orig_setDelegate = (void (*)(id, SEL, id))method_setImplementation(sd, (IMP)hooked_setDelegate);
     }
-    hookSceneDelegates();
+    // Scene 延后到主线程再 hook，避免启动期扫类崩溃
+    dispatch_async(dispatch_get_main_queue(), ^{
+        hookSceneDelegates();
+    });
     return orig_UIApplicationMain(argc, argv, principal, delegateClassName);
 }
 
@@ -1878,7 +1884,6 @@ static void hookAppDelegate(void) {
     installWindowBlockHook();
     installUIApplicationMainHook();
 
-    // 1) 尽早 hook setDelegate，抓住真实 AppDelegate 类名（可能是 Swift mangled）
     Method sd = class_getInstanceMethod([UIApplication class], @selector(setDelegate:));
     if (sd && !orig_setDelegate) {
         orig_setDelegate = (void (*)(id, SEL, id))method_setImplementation(sd, (IMP)hooked_setDelegate);
@@ -1886,39 +1891,21 @@ static void hookAppDelegate(void) {
     }
     tryHookDidFinishOnDelegate(UIApplication.sharedApplication.delegate);
 
+    // 只试已知名字，禁止全表扫描 AppDelegate（易误 hook 父类方法 → 秒退）
     NSArray *names = @[@"AppDelegate", @"LINEAppDelegate", @"NLAppDelegate", @"LineAppDelegate"];
     for (NSString *name in names) {
         Class cls = NSClassFromString(name);
-        if (!cls) continue;
-        Method m = class_getInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
+        Method m = ownInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
         if (m && !orig_didFinishLaunching) {
             orig_didFinishLaunching = method_setImplementation(m, (IMP)hooked_didFinishLaunching);
             NSLog(@"[LineAccount] hooked %@", name);
         }
     }
 
-    // 2) 扫一遍带 AppDelegate 后缀的类
-    if (!orig_didFinishLaunching) {
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        for (unsigned int i = 0; i < n && !orig_didFinishLaunching; i++) {
-            NSString *name = NSStringFromClass(list[i]);
-            if (![name containsString:@"AppDelegate"] && ![name containsString:@"appDelegate"]) continue;
-            if ([name hasPrefix:@"UI"]) continue;
-            Method m = class_getInstanceMethod(list[i], @selector(application:didFinishLaunchingWithOptions:));
-            if (!m) continue;
-            orig_didFinishLaunching = method_setImplementation(m, (IMP)hooked_didFinishLaunching);
-            NSLog(@"[LineAccount] hooked scanned %@", name);
-        }
-        if (list) free(list);
-    }
-
-    hookSceneDelegates();
-
     dispatch_async(dispatch_get_main_queue(), ^{
         tryHookDidFinishOnDelegate(UIApplication.sharedApplication.delegate);
         hookSceneDelegates();
-        if (g_needPicker) showAccountPicker();
+        if (g_needPicker && !g_launchResumed) showAccountPicker();
     });
 }
 
