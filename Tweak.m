@@ -364,41 +364,22 @@ static NSInteger activeSlotOrZero(void) {
     return g_selectedSlot >= 0 ? g_selectedSlot : 0;
 }
 
-static NSString *sanitizePathComponent(id obj) {
-    // storeType 等参数经常是 NSInteger 枚举，不能当对象发消息，否则 libobjc EXC_BAD_ACCESS
-    uintptr_t v = (uintptr_t)(__bridge void *)obj;
-    if (obj == nil || v < 0x100000ULL) {
-        return [NSString stringWithFormat:@"v%lu", (unsigned long)v];
-    }
-    @try {
-        if ([(id)obj isKindOfClass:[NSString class]]) {
-            NSString *s = (NSString *)obj;
-            if (s.length == 0) return @"unknown";
-            return [[s componentsSeparatedByCharactersInSet:
-                     [NSCharacterSet characterSetWithCharactersInString:@"/:\\"]]
-                    componentsJoinedByString:@"_"];
-        }
-        if ([(id)obj respondsToSelector:@selector(stringValue)]) {
-            NSString *s = [(id)obj stringValue];
-            if (s.length) return sanitizePathComponent(s);
-        }
-        NSString *d = [(id)obj description];
-        if (d.length) {
-            return [[d componentsSeparatedByCharactersInSet:
-                     [NSCharacterSet characterSetWithCharactersInString:@"/:\\ "]]
-                    componentsJoinedByString:@"_"];
-        }
-    } @catch (__unused NSException *e) {
-        // fallthrough
+// 绝不能对「可能是枚举整数」的指针发 ObjC 消息（@try 挡不住 SIGSEGV）
+static NSString *tokenFromRaw(uintptr_t v) {
+    if (v < 0x100000ULL) {
+        return [NSString stringWithFormat:@"t%lu", (unsigned long)v];
     }
     return [NSString stringWithFormat:@"p%lx", (unsigned long)v];
 }
 
-static NSURL *syntheticStoreURL(id storeOrType, id typeOrSub) {
+static NSString *tokenFromId(id obj) {
+    return tokenFromRaw((uintptr_t)(__bridge void *)obj);
+}
+
+static NSURL *syntheticStoreURLTokens(NSString *a, NSString *b) {
     NSInteger slot = activeSlotOrZero();
     ensureSlotDirectories(slot);
-    NSString *a = sanitizePathComponent(storeOrType);
-    NSString *b = typeOrSub ? sanitizePathComponent(typeOrSub) : nil;
+    if (a.length == 0) a = @"store";
     NSString *path = [[slotHomePath(slot)
                        stringByAppendingPathComponent:@"Library/Application Support/LineStores"]
                       stringByAppendingPathComponent:a];
@@ -407,87 +388,62 @@ static NSURL *syntheticStoreURL(id storeOrType, id typeOrSub) {
     return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
-static NSURL *ensureNonNilFileURL(NSURL *url, id fallbackKey) {
-    if (url && url.path.length > 0) {
-        NSString *mapped = remapPath(url.path);
-        if (mapped && ![mapped isEqualToString:url.path]) {
-            BOOL isDir = NO;
-            [[NSFileManager defaultManager] fileExistsAtPath:mapped isDirectory:&isDir];
-            // 目录型 URL 保持 isDirectory；文件型用原逻辑
-            if ([url.pathExtension length] == 0 || isDir) {
-                mkdirp(mapped);
-                return [NSURL fileURLWithPath:mapped isDirectory:YES];
-            }
-            mkdirp([mapped stringByDeletingLastPathComponent]);
-            return [NSURL fileURLWithPath:mapped isDirectory:NO];
-        }
-        return url;
-    }
-    return syntheticStoreURL(fallbackKey, nil);
-}
-
 // + privateFileStoresAreAccessible
 static BOOL (*orig_privateFileStoresAreAccessible)(Class, SEL) = NULL;
 static BOOL hooked_privateFileStoresAreAccessible(Class cls, SEL sel) {
-    NSLog(@"[LineAccount] privateFileStoresAreAccessible -> YES");
+    (void)cls; (void)sel;
     return YES;
 }
 
-// + fileURLForStoreType:  （参数是枚举/整数，不是对象）
+// 重签包无 App Group：原 fileURL* 内部常对坏状态发消息 → AV。
+// 策略：完全不调 orig，只返回槽内合成路径。
+
+// + fileURLForStoreType:  （NSInteger 枚举）
 static NSURL *(*orig_fileURLForStoreType)(Class, SEL, NSInteger) = NULL;
 static NSURL *hooked_fileURLForStoreType(Class cls, SEL sel, NSInteger storeType) {
-    NSURL *url = orig_fileURLForStoreType ? orig_fileURLForStoreType(cls, sel, storeType) : nil;
-    if (url && url.path.length > 0) {
-        return ensureNonNilFileURL(url, [NSString stringWithFormat:@"t%ld", (long)storeType]);
-    }
-    NSURL *fixed = syntheticStoreURL([NSString stringWithFormat:@"t%ld", (long)storeType], nil);
-    NSLog(@"[LineAccount] fileURLForStoreType:%ld nil -> %@", (long)storeType, fixed.path);
-    return fixed;
+    (void)cls; (void)sel;
+    return syntheticStoreURLTokens([NSString stringWithFormat:@"st%ld", (long)storeType], nil);
 }
 
-// + fileURLForStore:
+// + fileURLForStore:  （store 也可能是整数枚举）
 static NSURL *(*orig_fileURLForStore)(Class, SEL, id) = NULL;
 static NSURL *hooked_fileURLForStore(Class cls, SEL sel, id store) {
-    NSURL *url = orig_fileURLForStore ? orig_fileURLForStore(cls, sel, store) : nil;
-    return ensureNonNilFileURL(url, store ?: @"store");
+    (void)cls; (void)sel;
+    return syntheticStoreURLTokens(tokenFromId(store), nil);
 }
 
-// + fileURLForStore:ofType:
-static NSURL *(*orig_fileURLForStoreOfType)(Class, SEL, id, id) = NULL;
-static NSURL *hooked_fileURLForStoreOfType(Class cls, SEL sel, id store, id type) {
-    NSURL *url = orig_fileURLForStoreOfType ? orig_fileURLForStoreOfType(cls, sel, store, type) : nil;
-    if (url && url.path.length) return ensureNonNilFileURL(url, store);
-    NSURL *fixed = syntheticStoreURL(store, type);
-    NSLog(@"[LineAccount] fileURLForStore:ofType: nil -> %@", fixed.path);
-    return fixed;
+// + fileURLForStore:ofType:  （type 几乎肯定是 NSInteger）
+static NSURL *(*orig_fileURLForStoreOfType)(Class, SEL, id, NSInteger) = NULL;
+static NSURL *hooked_fileURLForStoreOfType(Class cls, SEL sel, id store, NSInteger type) {
+    (void)cls; (void)sel;
+    return syntheticStoreURLTokens(tokenFromId(store),
+                                   [NSString stringWithFormat:@"ty%ld", (long)type]);
 }
 
 // + fileURLForStore:substore:
 static NSURL *(*orig_fileURLForStoreSubstore)(Class, SEL, id, id) = NULL;
 static NSURL *hooked_fileURLForStoreSubstore(Class cls, SEL sel, id store, id sub) {
-    NSURL *url = orig_fileURLForStoreSubstore ? orig_fileURLForStoreSubstore(cls, sel, store, sub) : nil;
-    if (url && url.path.length) return ensureNonNilFileURL(url, store);
-    return syntheticStoreURL(store, sub);
+    (void)cls; (void)sel;
+    return syntheticStoreURLTokens(tokenFromId(store), tokenFromId(sub));
 }
 
 // + fileURLForFileNamed:inStore:
 static NSURL *(*orig_fileURLForFileInStore)(Class, SEL, id, id) = NULL;
 static NSURL *hooked_fileURLForFileInStore(Class cls, SEL sel, id name, id store) {
-    NSURL *url = orig_fileURLForFileInStore ? orig_fileURLForFileInStore(cls, sel, name, store) : nil;
-    if (url && url.path.length) return ensureNonNilFileURL(url, name);
-    NSURL *dir = syntheticStoreURL(store, nil);
-    NSString *path = [dir.path stringByAppendingPathComponent:sanitizePathComponent(name)];
+    (void)cls; (void)sel;
+    NSURL *dir = syntheticStoreURLTokens(tokenFromId(store), nil);
+    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
 
 // + fileURLForFileNamed:inStore:ofType:
-static NSURL *(*orig_fileURLForFileInStoreOfType)(Class, SEL, id, id, id) = NULL;
-static NSURL *hooked_fileURLForFileInStoreOfType(Class cls, SEL sel, id name, id store, id type) {
-    NSURL *url = orig_fileURLForFileInStoreOfType ? orig_fileURLForFileInStoreOfType(cls, sel, name, store, type) : nil;
-    if (url && url.path.length) return ensureNonNilFileURL(url, name);
-    NSURL *dir = syntheticStoreURL(store, type);
-    NSString *path = [dir.path stringByAppendingPathComponent:sanitizePathComponent(name)];
+static NSURL *(*orig_fileURLForFileInStoreOfType)(Class, SEL, id, id, NSInteger) = NULL;
+static NSURL *hooked_fileURLForFileInStoreOfType(Class cls, SEL sel, id name, id store, NSInteger type) {
+    (void)cls; (void)sel;
+    NSURL *dir = syntheticStoreURLTokens(tokenFromId(store),
+                                         [NSString stringWithFormat:@"ty%ld", (long)type]);
+    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
@@ -495,10 +451,9 @@ static NSURL *hooked_fileURLForFileInStoreOfType(Class cls, SEL sel, id name, id
 // + fileURLForFileNamed:inStore:substore:
 static NSURL *(*orig_fileURLForFileInStoreSub)(Class, SEL, id, id, id) = NULL;
 static NSURL *hooked_fileURLForFileInStoreSub(Class cls, SEL sel, id name, id store, id sub) {
-    NSURL *url = orig_fileURLForFileInStoreSub ? orig_fileURLForFileInStoreSub(cls, sel, name, store, sub) : nil;
-    if (url && url.path.length) return ensureNonNilFileURL(url, name);
-    NSURL *dir = syntheticStoreURL(store, sub);
-    NSString *path = [dir.path stringByAppendingPathComponent:sanitizePathComponent(name)];
+    (void)cls; (void)sel;
+    NSURL *dir = syntheticStoreURLTokens(tokenFromId(store), tokenFromId(sub));
+    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
