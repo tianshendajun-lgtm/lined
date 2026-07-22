@@ -168,9 +168,111 @@ static void bindRealTalkDBDirToSlot(NSInteger slot) {
     } else {
         NSLog(@"[LineAccount] talkdb symlink OK %s -> %s", realC, slotC);
     }
+
+    // 诊断：两边是否都能看到目录
+    struct stat st2;
+    NSLog(@"[LineAccount] talkdb check real link=%d slot dir=%d",
+          (lstat(realC, &st2) == 0 && S_ISLNK(st2.st_mode)),
+          (stat(slotC, &st2) == 0));
 }
 
-#pragma mark - 元数据（写在 LineAccountSlots 下，不被 remap）
+#pragma mark - Talk DB / 账号事件（登录成功后失败会 unauthorize + exit(0)）
+
+static IMP orig_accountAuthorized = NULL;
+static IMP orig_accountUnauthorize = NULL;
+static IMP orig_logPersistentStoreLoadError = NULL;
+
+static void dumpTalkDBState(const char *tag) {
+    if (g_selectedSlot < 1) return;
+    NSString *realDb = [[realHomePath()
+                         stringByAppendingPathComponent:@"Library/Application Support/Messages"]
+                        stringByAppendingPathComponent:@"Line.sqlite"];
+    NSString *slotDb = [[slotHomePath(g_selectedSlot)
+                         stringByAppendingPathComponent:@"Library/Application Support/Messages"]
+                        stringByAppendingPathComponent:@"Line.sqlite"];
+    struct stat st;
+    NSLog(@"[LineAccount][%s] slot=%ld realDb=%d (%@) slotDb=%d (%@)",
+          tag, (long)g_selectedSlot,
+          stat([realDb fileSystemRepresentation], &st) == 0, realDb,
+          stat([slotDb fileSystemRepresentation], &st) == 0, slotDb);
+}
+
+static void hooked_accountEventAuthorizedAccount(id self, SEL _cmd) {
+    if (g_selectedSlot >= 1) {
+        bindRealTalkDBDirToSlot(g_selectedSlot);
+        dumpTalkDBState("beforeAuthorized");
+    }
+    if (orig_accountAuthorized) {
+        ((void (*)(id, SEL))orig_accountAuthorized)(self, _cmd);
+    }
+    dumpTalkDBState("afterAuthorized");
+}
+
+static void hooked_accountEventUnauthorizeAccountWithLevel(id self, SEL _cmd, NSInteger level) {
+    NSLog(@"[LineAccount] UNAUTHORIZE level=%ld — will likely exit(0)", (long)level);
+    dumpTalkDBState("unauthorize");
+    if (orig_accountUnauthorize) {
+        ((void (*)(id, SEL, NSInteger))orig_accountUnauthorize)(self, _cmd, level);
+    }
+}
+
+static void hooked_logPersistentStoreLoadError(id self, SEL _cmd, id error) {
+    NSLog(@"[LineAccount] TalkDB load error: %@", error);
+    dumpTalkDBState("storeLoadError");
+    if (orig_logPersistentStoreLoadError) {
+        ((void (*)(id, SEL, id))orig_logPersistentStoreLoadError)(self, _cmd, error);
+    }
+}
+
+static void installTalkDBAccountHooks(void) {
+    static BOOL done = NO;
+    if (done) return;
+
+    Class mgr = NSClassFromString(@"LineCoreDataManager");
+    if (mgr) {
+        Method m = class_getInstanceMethod(mgr, @selector(accountEventAuthorizedAccount));
+        if (m && !orig_accountAuthorized) {
+            orig_accountAuthorized = method_setImplementation(m, (IMP)hooked_accountEventAuthorizedAccount);
+            NSLog(@"[LineAccount] hooked accountEventAuthorizedAccount");
+        }
+        m = class_getInstanceMethod(mgr, @selector(accountEventUnauthorizeAccountWithLevel:));
+        if (m && !orig_accountUnauthorize) {
+            orig_accountUnauthorize = method_setImplementation(m, (IMP)hooked_accountEventUnauthorizeAccountWithLevel);
+            NSLog(@"[LineAccount] hooked accountEventUnauthorizeAccountWithLevel:");
+        }
+    } else {
+        NSLog(@"[LineAccount] LineCoreDataManager missing (talk hooks deferred)");
+    }
+
+    Class pc = NSClassFromString(@"LinePersistentContainer");
+    if (pc) {
+        Method m = class_getInstanceMethod(pc, @selector(logPersistentStoreLoadError:));
+        if (m && !orig_logPersistentStoreLoadError) {
+            orig_logPersistentStoreLoadError = method_setImplementation(m, (IMP)hooked_logPersistentStoreLoadError);
+            NSLog(@"[LineAccount] hooked logPersistentStoreLoadError:");
+            done = YES;
+        }
+    }
+
+    // 类可能晚加载
+    if (!orig_accountAuthorized || !orig_accountUnauthorize) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            Class m2 = NSClassFromString(@"LineCoreDataManager");
+            if (!m2) return;
+            if (!orig_accountAuthorized) {
+                Method mm = class_getInstanceMethod(m2, @selector(accountEventAuthorizedAccount));
+                if (mm) orig_accountAuthorized = method_setImplementation(mm, (IMP)hooked_accountEventAuthorizedAccount);
+            }
+            if (!orig_accountUnauthorize) {
+                Method mm = class_getInstanceMethod(m2, @selector(accountEventUnauthorizeAccountWithLevel:));
+                if (mm) orig_accountUnauthorize = method_setImplementation(mm, (IMP)hooked_accountEventUnauthorizeAccountWithLevel);
+            }
+        });
+    } else {
+        done = YES;
+    }
+}
 
 static NSString *metaPlistPath(void) {
     mkdirp(slotsRootPath());
@@ -193,6 +295,9 @@ static NSString *slotKeyPrefix(NSInteger slot) {
 static BOOL pathNeedsRemap(NSString *path) {
     if (path.length == 0) return NO;
     if ([path containsString:SLOT_DIR_NAME]) return NO;
+    // Talk DB（Messages/Line.sqlite）必须走真实 Home + symlink。
+    // 若 remap 到槽路径，NSFileManager 会绕开/毁掉 symlink，Core Data 仍读真实路径 → 加载失败 → unauthorize → exit(0)
+    if ([path containsString:@"/Library/Application Support/Messages"]) return NO;
     // 仅正式账号槽 remap（选号前不碰）
     if (g_selectedSlot < 1) return NO;
     NSString *home = realHomePath();
@@ -1187,10 +1292,11 @@ static void enterAccountSlot(NSInteger slot) {
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    // 选账号后：装 LFM；并把真实 Home 下 Messages 目录 symlink 到槽位（修 Talk DB，且不 hook NSHomeDirectory）
+    // 选账号后：装 LFM；Messages 不 remap，用 symlink 接到槽位；并 hook 授权/踢下线日志
     g_selectedSlot = slot;
     installLineFileManagerHooks();
     bindRealTalkDBDirToSlot(slot);
+    installTalkDBAccountHooks();
     NSLog(@"[LineAccount] selected slot %ld — talkdb bound, slot=%@",
           (long)slot, slotHomePath(slot));
     resumeLINELaunch();
