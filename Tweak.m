@@ -553,36 +553,19 @@ static NSString *remapPath(NSString *path) {
 #pragma mark - Keychain 字典改写
 
 static CFDictionaryRef rewriteKeychainQuery(CFDictionaryRef query, BOOL forWrite) {
+    (void)forWrite;
     if (!query) return query;
 
     NSDictionary *orig = (__bridge NSDictionary *)query;
+
+    // ★ Keychain 隔离已改为「交换」模型：激活槽直接用 LINE 原生的无前缀凭证（与纯净重签版
+    //   完全一致，不触发身份验证/恢复墙），切槽时再由 keychainSwap() 把整套凭证改名搬进/搬出
+    //   line.slot.N.*。因此运行时这里不再按槽加前缀，只需去掉重签 IPA 没有的 access group
+    //   （保留会导致 SecItem* → errSecMissingEntitlement -34018）。
+    if (!orig[(__bridge id)kSecAttrAccessGroup]) return query;  // 无 agrp → 原样直通，省一次拷贝
+
     NSMutableDictionary *m = [orig mutableCopy];
-
-    // 重签 IPA 没有 LINE 原 keychain-access-groups，保留会 SecItem* → -34018
     [m removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
-
-    if (g_selectedSlot >= 1) {
-        NSString *prefix = slotKeyPrefix(g_selectedSlot);
-
-        id account = m[(__bridge id)kSecAttrAccount];
-        if ([account isKindOfClass:[NSString class]]) {
-            NSString *s = (NSString *)account;
-            if (![s hasPrefix:prefix]) {
-                m[(__bridge id)kSecAttrAccount] = [prefix stringByAppendingString:s];
-            }
-        } else if (forWrite) {
-            m[(__bridge id)kSecAttrAccount] = [prefix stringByAppendingString:@"default"];
-        }
-
-        id service = m[(__bridge id)kSecAttrService];
-        if ([service isKindOfClass:[NSString class]]) {
-            NSString *s = (NSString *)service;
-            if (![s hasPrefix:prefix]) {
-                m[(__bridge id)kSecAttrService] = [prefix stringByAppendingString:s];
-            }
-        }
-    }
-
     return CFBridgingRetain(m);
 }
 
@@ -1913,6 +1896,97 @@ static void fillHomeFromSlot(NSInteger slot) {
     NSLog(@"[LineAccount] SWAP filled slot %ld -> Home", (long)slot);
 }
 
+#pragma mark - Keychain 交换（激活槽用原生无前缀凭证；非激活槽存 line.slot.N.*）
+// Keychain 不在 Home 内、删 App 也不清除，无法随文件交换。故这里用 SecItemUpdate 给
+// account 改名的方式，把整套凭证在「无前缀(激活)」与「line.slot.N.(停放)」之间搬移：
+//   drain(from): 把当前激活(无前缀)凭证 → 加前缀 line.slot.from.*  （停放）
+//   fill(to)   : 把 line.slot.to.* 凭证 → 去前缀  （成为激活，LINE 原生读取）
+// 只改 account，不动 service —— (service, account) 是 genp 主键，account 带槽前缀即可区分，
+// 且激活项 service 保持原样，LINE 用原生 query 就能命中。
+
+static SecItemCopyMatching_t kcCopy(void) {
+    return orig_SecItemCopyMatching ?: (SecItemCopyMatching_t)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
+}
+static SecItemUpdate_t kcUpdate(void) {
+    return orig_SecItemUpdate ?: (SecItemUpdate_t)dlsym(RTLD_DEFAULT, "SecItemUpdate");
+}
+static SecItemDelete_t kcDelete(void) {
+    return orig_SecItemDelete ?: (SecItemDelete_t)dlsym(RTLD_DEFAULT, "SecItemDelete");
+}
+
+static NSArray *kcAllItems(CFTypeRef klass) {
+    NSDictionary *q = @{
+        (__bridge id)kSecClass:            (__bridge id)klass,
+        (__bridge id)kSecMatchLimit:       (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes: (__bridge id)kCFBooleanTrue,
+    };
+    SecItemCopyMatching_t f = kcCopy();
+    if (!f) return @[];
+    CFTypeRef res = NULL;
+    OSStatus st = f((__bridge CFDictionaryRef)q, &res);
+    if (st != errSecSuccess || !res) return @[];
+    if (CFGetTypeID(res) != CFArrayGetTypeID()) { CFRelease(res); return @[]; }
+    return (__bridge_transfer NSArray *)res;
+}
+
+static BOOL kcHasAnySlotPrefix(NSString *s) {
+    return s.length > 0 && [s hasPrefix:@"line.slot."];
+}
+
+// 用 (klass, oldAcct[, svce]) 唯一定位一条，把 account 改成 newAcct。幂等、容错。
+static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, NSString *newAcct) {
+    if (oldAcct.length == 0 || newAcct.length == 0 || [oldAcct isEqualToString:newAcct]) return YES;
+    NSMutableDictionary *query = [@{
+        (__bridge id)kSecClass:       (__bridge id)klass,
+        (__bridge id)kSecAttrAccount: oldAcct,
+    } mutableCopy];
+    if (svce.length > 0) query[(__bridge id)kSecAttrService] = svce;
+
+    NSDictionary *attrs = @{ (__bridge id)kSecAttrAccount: newAcct };
+    SecItemUpdate_t up = kcUpdate();
+    if (!up) return NO;
+    OSStatus st = up((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)attrs);
+    if (st == errSecSuccess || st == errSecItemNotFound) return YES;
+    if (st == errSecDuplicateItem) {
+        // 目标名已存在（多为上次残留未搬回）→ 删掉冗余源项，保留已存在的目标
+        SecItemDelete_t del = kcDelete();
+        if (del) del((__bridge CFDictionaryRef)query);
+        NSLog(@"[LineAccount] KC dup, dropped source acct=%@ svce=%@", oldAcct, svce);
+        return YES;
+    }
+    NSLog(@"[LineAccount] KC rename FAIL st=%d acct=%@ -> %@ svce=%@", (int)st, oldAcct, newAcct, svce);
+    return NO;
+}
+
+static void keychainSwap(NSInteger slot, BOOL addPrefix) {
+    if (slot < 1 || slot > ACCOUNT_COUNT) return;
+    NSString *prefix = slotKeyPrefix(slot);   // line.slot.N.
+    CFTypeRef classes[] = { kSecClassGenericPassword, kSecClassInternetPassword };
+    int changed = 0;
+    for (int ci = 0; ci < 2; ci++) {
+        CFTypeRef klass = classes[ci];
+        for (NSDictionary *it in kcAllItems(klass)) {
+            id acctObj = it[(__bridge id)kSecAttrAccount];
+            id svceObj = it[(__bridge id)kSecAttrService];
+            NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
+            NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
+            if (acct.length == 0) continue;   // 只处理有 account 的项
+
+            if (addPrefix) {
+                if (kcHasAnySlotPrefix(acct)) continue;         // 已带任意槽前缀 → 不是激活项，跳过
+                if (kcRenameAccount(klass, acct, svce, [prefix stringByAppendingString:acct])) changed++;
+            } else {
+                if (![acct hasPrefix:prefix]) continue;          // 只搬本槽的
+                if (kcRenameAccount(klass, acct, svce, [acct substringFromIndex:prefix.length])) changed++;
+            }
+        }
+    }
+    NSLog(@"[LineAccount] KC swap slot %ld addPrefix=%d changed=%d", (long)slot, addPrefix, changed);
+}
+
+static void drainKeychainToSlot(NSInteger slot)  { keychainSwap(slot, YES); }
+static void fillKeychainFromSlot(NSInteger slot) { keychainSwap(slot, NO); }
+
 // 切换到目标槽：先把上一个账号的实时数据搬回它的槽，再把目标槽数据搬进 Home。
 static void swapToSlot(NSInteger to) {
     if (to < 1 || to > ACCOUNT_COUNT) return;
@@ -1923,10 +1997,14 @@ static void swapToSlot(NSInteger to) {
     }
     NSLog(@"[LineAccount] SWAP %ld -> %ld begin", (long)from, (long)to);
     writeJournal(from, to, @"drain");
-    if (from >= 1) drainHomeToSlot(from);
+    if (from >= 1) {
+        drainHomeToSlot(from);
+        drainKeychainToSlot(from);       // 上一号的凭证 → line.slot.from.*（停放）
+    }
     writeCurrentSlot(0);                 // Home 已清空（数据在各槽），中间安全静止点
     writeJournal(from, to, @"fill");
     fillHomeFromSlot(to);
+    fillKeychainFromSlot(to);            // 目标槽凭证 → 去前缀，成为 LINE 原生激活凭证
     writeCurrentSlot(to);
     clearJournal();
     NSLog(@"[LineAccount] SWAP %ld -> %ld done", (long)from, (long)to);
@@ -1945,10 +2023,11 @@ static void recoverSwapJournalIfAny(void) {
     NSLog(@"[LineAccount] SWAP 检测到中断的交换 from=%ld to=%ld phase=%@ — 自愈中",
           (long)from, (long)to, phase);
     if ([phase isEqualToString:@"drain"]) {
-        if (from >= 1) drainHomeToSlot(from);
+        if (from >= 1) { drainHomeToSlot(from); drainKeychainToSlot(from); }
         writeCurrentSlot(0);             // 停在「Home 空、数据在槽」，交给选择页重新决定
     } else { // fill
         fillHomeFromSlot(to);
+        fillKeychainFromSlot(to);
         writeCurrentSlot(to);
     }
     clearJournal();
