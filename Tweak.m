@@ -252,18 +252,7 @@ static void installRuntimeHooks(void) {
     if (g_hooksInstalled) return;
     g_hooksInstalled = YES;
 
-    // Keychain
-    orig_SecItemAdd = (SecItemAdd_t)dlsym(RTLD_DEFAULT, "SecItemAdd");
-    orig_SecItemCopyMatching = (SecItemCopyMatching_t)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
-    orig_SecItemUpdate = (SecItemUpdate_t)dlsym(RTLD_DEFAULT, "SecItemUpdate");
-    orig_SecItemDelete = (SecItemDelete_t)dlsym(RTLD_DEFAULT, "SecItemDelete");
-
-    // 用 fishhook 风格不可直接替换导出符号时，优先用 method swizzle；
-    // 这里对 Security C API 采用简单的函数指针保存 + 后续可用 substrate/fishhook。
-    // 非越狱注入场景：用 ObjC 层 NSFileManager + App Group 覆盖主路径；
-    // Keychain 用 runtime interpose 较难，下面用 dlsym 记录，真正替换需 fishhook。
-    // 为在无第三方库时尽量可用，Keychain 改写放到 ObjC 包装层；此处先装 FileManager。
-
+    // 与 imToken HookDylib 相同：ObjC method_setImplementation（非越狱可用）
     Class fm = [NSFileManager class];
     Method m;
 
@@ -300,13 +289,17 @@ static void installRuntimeHooks(void) {
     NSLog(@"[LineAccount] FileManager / AppGroup hooks installed");
 }
 
-#pragma mark - fishhook Keychain（内嵌精简版）
+#pragma mark - fishhook Keychain（非越狱可用：只改 App 内镜像 + vm_protect）
 
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <mach/mach.h>
+#include <sys/mman.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -328,6 +321,48 @@ struct rebinding {
     void **replaced;
 };
 
+static bool image_is_app_local(const struct mach_header *header) {
+    Dl_info info;
+    if (dladdr(header, &info) == 0 || !info.dli_fname) return false;
+    const char *p = info.dli_fname;
+    // 跳过系统库 / dyld shared cache，避免写只读页崩溃（非越狱必做）
+    if (strncmp(p, "/System/", 8) == 0) return false;
+    if (strncmp(p, "/usr/lib/", 9) == 0) return false;
+    if (strncmp(p, "/Developer/", 11) == 0) return false;
+    if (strstr(p, "LineAccount.dylib") != NULL) return false; // 不要 hook 自己
+    // 只处理 App 包内镜像
+    return strstr(p, ".app/") != NULL;
+}
+
+static bool safe_write_ptr(void **slot, void *value) {
+    if (!slot) return false;
+    size_t page = (size_t)getpagesize();
+    uintptr_t addr = (uintptr_t)slot;
+    uintptr_t page_start = addr & ~(page - 1);
+
+    // iOS 上 __DATA_CONST 只读，必须先改权限（非越狱同样适用）
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  (vm_address_t)page_start,
+                                  (vm_size_t)page,
+                                  false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        if (mprotect((void *)page_start, page, PROT_READ | PROT_WRITE) != 0) {
+            NSLog(@"[LineAccount] vm_protect/mprotect failed for %p kr=%d", slot, kr);
+            return false;
+        }
+    }
+
+    *slot = value;
+
+    vm_protect(mach_task_self(),
+               (vm_address_t)page_start,
+               (vm_size_t)page,
+               false,
+               VM_PROT_READ | VM_PROT_COPY);
+    return true;
+}
+
 static int perform_rebinding_with_section(struct rebinding rebindings[], size_t count,
                                           section_t *sect, intptr_t slide, nlist_t *symtab,
                                           char *strtab, uint32_t *indirect_symtab) {
@@ -344,10 +379,13 @@ static int perform_rebinding_with_section(struct rebinding rebindings[], size_t 
         if (name && name[0] == '_') {
             for (size_t j = 0; j < count; j++) {
                 if (strcmp(&name[1], rebindings[j].name) == 0) {
-                    if (rebindings[j].replaced && bindings[i] != rebindings[j].replacement) {
+                    if (rebindings[j].replaced != NULL &&
+                        bindings[i] != rebindings[j].replacement) {
                         *(rebindings[j].replaced) = bindings[i];
                     }
-                    bindings[i] = rebindings[j].replacement;
+                    if (!safe_write_ptr(&bindings[i], rebindings[j].replacement)) {
+                        NSLog(@"[LineAccount] skip bind %s (page not writable)", rebindings[j].name);
+                    }
                     break;
                 }
             }
@@ -358,8 +396,11 @@ static int perform_rebinding_with_section(struct rebinding rebindings[], size_t 
 
 static void rebind_symbols_for_image(const struct mach_header *header, intptr_t slide,
                                      struct rebinding rebindings[], size_t count) {
+    if (!image_is_app_local(header)) return;
+
     Dl_info info;
     if (dladdr(header, &info) == 0) return;
+    NSLog(@"[LineAccount] rebind image: %s", info.dli_fname);
 
     segment_command_t *curSeg = NULL;
     segment_command_t *linkedit = NULL;
@@ -388,8 +429,9 @@ static void rebind_symbols_for_image(const struct mach_header *header, intptr_t 
     for (uint32_t i = 0; i < header->ncmds; i++, cur += curSeg->cmdsize) {
         curSeg = (segment_command_t *)cur;
         if (curSeg->cmd == LC_SEGMENT_CMD) {
+            section_t *sects = (section_t *)(cur + sizeof(segment_command_t));
             for (uint32_t j = 0; j < curSeg->nsects; j++) {
-                section_t *sect = (section_t *)(cur + sizeof(segment_command_t)) + j;
+                section_t *sect = &sects[j];
                 if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
                     (sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
                     perform_rebinding_with_section(rebindings, count, sect, slide, symtab, strtab, indirect);
@@ -403,6 +445,7 @@ static struct rebinding *g_rebindings = NULL;
 static size_t g_rebindings_count = 0;
 
 static void _rebind_for_image(const struct mach_header *header, intptr_t slide) {
+    if (g_rebindings_count == 0) return;
     rebind_symbols_for_image(header, slide, g_rebindings, g_rebindings_count);
 }
 
@@ -424,6 +467,16 @@ static int rebind_symbols(struct rebinding rebindings[], size_t count) {
 }
 
 static void installKeychainHooks(void) {
+    // 先保留原始指针，防止 rebind 失败时调用空指针
+    if (!orig_SecItemAdd)
+        orig_SecItemAdd = (SecItemAdd_t)dlsym(RTLD_DEFAULT, "SecItemAdd");
+    if (!orig_SecItemCopyMatching)
+        orig_SecItemCopyMatching = (SecItemCopyMatching_t)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
+    if (!orig_SecItemUpdate)
+        orig_SecItemUpdate = (SecItemUpdate_t)dlsym(RTLD_DEFAULT, "SecItemUpdate");
+    if (!orig_SecItemDelete)
+        orig_SecItemDelete = (SecItemDelete_t)dlsym(RTLD_DEFAULT, "SecItemDelete");
+
     struct rebinding rebs[4] = {
         {"SecItemAdd", (void *)hooked_SecItemAdd, (void **)&orig_SecItemAdd},
         {"SecItemCopyMatching", (void *)hooked_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching},
@@ -431,7 +484,7 @@ static void installKeychainHooks(void) {
         {"SecItemDelete", (void *)hooked_SecItemDelete, (void **)&orig_SecItemDelete},
     };
     rebind_symbols(rebs, 4);
-    NSLog(@"[LineAccount] Keychain hooks installed");
+    NSLog(@"[LineAccount] Keychain hooks installed (app-local + vm_protect, non-JB OK)");
 }
 
 #pragma mark - 账号选择 UI
