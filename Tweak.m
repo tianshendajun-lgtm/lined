@@ -964,8 +964,8 @@ static void dismissPicker(void) {
 
 // 把带 rootVC 的主窗口设为 key；藏掉空覆盖层
 static void promoteMainWindowOnce(void) {
-    UIWindow *best = nil;
-    CGFloat bestArea = 0;
+    __block UIWindow *best = nil;
+    __block CGFloat bestArea = 0;
 
     void (^scan)(UIWindow *) = ^(UIWindow *w) {
         if (!w) return;
