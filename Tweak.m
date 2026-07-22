@@ -290,7 +290,7 @@ static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL interm
     // 若传入的是枚举整数/nil：不要「假装建成功」，直接失败，避免 LINE 后续 Swift 解包其它 nil 崩掉。
     // 真正的 store 路径应由 LineFileManager fileURL* hook 提供。
     if (isBogusObjPtr((__bridge void *)url)) {
-        NSLog(@"[LineAccount] blocked createDirectoryAtURL:bogus %p", (void *)url);
+        NSLog(@"[LineAccount] blocked createDirectoryAtURL:bogus %p", (__bridge void *)url);
         if (err) {
             *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
                                    userInfo:@{NSLocalizedDescriptionKey: @"URL is bogus (blocked)"}];
