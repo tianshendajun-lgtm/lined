@@ -98,22 +98,21 @@ static void mkdirp(NSString *path) {
 }
 
 static void ensureSlotDirectories(NSInteger slot) {
-    // slot==0：选择页出现前的临时沙盒，防止 App Group URL 为 nil
+    // 与 LINE 真实布局对齐：PrivateStore 在 Library/Application Support 下，不在 AppGroup 嵌套里
+    // SSH 已证实真实路径是：$HOME/Library/Application Support/PrivateStore/
     NSArray *subs = @[
         @"Documents",
         @"Library/Preferences",
         @"Library/Caches",
         @"Library/Application Support",
         @"Library/Application Support/Messages",
+        @"Library/Application Support/PrivateStore",
+        @"Library/Application Support/PrivateStore/t0",
+        @"Library/Application Support/PublicStore",
         @"tmp",
+        // 仍保留假 App Group 根（其它 API 可能问 containerURL），但不再把 Talk DB 放这里
         @"AppGroup/group.com.linecorp.line",
-        // ★ 实测 Talk DB：AppGroup/.../PrivateStore/t0/Line.sqlite
-        @"AppGroup/group.com.linecorp.line/Library",
-        @"AppGroup/group.com.linecorp.line/Library/Application Support",
-        @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore",
-        @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore/t0",
         @"AppGroup/group.com.linecorp.Line.encrypted.app",
-        @"AppGroup/group.com.linecorp.Line.encrypted.app/Library/Application Support/PrivateStore",
         @"AppGroup/group.share.com.linecorp.line",
         @"AppGroup/group.com.linecorp.Line.encrypted.share",
         @"AppGroup/group.com.linecorp.Line.encrypted.standard",
@@ -123,24 +122,31 @@ static void ensureSlotDirectories(NSInteger slot) {
     for (NSString *sub in subs) {
         mkdirp([root stringByAppendingPathComponent:sub]);
     }
-    // 预建 PrivateStore/tN
-    NSString *ps = [root stringByAppendingPathComponent:
-                    @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore"];
+    NSString *ps = [root stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
     mkdirp(ps);
     for (NSInteger i = 0; i <= 128; i++) {
         mkdirp([ps stringByAppendingPathComponent:[NSString stringWithFormat:@"t%ld", (long)i]]);
     }
+    // 真实 Home 下也建齐（登录时 LINE 可能直接用真实 AS/PrivateStore）
+    NSString *realPS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
+    mkdirp(realPS);
+    for (NSInteger i = 0; i <= 128; i++) {
+        mkdirp([realPS stringByAppendingPathComponent:[NSString stringWithFormat:@"t%ld", (long)i]]);
+    }
+
     NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
     [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:ps error:nil];
+    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realPS error:nil];
     NSString *msgDir = [root stringByAppendingPathComponent:@"Library/Application Support/Messages"];
     mkdirp(msgDir);
     [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:msgDir error:nil];
 
-    // 诊断：确认 t0 真是目录
     NSString *t0 = [ps stringByAppendingPathComponent:@"t0"];
     struct stat st;
-    NSLog(@"[LineAccount] PrivateStore/t0 is_dir=%d path=%@",
-          (stat([t0 fileSystemRepresentation], &st) == 0 && S_ISDIR(st.st_mode)), t0);
+    NSLog(@"[LineAccount] slot=%ld root=%@ PrivateStore/t0 is_dir=%d realPS is_dir=%d",
+          (long)slot, root,
+          (stat([t0 fileSystemRepresentation], &st) == 0 && S_ISDIR(st.st_mode)),
+          (stat([realPS fileSystemRepresentation], &st) == 0 && S_ISDIR(st.st_mode)));
 }
 
 // Talk DB 策略（已证实 symlink 易 ENOENT）：
@@ -505,20 +511,21 @@ static OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
 }
 
 static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
-    // 选账号前不要合成 App Group：空目录会被 LINE 当真实 store 去 PropertyListDecoder → 崩
+    // 选账号前不要合成 App Group
     if (g_selectedSlot < 1) {
         if (orig_containerURL) {
             return orig_containerURL(self, _cmd, groupId);
         }
         return nil;
     }
-    // 已选账号：重签无 entitlement，必须合成路径
+    // SSH 实证：Talk DB 在 $HOME/Library/Application Support/PrivateStore
+    // LINE 会做：containerURL + "Library/Application Support/PrivateStore/tN"
+    // 因此假 group 根必须是「槽位 home」，不能再套一层 AppGroup/groupId（那条链 createDir 全失败且磁盘上根本没有 LineAccountSlots/AppGroup）
     if (groupId.length > 0) {
         ensureSlotDirectories(g_selectedSlot);
-        NSString *path = [[slotHomePath(g_selectedSlot)
-                           stringByAppendingPathComponent:@"AppGroup"]
-                          stringByAppendingPathComponent:groupId];
+        NSString *path = slotHomePath(g_selectedSlot);
         mkdirp(path);
+        NSLog(@"[LineAccount] containerURL(%@) -> %@", groupId, path);
         return [NSURL fileURLWithPath:path isDirectory:YES];
     }
     if (orig_containerURL) {
@@ -829,19 +836,33 @@ static NSURL *remapFileURL(NSURL *url) {
     return [NSURL fileURLWithPath:mapped isDirectory:isDir];
 }
 
-// App Group 下真实结构更接近：.../AppGroup/<group>/Library/Application Support/PrivateStore/<token>
+// SSH 实证：真实布局是 $HOME/Library/Application Support/PrivateStore/
+// containerURL 已返回槽位 home，故这里与 LINE 拼接结果一致
 static NSURL *syntheticPrivateStoreURL(NSString *token, NSString *sub) {
     NSInteger slot = activeSlotOrZero();
     ensureSlotDirectories(slot);
-    if (token.length == 0) token = @"default";
-    NSString *path = [[[slotHomePath(slot)
-                        stringByAppendingPathComponent:@"AppGroup/group.com.linecorp.line"]
+    if (token.length == 0) token = @"t0";
+    // 统一用 tN 命名（LINE / 探针日志都是 t0、t31…）
+    if (![token hasPrefix:@"t"] && ![token hasPrefix:@"st"] && ![token hasPrefix:@"p"]) {
+        token = [NSString stringWithFormat:@"t%@", token];
+    }
+    if ([token hasPrefix:@"st"]) {
+        token = [@"t" stringByAppendingString:[token substringFromIndex:2]];
+    }
+    NSString *path = [[slotHomePath(slot)
                        stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]
                       stringByAppendingPathComponent:token];
     if (sub.length > 0) {
         path = [path stringByAppendingPathComponent:sub];
     }
     mkdirp(path);
+    // 同步在真实 Home 建一份，避免有的代码不走 containerURL
+    NSString *realPath = [[realHomePath()
+                           stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]
+                          stringByAppendingPathComponent:token];
+    if (sub.length > 0) realPath = [realPath stringByAppendingPathComponent:sub];
+    mkdirp(realPath);
+    NSLog(@"[LineAccount] PrivateStore -> %@", path);
     return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
@@ -865,7 +886,7 @@ static BOOL hooked_privateFileStoresAreAccessible(Class cls, SEL sel) {
 static NSURL *(*orig_fileURLForStoreType)(Class, SEL, NSInteger) = NULL;
 static NSURL *hooked_fileURLForStoreType(Class cls, SEL sel, NSInteger storeType) {
     (void)cls; (void)sel; (void)orig_fileURLForStoreType;
-    NSURL *url = syntheticPrivateStoreURL([NSString stringWithFormat:@"st%ld", (long)storeType], nil);
+    NSURL *url = syntheticPrivateStoreURL([NSString stringWithFormat:@"t%ld", (long)storeType], nil);
     NSLog(@"[LineAccount] fileURLForStoreType:%ld -> %@", (long)storeType, url.path);
     return url;
 }
@@ -1591,6 +1612,7 @@ static void line_account_init(void) {
     g_launchResumed = NO;
     (void)realHomePath(); // 启动最早缓存真实 Home
     mkdirp(slotsRootPath());
+    NSLog(@"[LineAccount] realHome=%@ slots=%@", realHomePath(), slotsRootPath());
 
     installRuntimeHooks();
     installKeychainHooks();
