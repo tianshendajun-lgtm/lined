@@ -287,16 +287,15 @@ static NSString *pathFromMaybeBogus(NSString *path) {
 
 static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL intermediates,
                                       NSDictionary *attr, NSError **err) {
+    // 若传入的是枚举整数/nil：不要「假装建成功」，直接失败，避免 LINE 后续 Swift 解包其它 nil 崩掉。
+    // 真正的 store 路径应由 LineFileManager fileURL* hook 提供。
     if (isBogusObjPtr((__bridge void *)url)) {
-        url = urlFromMaybeBogus(url);
-        if (isBogusObjPtr((__bridge void *)url)) {
-            NSLog(@"[LineAccount] blocked createDirectoryAtURL:bogus/nil");
-            if (err) {
-                *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
-                                       userInfo:@{NSLocalizedDescriptionKey: @"URL is bogus (blocked)"}];
-            }
-            return NO;
+        NSLog(@"[LineAccount] blocked createDirectoryAtURL:bogus %p", (void *)url);
+        if (err) {
+            *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
+                                   userInfo:@{NSLocalizedDescriptionKey: @"URL is bogus (blocked)"}];
         }
+        return NO;
     }
     NSString *path = url.path;
     if (path.length == 0) {
@@ -1077,11 +1076,12 @@ static void enterAccountSlot(NSInteger slot) {
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    // 先切沙盒，再放行 LINE（无需重启进程）
-    // 注意：不要在登录前装 LineFileManager hooks——
-    // privateFileStoresAreAccessible=YES 会让点「登入」时走坏路径 → libobjc AV
+    // 先切沙盒 + 安装「只合成 URL、不调 orig」的 LFM hooks。
+    // 不装的话 fileURL 为 nil → 点登入后 Swift fatalError(breakpoint)；
+    // 装且调 orig / 把枚举当对象 → libobjc AV。必须走合成路径。
     g_selectedSlot = slot;
-    NSLog(@"[LineAccount] selected slot %ld — continue without restart (LFM hooks deferred until stable)", (long)slot);
+    installLineFileManagerHooks();
+    NSLog(@"[LineAccount] selected slot %ld — LFM synthetic hooks on, resume launch", (long)slot);
     resumeLINELaunch();
 }
 
