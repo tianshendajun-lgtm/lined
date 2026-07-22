@@ -206,6 +206,8 @@ static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
           [[NSFileManager defaultManager] fileExistsAtPath:realDb]);
 }
 
+static NSMutableDictionary *loadMeta(void); // forward — used by bindRealTalkDBDirToSlot
+
 static void bindRealTalkDBDirToSlot(NSInteger slot) {
     NSInteger prev = 0;
     NSDictionary *meta = loadMeta();
