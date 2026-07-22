@@ -150,8 +150,9 @@ static void ensureSlotDirectories(NSInteger slot) {
 }
 
 // Talk DB 策略（已证实 symlink 易 ENOENT）：
-// - 运行时始终用真实 Home/.../Messages（不 remap）
-// - 选账号时：先把当前真实 Messages 存回旧槽，再把新槽 Messages 拷到真实路径
+// - 运行时始终用真实 Home/.../Messages + PrivateStore（不 remap）
+// - 选账号时：换槽才切换；同槽重进只回写槽位、绝不 wipe 真实数据
+// - 进后台 / 登录成功后再把真实数据持久化到当前槽
 static void removePathPOSIX(NSString *path) {
     if (path.length == 0) return;
     const char *c = [path fileSystemRepresentation];
@@ -185,91 +186,100 @@ static BOOL copyDirContents(NSString *src, NSString *dst) {
     return YES;
 }
 
+static void replaceDirFromSrc(NSString *src, NSString *dst) {
+    mkdirp([dst stringByDeletingLastPathComponent]);
+    removePathPOSIX(dst);
+    mkdirp(dst);
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:src error:nil];
+    if (items.count == 0) return;
+    copyDirContents(src, dst);
+}
+
+// 把真实运行态 Talk 数据写回指定槽（登录态/聊天记录持久化）
+static void persistRealTalkDataToSlot(NSInteger slot) {
+    if (slot < 1 || slot > ACCOUNT_COUNT) return;
+    ensureSlotDirectories(slot);
+
+    NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
+    NSString *slotAS = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support"];
+    mkdirp(slotAS);
+
+    NSArray *names = @[@"Messages", @"PrivateStore", @"PublicStore"];
+    for (NSString *name in names) {
+        NSString *src = [realAS stringByAppendingPathComponent:name];
+        NSString *dst = [slotAS stringByAppendingPathComponent:name];
+        const char *c = [src fileSystemRepresentation];
+        struct stat st;
+        if (!c || lstat(c, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) {
+            unlink(c);
+            continue;
+        }
+        if (!S_ISDIR(st.st_mode)) continue;
+        replaceDirFromSrc(src, dst);
+        NSLog(@"[LineAccount] persist %@ real -> slot %ld", name, (long)slot);
+    }
+}
+
+static void loadTalkDataFromSlotToReal(NSInteger slot) {
+    NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
+    NSString *slotAS = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support"];
+    mkdirp(realAS);
+
+    NSArray *names = @[@"Messages", @"PrivateStore", @"PublicStore"];
+    for (NSString *name in names) {
+        NSString *src = [slotAS stringByAppendingPathComponent:name];
+        NSString *dst = [realAS stringByAppendingPathComponent:name];
+        // 先清真实目录，再按槽位恢复（空槽 = 新号）
+        removePathPOSIX(dst);
+        mkdirp(dst);
+        NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:src error:nil];
+        if (items.count > 0) {
+            copyDirContents(src, dst);
+            NSLog(@"[LineAccount] load %@ slot %ld -> real (%lu)", name, (long)slot, (unsigned long)items.count);
+        } else {
+            if ([name isEqualToString:@"PrivateStore"]) {
+                mkdirp([dst stringByAppendingPathComponent:@"t0"]);
+            }
+            NSLog(@"[LineAccount] fresh %@ for slot %ld", name, (long)slot);
+        }
+        NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
+        [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:dst error:nil];
+    }
+}
+
 static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
     if (slot < 1) return;
 
     NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
-    NSString *realMsg = [realAS stringByAppendingPathComponent:@"Messages"];
-    NSString *slotMsg = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
-    NSString *realPS = [realAS stringByAppendingPathComponent:@"PrivateStore"];
-    NSString *slotPS = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
-
-    // 1) 真实父目录必须存在
     mkdirp(realAS);
-    mkdirp([slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support"]);
-    mkdirp(slotMsg);
-    mkdirp(slotPS);
     ensureSlotDirectories(slot);
 
-    // 2) 拆掉坏 symlink
-    const char *realC = [realMsg fileSystemRepresentation];
-    struct stat st;
-    if (realC && lstat(realC, &st) == 0 && S_ISLNK(st.st_mode)) {
-        NSLog(@"[LineAccount] removing stale Messages symlink");
-        unlink(realC);
-    }
-    const char *realPSC = [realPS fileSystemRepresentation];
-    if (realPSC && lstat(realPSC, &st) == 0 && S_ISLNK(st.st_mode)) {
-        NSLog(@"[LineAccount] removing stale PrivateStore symlink");
-        unlink(realPSC);
-    }
-
-    // 3) 当前真实 Messages / PrivateStore → 旧槽
-    if (previousSlot >= 1 && previousSlot <= ACCOUNT_COUNT && previousSlot != slot) {
-        if (realC && lstat(realC, &st) == 0 && S_ISDIR(st.st_mode)) {
-            NSString *prevMsg = [slotHomePath(previousSlot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
-            mkdirp(prevMsg);
-            NSArray *old = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prevMsg error:nil];
-            for (NSString *n in old) {
-                removePathPOSIX([prevMsg stringByAppendingPathComponent:n]);
-            }
-            copyDirContents(realMsg, prevMsg);
-            NSLog(@"[LineAccount] saved talkdb real -> slot %ld", (long)previousSlot);
-        }
-        if (realPSC && lstat(realPSC, &st) == 0 && S_ISDIR(st.st_mode)) {
-            NSString *prevPS = [slotHomePath(previousSlot) stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
-            mkdirp(prevPS);
-            NSArray *old = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prevPS error:nil];
-            for (NSString *n in old) {
-                removePathPOSIX([prevPS stringByAppendingPathComponent:n]);
-            }
-            copyDirContents(realPS, prevPS);
-            NSLog(@"[LineAccount] saved PrivateStore real -> slot %ld", (long)previousSlot);
+    // 拆掉坏 symlink（真实路径上）
+    for (NSString *name in @[@"Messages", @"PrivateStore", @"PublicStore"]) {
+        NSString *p = [realAS stringByAppendingPathComponent:name];
+        const char *c = [p fileSystemRepresentation];
+        struct stat st;
+        if (c && lstat(c, &st) == 0 && S_ISLNK(st.st_mode)) {
+            NSLog(@"[LineAccount] removing stale %@ symlink", name);
+            unlink(c);
         }
     }
 
-    // 4) 新槽 → 真实 Messages
-    removePathPOSIX(realMsg);
-    mkdirp(realMsg);
-    NSArray *slotItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:slotMsg error:nil];
-    if (slotItems.count > 0) {
-        copyDirContents(slotMsg, realMsg);
-        NSLog(@"[LineAccount] loaded talkdb slot %ld -> real (%lu files)",
-              (long)slot, (unsigned long)slotItems.count);
+    // ★ 同槽重进（重启后再选同一账号）：绝不能 wipe 真实数据
+    //   旧逻辑会 remove PrivateStore 再从空槽覆盖 → 丢登录态/聊天记录
+    if (previousSlot == slot) {
+        persistRealTalkDataToSlot(slot);
+        NSLog(@"[LineAccount] same slot %ld re-enter: kept real Talk DB, backed up to slot", (long)slot);
     } else {
-        NSLog(@"[LineAccount] fresh talkdb for slot %ld (empty)", (long)slot);
+        if (previousSlot >= 1 && previousSlot <= ACCOUNT_COUNT) {
+            persistRealTalkDataToSlot(previousSlot);
+        }
+        loadTalkDataFromSlotToReal(slot);
     }
 
-    // 5) 新槽 → 真实 PrivateStore（Talk Core Data 实际落点）
-    removePathPOSIX(realPS);
-    mkdirp(realPS);
-    NSArray *psItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:slotPS error:nil];
-    if (psItems.count > 0) {
-        copyDirContents(slotPS, realPS);
-        NSLog(@"[LineAccount] loaded PrivateStore slot %ld -> real (%lu items)",
-              (long)slot, (unsigned long)psItems.count);
-    } else {
-        mkdirp([realPS stringByAppendingPathComponent:@"t0"]);
-        NSLog(@"[LineAccount] fresh PrivateStore for slot %ld", (long)slot);
-    }
-
-    NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
-    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realMsg error:nil];
-    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realPS error:nil];
-    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realAS error:nil];
-
-    NSString *realDb = [realMsg stringByAppendingPathComponent:@"Line.sqlite"];
-    NSString *realTalk = [realPS stringByAppendingPathComponent:@"t0/Line.sqlite"];
+    NSString *realDb = [realAS stringByAppendingPathComponent:@"Messages/Line.sqlite"];
+    NSString *realTalk = [realAS stringByAppendingPathComponent:@"PrivateStore/t0/Line.sqlite"];
     NSLog(@"[LineAccount] talkdb ready Messages=%d PrivateStore/t0=%d",
           [[NSFileManager defaultManager] fileExistsAtPath:realDb],
           [[NSFileManager defaultManager] fileExistsAtPath:realTalk]);
@@ -321,6 +331,34 @@ static void hooked_accountEventAuthorizedAccount(id self, SEL _cmd) {
         ((void (*)(id, SEL))orig_accountAuthorized)(self, _cmd);
     }
     dumpTalkDBState("afterAuthorized");
+    // 登录成功后尽快落盘到槽位，避免杀进程后槽位仍空
+    if (g_selectedSlot >= 1) {
+        persistRealTalkDataToSlot(g_selectedSlot);
+    }
+}
+
+static void onAppWillPersistTalkData(NSNotification *note) {
+    (void)note;
+    if (g_selectedSlot >= 1) {
+        persistRealTalkDataToSlot(g_selectedSlot);
+    }
+}
+
+static void installTalkDataPersistObservers(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserverForName:UIApplicationWillResignActiveNotification
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n) { onAppWillPersistTalkData(n); }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n) { onAppWillPersistTalkData(n); }];
+    [nc addObserverForName:UIApplicationWillTerminateNotification
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n) { onAppWillPersistTalkData(n); }];
+    NSLog(@"[LineAccount] Talk DB persist observers installed");
 }
 
 static void hooked_accountEventUnauthorizeAccountWithLevel(id self, SEL _cmd, NSInteger level) {
@@ -1465,13 +1503,14 @@ static void enterAccountSlot(NSInteger slot) {
     installLineFileManagerHooks();
     bindRealTalkDBDirToSlot(slot);
     installTalkDBAccountHooks();
+    installTalkDataPersistObservers();
 
     NSMutableDictionary *meta = loadMeta();
     meta[@"selectedSlot"] = @(slot);
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    NSLog(@"[LineAccount] selected slot %ld — talkdb synced to real Messages", (long)slot);
+    NSLog(@"[LineAccount] selected slot %ld — talkdb ready (same-slot keeps real data)", (long)slot);
     resumeLINELaunch();
 }
 
