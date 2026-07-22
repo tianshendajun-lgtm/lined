@@ -129,11 +129,11 @@ static void ensureSlotDirectories(NSInteger slot) {
         @"Library/Application Support/PrivateStore",
         @"Library/Application Support/PublicStore",
         @"tmp",
-        @"AppGroup/group.com.linecorp.line",
-        @"AppGroup/group.com.linecorp.Line.encrypted.app",
-        @"AppGroup/group.share.com.linecorp.line",
-        @"AppGroup/group.com.linecorp.Line.encrypted.share",
-        @"AppGroup/group.com.linecorp.Line.encrypted.standard",
+        @"Library/AppGroup/group.com.linecorp.line",
+        @"Library/AppGroup/group.com.linecorp.Line.encrypted.app",
+        @"Library/AppGroup/group.share.com.linecorp.line",
+        @"Library/AppGroup/group.com.linecorp.Line.encrypted.share",
+        @"Library/AppGroup/group.com.linecorp.Line.encrypted.standard",
     ];
     NSString *root = slotHomePath(slot);
     mkdirp(root);
@@ -544,7 +544,8 @@ static NSString *remapPath(NSString *path) {
     NSRange r = [path rangeOfString:@"/Library/Group Containers/"];
     if (r.location != NSNotFound) {
         NSString *after = [path substringFromIndex:r.location + r.length];
-        return [[slotHome stringByAppendingPathComponent:@"AppGroup"]
+        return [[[slotHome stringByAppendingPathComponent:@"Library"]
+                 stringByAppendingPathComponent:@"AppGroup"]
                 stringByAppendingPathComponent:after];
     }
     return path;
@@ -629,7 +630,10 @@ static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
     if (groupId.length == 0) {
         return orig_containerURL ? orig_containerURL(self, _cmd, groupId) : nil;
     }
-    NSString *path = [[realHomePath() stringByAppendingPathComponent:@"AppGroup"]
+    // ★ 必须放在 Library/ 下：容器根目录 <UUID>/ 禁止新建顶层目录(EPERM)，
+    //   否则 <UUID>/AppGroup 建不出来 → 其下所有 mkdir ENOENT → MessageExt CoreData 崩。
+    NSString *path = [[[realHomePath() stringByAppendingPathComponent:@"Library"]
+                       stringByAppendingPathComponent:@"AppGroup"]
                       stringByAppendingPathComponent:groupId];
     mkdirp(path);
     // ★ iOS 真实 App Group 容器由系统预建了 Library/Caches 等骨架目录。重定向到 Home 内后
@@ -1895,7 +1899,7 @@ static NSArray<NSString *> *swapItems(void) {
         @"Library/Caches",
         @"Library/Cookies",
         @"Library/WebKit",
-        @"AppGroup",
+        @"Library/AppGroup",
     ];
 }
 
@@ -2402,7 +2406,7 @@ static void line_account_init(void) {
     recoverSwapJournalIfAny();
 
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] BUILD=swap+kcswap+cd-loadPS-mkdir v4");
+    NSLog(@"[LineAccount] BUILD=appgroup-under-Library v5");
     NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
     NSLog(@"[LineAccount] ========================================");
 
