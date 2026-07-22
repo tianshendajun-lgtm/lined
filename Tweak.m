@@ -191,11 +191,14 @@ static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
     NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
     NSString *realMsg = [realAS stringByAppendingPathComponent:@"Messages"];
     NSString *slotMsg = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
+    NSString *realPS = [realAS stringByAppendingPathComponent:@"PrivateStore"];
+    NSString *slotPS = [slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
 
     // 1) 真实父目录必须存在
     mkdirp(realAS);
     mkdirp([slotHomePath(slot) stringByAppendingPathComponent:@"Library/Application Support"]);
     mkdirp(slotMsg);
+    mkdirp(slotPS);
     ensureSlotDirectories(slot);
 
     // 2) 拆掉坏 symlink
@@ -205,18 +208,34 @@ static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
         NSLog(@"[LineAccount] removing stale Messages symlink");
         unlink(realC);
     }
+    const char *realPSC = [realPS fileSystemRepresentation];
+    if (realPSC && lstat(realPSC, &st) == 0 && S_ISLNK(st.st_mode)) {
+        NSLog(@"[LineAccount] removing stale PrivateStore symlink");
+        unlink(realPSC);
+    }
 
-    // 3) 当前真实 Messages → 旧槽
-    if (previousSlot >= 1 && previousSlot <= ACCOUNT_COUNT && previousSlot != slot &&
-        realC && lstat(realC, &st) == 0 && S_ISDIR(st.st_mode)) {
-        NSString *prevMsg = [slotHomePath(previousSlot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
-        mkdirp(prevMsg);
-        NSArray *old = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prevMsg error:nil];
-        for (NSString *n in old) {
-            removePathPOSIX([prevMsg stringByAppendingPathComponent:n]);
+    // 3) 当前真实 Messages / PrivateStore → 旧槽
+    if (previousSlot >= 1 && previousSlot <= ACCOUNT_COUNT && previousSlot != slot) {
+        if (realC && lstat(realC, &st) == 0 && S_ISDIR(st.st_mode)) {
+            NSString *prevMsg = [slotHomePath(previousSlot) stringByAppendingPathComponent:@"Library/Application Support/Messages"];
+            mkdirp(prevMsg);
+            NSArray *old = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prevMsg error:nil];
+            for (NSString *n in old) {
+                removePathPOSIX([prevMsg stringByAppendingPathComponent:n]);
+            }
+            copyDirContents(realMsg, prevMsg);
+            NSLog(@"[LineAccount] saved talkdb real -> slot %ld", (long)previousSlot);
         }
-        copyDirContents(realMsg, prevMsg);
-        NSLog(@"[LineAccount] saved talkdb real -> slot %ld", (long)previousSlot);
+        if (realPSC && lstat(realPSC, &st) == 0 && S_ISDIR(st.st_mode)) {
+            NSString *prevPS = [slotHomePath(previousSlot) stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
+            mkdirp(prevPS);
+            NSArray *old = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prevPS error:nil];
+            for (NSString *n in old) {
+                removePathPOSIX([prevPS stringByAppendingPathComponent:n]);
+            }
+            copyDirContents(realPS, prevPS);
+            NSLog(@"[LineAccount] saved PrivateStore real -> slot %ld", (long)previousSlot);
+        }
     }
 
     // 4) 新槽 → 真实 Messages
@@ -231,14 +250,29 @@ static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
         NSLog(@"[LineAccount] fresh talkdb for slot %ld (empty)", (long)slot);
     }
 
+    // 5) 新槽 → 真实 PrivateStore（Talk Core Data 实际落点）
+    removePathPOSIX(realPS);
+    mkdirp(realPS);
+    NSArray *psItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:slotPS error:nil];
+    if (psItems.count > 0) {
+        copyDirContents(slotPS, realPS);
+        NSLog(@"[LineAccount] loaded PrivateStore slot %ld -> real (%lu items)",
+              (long)slot, (unsigned long)psItems.count);
+    } else {
+        mkdirp([realPS stringByAppendingPathComponent:@"t0"]);
+        NSLog(@"[LineAccount] fresh PrivateStore for slot %ld", (long)slot);
+    }
+
     NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
     [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realMsg error:nil];
+    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realPS error:nil];
     [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realAS error:nil];
 
     NSString *realDb = [realMsg stringByAppendingPathComponent:@"Line.sqlite"];
-    NSLog(@"[LineAccount] talkdb ready dir=%@ db_exists=%d",
-          realMsg,
-          [[NSFileManager defaultManager] fileExistsAtPath:realDb]);
+    NSString *realTalk = [realPS stringByAppendingPathComponent:@"t0/Line.sqlite"];
+    NSLog(@"[LineAccount] talkdb ready Messages=%d PrivateStore/t0=%d",
+          [[NSFileManager defaultManager] fileExistsAtPath:realDb],
+          [[NSFileManager defaultManager] fileExistsAtPath:realTalk]);
 }
 
 static NSMutableDictionary *loadMeta(void); // forward — used by bindRealTalkDBDirToSlot
@@ -273,11 +307,14 @@ static void dumpTalkDBState(const char *tag) {
 
 static void hooked_accountEventAuthorizedAccount(id self, SEL _cmd) {
     if (g_selectedSlot >= 1) {
-        // 再次确保真实 Messages 父目录存在（防登录过程中被删）
+        // 再次确保真实 Messages / PrivateStore 父目录存在（防登录过程中被删）
         NSString *realAS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support"];
         NSString *realMsg = [realAS stringByAppendingPathComponent:@"Messages"];
+        NSString *realPS = [realAS stringByAppendingPathComponent:@"PrivateStore"];
         mkdirp(realAS);
         mkdirp(realMsg);
+        mkdirp(realPS);
+        mkdirp([realPS stringByAppendingPathComponent:@"t0"]);
         dumpTalkDBState("beforeAuthorized");
     }
     if (orig_accountAuthorized) {
@@ -511,21 +548,21 @@ static OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
 }
 
 static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
-    // 选账号前不要合成 App Group
     if (g_selectedSlot < 1) {
         if (orig_containerURL) {
             return orig_containerURL(self, _cmd, groupId);
         }
         return nil;
     }
-    // SSH 实证：Talk DB 在 $HOME/Library/Application Support/PrivateStore
-    // LINE 会做：containerURL + "Library/Application Support/PrivateStore/tN"
-    // 因此假 group 根必须是「槽位 home」，不能再套一层 AppGroup/groupId（那条链 createDir 全失败且磁盘上根本没有 LineAccountSlots/AppGroup）
+    // ★ 关键：LineAccountSlots/.../PrivateStore 下 createDir 全部 FAIL；
+    //    真实 $HOME/Library/Application Support/PrivateStore 可用（SSH+探针已证实）。
+    // LINE 拼接：containerURL + "Library/Application Support/PrivateStore/tN"
+    // 因此假 group 根 = 真实 Home，Talk DB 落在已验证可写的位置。
     if (groupId.length > 0) {
         ensureSlotDirectories(g_selectedSlot);
-        NSString *path = slotHomePath(g_selectedSlot);
-        mkdirp(path);
-        NSLog(@"[LineAccount] containerURL(%@) -> %@", groupId, path);
+        NSString *path = realHomePath();
+        mkdirp([path stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]);
+        NSLog(@"[LineAccount] containerURL(%@) -> REAL home %@", groupId, path);
         return [NSURL fileURLWithPath:path isDirectory:YES];
     }
     if (orig_containerURL) {
@@ -571,25 +608,21 @@ static NSString *pathFromMaybeBogus(NSString *path) {
     return path;
 }
 
-// 槽位 AppGroup 下任意目录：POSIX 建齐；已存在也当成功（NSFileManager 对「已存在」常返回 FAIL）
-static BOOL ensureSlotAppGroupDir(NSString *path) {
+// PrivateStore（真实或槽位镜像）：POSIX 建齐后一律视为成功
+// （NSFileManager 对「已存在」常返回 FAIL；槽路径下探针也几乎全 FAIL）
+static BOOL ensurePrivateStoreDir(NSString *path) {
     if (path.length == 0) return NO;
-    if (![path containsString:SLOT_DIR_NAME]) return NO;
-    if (![path containsString:@"/AppGroup/"]) return NO;
+    if (![path containsString:@"PrivateStore"]) return NO;
 
     NSString *dir = path;
-    // Line.sqlite / 带扩展名 → 建父目录
-    NSString *ext = path.pathExtension;
-    if (ext.length > 0) {
+    if (path.pathExtension.length > 0) {
         dir = [path stringByDeletingLastPathComponent];
     }
     mkdirp(dir);
     const char *c = [dir fileSystemRepresentation];
     struct stat st;
-    if (c && lstat(c, &st) == 0 && S_ISDIR(st.st_mode)) {
-        return YES;
-    }
-    NSLog(@"[LineAccount] ensureSlotAppGroupDir FAIL errno=%d %@", errno, dir);
+    if (c && lstat(c, &st) == 0 && S_ISDIR(st.st_mode)) return YES;
+    NSLog(@"[LineAccount] ensurePrivateStoreDir FAIL errno=%d %@", errno, dir);
     return NO;
 }
 
@@ -612,10 +645,7 @@ static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL interm
         return NO;
     }
     NSString *mapped = remapPath(path);
-    // AppGroup 路径：不走 NSFileManager（它对「已存在」/挡路文件常 FAIL），POSIX 建好直接 YES
-    if (ensureSlotAppGroupDir(mapped)) {
-        return YES;
-    }
+    if (ensurePrivateStoreDir(mapped)) return YES;
     if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
         mkdirp(mapped);
     }
@@ -635,9 +665,7 @@ static BOOL hooked_createDirectory(id self, SEL _cmd, NSString *path, BOOL inter
         return NO;
     }
     NSString *mapped = remapPath(path);
-    if (ensureSlotAppGroupDir(mapped)) {
-        return YES;
-    }
+    if (ensurePrivateStoreDir(mapped)) return YES;
     if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
         mkdirp(mapped);
     }
@@ -836,33 +864,31 @@ static NSURL *remapFileURL(NSURL *url) {
     return [NSURL fileURLWithPath:mapped isDirectory:isDir];
 }
 
-// SSH 实证：真实布局是 $HOME/Library/Application Support/PrivateStore/
-// containerURL 已返回槽位 home，故这里与 LINE 拼接结果一致
+// 运行时 Talk DB 落在真实 Home（createDir 唯一稳定成功的位置）；
+// 多账号：选槽时把真实 PrivateStore 与槽位互拷。
 static NSURL *syntheticPrivateStoreURL(NSString *token, NSString *sub) {
     NSInteger slot = activeSlotOrZero();
     ensureSlotDirectories(slot);
     if (token.length == 0) token = @"t0";
-    // 统一用 tN 命名（LINE / 探针日志都是 t0、t31…）
-    if (![token hasPrefix:@"t"] && ![token hasPrefix:@"st"] && ![token hasPrefix:@"p"]) {
-        token = [NSString stringWithFormat:@"t%@", token];
-    }
     if ([token hasPrefix:@"st"]) {
         token = [@"t" stringByAppendingString:[token substringFromIndex:2]];
+    } else if (![token hasPrefix:@"t"] && ![token hasPrefix:@"p"]) {
+        token = [NSString stringWithFormat:@"t%@", token];
     }
-    NSString *path = [[slotHomePath(slot)
+    NSString *path = [[realHomePath()
                        stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]
                       stringByAppendingPathComponent:token];
     if (sub.length > 0) {
         path = [path stringByAppendingPathComponent:sub];
     }
     mkdirp(path);
-    // 同步在真实 Home 建一份，避免有的代码不走 containerURL
-    NSString *realPath = [[realHomePath()
+    // 槽位镜像目录也建好，便于切换账号时拷贝
+    NSString *slotPath = [[slotHomePath(slot)
                            stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]
                           stringByAppendingPathComponent:token];
-    if (sub.length > 0) realPath = [realPath stringByAppendingPathComponent:sub];
-    mkdirp(realPath);
-    NSLog(@"[LineAccount] PrivateStore -> %@", path);
+    if (sub.length > 0) slotPath = [slotPath stringByAppendingPathComponent:sub];
+    mkdirp(slotPath);
+    NSLog(@"[LineAccount] PrivateStore(real) -> %@", path);
     return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
