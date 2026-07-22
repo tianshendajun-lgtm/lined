@@ -935,6 +935,7 @@ static void dismissPicker(void) {
         pickerWindow = nil;
     }
 
+    // 只恢复可见/触控，绝不反复 makeKeyAndVisible（会抢走登录/注册弹窗焦点）
     void (^unhide)(UIWindow *) = ^(UIWindow *w) {
         if (!w) return;
         w.hidden = NO;
@@ -955,40 +956,19 @@ static void dismissPicker(void) {
     }
 }
 
-static void restoreLINEWindows(void) {
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        w.hidden = NO;
-        w.alpha = 1;
-        w.userInteractionEnabled = YES;
-        if (w.rootViewController) {
-            [w makeKeyAndVisible];
-        }
-    }
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if (![s isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)s;
-            for (UIWindow *w in ws.windows) {
-                w.hidden = NO;
-                w.alpha = 1;
-                w.userInteractionEnabled = YES;
-            }
-            // 优先恢复带根控制器的窗口
-            for (UIWindow *w in ws.windows) {
-                if (w.rootViewController) {
-                    [w makeKeyAndVisible];
-                    break;
-                }
-            }
-        }
-    }
-}
-
 static void resumeLINELaunch(void) {
     if (g_launchResumed) return;
     g_launchResumed = YES;
 
     dismissPicker();
+
+    // 卸掉 makeKeyAndVisible hook，避免之后任何逻辑再挡登录/注册弹窗
+    if (orig_makeKeyAndVisible) {
+        Method m = class_getInstanceMethod([UIWindow class], @selector(makeKeyAndVisible));
+        if (m) method_setImplementation(m, orig_makeKeyAndVisible);
+        orig_makeKeyAndVisible = NULL;
+        NSLog(@"[LineAccount] UIWindow makeKeyAndVisible hook removed");
+    }
 
     if (g_launchDeferred && orig_didFinishLaunching && g_deferredDelegate) {
         NSLog(@"[LineAccount] resume didFinishLaunching, slot=%ld", (long)g_selectedSlot);
@@ -1006,14 +986,8 @@ static void resumeLINELaunch(void) {
     g_deferredOpts = nil;
     g_launchDeferred = NO;
 
-    restoreLINEWindows();
-    // LINE 可能异步建窗，再补几次
-    for (int i = 1; i <= 20; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.1 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            restoreLINEWindows();
-        });
-    }
+    // 仅再 unhide 一次；登录页自己会 makeKeyAndVisible
+    dismissPicker();
 }
 
 static void enterAccountSlot(NSInteger slot) {
