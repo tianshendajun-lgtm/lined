@@ -353,7 +353,7 @@ static void installRuntimeHooks(void) {
         method_setImplementation(m, (IMP)hooked_containerURL);
     }
 
-    installLineFileManagerHooks();
+    // LineFileManager 等到选账号后再 hook，避免启动阶段枚举参数把整数当对象打崩
     NSLog(@"[LineAccount] FileManager / AppGroup hooks installed");
 }
 
@@ -364,15 +364,33 @@ static NSInteger activeSlotOrZero(void) {
 }
 
 static NSString *sanitizePathComponent(id obj) {
-    if (!obj) return @"unknown";
-    NSString *s = nil;
-    if ([obj isKindOfClass:[NSString class]]) s = (NSString *)obj;
-    else if ([obj respondsToSelector:@selector(stringValue)]) s = [obj stringValue];
-    else s = [obj description];
-    if (s.length == 0) return @"unknown";
-    s = [[s componentsSeparatedByCharactersInSet:
-          [NSCharacterSet characterSetWithCharactersInString:@"/:\\"]] componentsJoinedByString:@"_"];
-    return s;
+    // storeType 等参数经常是 NSInteger 枚举，不能当对象发消息，否则 libobjc EXC_BAD_ACCESS
+    uintptr_t v = (uintptr_t)(__bridge void *)obj;
+    if (obj == nil || v < 0x100000ULL) {
+        return [NSString stringWithFormat:@"v%lu", (unsigned long)v];
+    }
+    @try {
+        if ([(id)obj isKindOfClass:[NSString class]]) {
+            NSString *s = (NSString *)obj;
+            if (s.length == 0) return @"unknown";
+            return [[s componentsSeparatedByCharactersInSet:
+                     [NSCharacterSet characterSetWithCharactersInString:@"/:\\"]]
+                    componentsJoinedByString:@"_"];
+        }
+        if ([(id)obj respondsToSelector:@selector(stringValue)]) {
+            NSString *s = [(id)obj stringValue];
+            if (s.length) return sanitizePathComponent(s);
+        }
+        NSString *d = [(id)obj description];
+        if (d.length) {
+            return [[d componentsSeparatedByCharactersInSet:
+                     [NSCharacterSet characterSetWithCharactersInString:@"/:\\ "]]
+                    componentsJoinedByString:@"_"];
+        }
+    } @catch (__unused NSException *e) {
+        // fallthrough
+    }
+    return [NSString stringWithFormat:@"p%lx", (unsigned long)v];
 }
 
 static NSURL *syntheticStoreURL(id storeOrType, id typeOrSub) {
@@ -414,12 +432,15 @@ static BOOL hooked_privateFileStoresAreAccessible(Class cls, SEL sel) {
     return YES;
 }
 
-// + fileURLForStoreType:
-static NSURL *(*orig_fileURLForStoreType)(Class, SEL, id) = NULL;
-static NSURL *hooked_fileURLForStoreType(Class cls, SEL sel, id storeType) {
+// + fileURLForStoreType:  （参数是枚举/整数，不是对象）
+static NSURL *(*orig_fileURLForStoreType)(Class, SEL, NSInteger) = NULL;
+static NSURL *hooked_fileURLForStoreType(Class cls, SEL sel, NSInteger storeType) {
     NSURL *url = orig_fileURLForStoreType ? orig_fileURLForStoreType(cls, sel, storeType) : nil;
-    NSURL *fixed = ensureNonNilFileURL(url, storeType ?: @"storeType");
-    if (!url) NSLog(@"[LineAccount] fileURLForStoreType nil -> %@", fixed.path);
+    if (url && url.path.length > 0) {
+        return ensureNonNilFileURL(url, [NSString stringWithFormat:@"t%ld", (long)storeType]);
+    }
+    NSURL *fixed = syntheticStoreURL([NSString stringWithFormat:@"t%ld", (long)storeType], nil);
+    NSLog(@"[LineAccount] fileURLForStoreType:%ld nil -> %@", (long)storeType, fixed.path);
     return fixed;
 }
 
