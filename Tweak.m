@@ -935,36 +935,55 @@ static void dismissPicker(void) {
         pickerWindow = nil;
     }
 
-    // 只恢复可见/触控，绝不反复 makeKeyAndVisible（会抢走登录/注册弹窗焦点）
-    void (^unhide)(UIWindow *) = ^(UIWindow *w) {
+    // 有 rootVC 的才显示；空窗口（HUD/level 2002 等）必须藏住，否则盖住登录页且 keyWindow=nil
+    void (^fix)(UIWindow *) = ^(UIWindow *w) {
         if (!w) return;
-        w.hidden = NO;
-        w.alpha = 1;
-        w.userInteractionEnabled = YES;
+        if (w.rootViewController) {
+            w.hidden = NO;
+            w.alpha = 1;
+            w.userInteractionEnabled = YES;
+        } else {
+            w.hidden = YES;
+            w.alpha = 0;
+            w.userInteractionEnabled = NO;
+        }
     };
 
     for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        unhide(w);
+        fix(w);
     }
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
             if (![s isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                unhide(w);
+                fix(w);
             }
         }
     }
 }
 
-// 选一次「面积最大且有 rootVC」的窗口作为 key，避免黑屏；不循环抢焦点
+// 把带 rootVC 的主窗口设为 key；藏掉空覆盖层
 static void promoteMainWindowOnce(void) {
     UIWindow *best = nil;
     CGFloat bestArea = 0;
 
-    void (^consider)(UIWindow *) = ^(UIWindow *w) {
-        if (!w || !w.rootViewController) return;
+    void (^scan)(UIWindow *) = ^(UIWindow *w) {
+        if (!w) return;
+        if (!w.rootViewController) {
+            w.hidden = YES;
+            w.alpha = 0;
+            w.userInteractionEnabled = NO;
+            return;
+        }
+        w.hidden = NO;
+        w.alpha = 1;
+        w.userInteractionEnabled = YES;
         CGRect f = w.bounds;
         CGFloat area = f.size.width * f.size.height;
+        // 优先普通 level，避免选到异常高层窗口
+        if (w.windowLevel > UIWindowLevelNormal + 1) {
+            area *= 0.1;
+        }
         if (area > bestArea) {
             bestArea = area;
             best = w;
@@ -972,28 +991,24 @@ static void promoteMainWindowOnce(void) {
     };
 
     for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        consider(w);
+        scan(w);
     }
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
             if (![s isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                consider(w);
+                scan(w);
             }
         }
     }
 
     if (best) {
-        best.hidden = NO;
-        best.alpha = 1;
-        best.userInteractionEnabled = YES;
-        // 直接调原始实现（若 hook 已卸则走正常消息）
         if (orig_makeKeyAndVisible) {
             ((void(*)(id,SEL))orig_makeKeyAndVisible)(best, @selector(makeKeyAndVisible));
         } else {
             [best makeKeyAndVisible];
         }
-        NSLog(@"[LineAccount] promoted main window %@", best);
+        NSLog(@"[LineAccount] promoted main window %@ root=%@", best, best.rootViewController);
     } else {
         NSLog(@"[LineAccount] no window with rootVC to promote");
     }
@@ -1032,11 +1047,13 @@ static void resumeLINELaunch(void) {
         NSLog(@"[LineAccount] UIWindow makeKeyAndVisible hook removed");
     }
 
-    // 延迟一次：等 LINE 异步建好 rootVC 再 promote（只一次，不循环）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        promoteMainWindowOnce();
-    });
+    // LINE 异步建 Auth 窗：再 promote 几次，并持续藏空覆盖层
+    for (int i = 1; i <= 8; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.25 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            promoteMainWindowOnce();
+        });
+    }
 }
 
 static void enterAccountSlot(NSInteger slot) {
