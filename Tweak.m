@@ -231,12 +231,17 @@ static OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
 }
 
 static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
-    // 重签包通常没有 App Group 权限，系统会返回 nil → LINE 直接崩
-    // 所以只要有 groupId，就始终返回我们合成的容器路径
+    // 选账号前不要合成 App Group：空目录会被 LINE 当真实 store 去 PropertyListDecoder → 崩
+    if (g_selectedSlot < 1) {
+        if (orig_containerURL) {
+            return orig_containerURL(self, _cmd, groupId);
+        }
+        return nil;
+    }
+    // 已选账号：重签无 entitlement，必须合成路径
     if (groupId.length > 0) {
-        NSInteger slot = g_selectedSlot >= 0 ? g_selectedSlot : 0;
-        ensureSlotDirectories(slot);
-        NSString *path = [[slotHomePath(slot)
+        ensureSlotDirectories(g_selectedSlot);
+        NSString *path = [[slotHomePath(g_selectedSlot)
                            stringByAppendingPathComponent:@"AppGroup"]
                           stringByAppendingPathComponent:groupId];
         mkdirp(path);
@@ -536,78 +541,62 @@ static BOOL hooked_privateFileStoresAreAccessible(Class cls, SEL sel) {
     return YES;
 }
 
-// 策略：优先调 orig（containerURL 已合成，一般不再 AV）；
-// 返回有效 URL 则 remap；nil 再用 PrivateStore 路径兜底（避免 createDirectoryAtURL:nil）。
+// Frida 实测崩溃栈（点 loginButtonAction 后 Swift Task 里）:
+//   objc_storeStrong ← LineAccount.dylib!hooked_fileURLForFileInStore
+// 根因：参数写成 id 时 ARC 会 retain/storeStrong；LINE 常传枚举小整数 → 读 0x40 AV。
+// 全部改成 uintptr_t，禁止 ARC 当对象处理。不调 orig。
 
 static NSURL *(*orig_fileURLForStoreType)(Class, SEL, NSInteger) = NULL;
 static NSURL *hooked_fileURLForStoreType(Class cls, SEL sel, NSInteger storeType) {
-    NSURL *url = nil;
-    if (orig_fileURLForStoreType) {
-        url = orig_fileURLForStoreType(cls, sel, storeType);
-    }
-    url = remapFileURL(url);
-    if (url && url.path.length > 0) return url;
-    NSLog(@"[LineAccount] fileURLForStoreType:%ld nil -> PrivateStore", (long)storeType);
-    return syntheticPrivateStoreURL([NSString stringWithFormat:@"st%ld", (long)storeType], nil);
+    (void)cls; (void)sel; (void)orig_fileURLForStoreType;
+    NSURL *url = syntheticPrivateStoreURL([NSString stringWithFormat:@"st%ld", (long)storeType], nil);
+    NSLog(@"[LineAccount] fileURLForStoreType:%ld -> %@", (long)storeType, url.path);
+    return url;
 }
 
-static NSURL *(*orig_fileURLForStore)(Class, SEL, id) = NULL;
-static NSURL *hooked_fileURLForStore(Class cls, SEL sel, id store) {
-    NSURL *url = orig_fileURLForStore ? orig_fileURLForStore(cls, sel, store) : nil;
-    url = remapFileURL(url);
-    if (url && url.path.length > 0) return url;
-    return syntheticPrivateStoreURL(tokenFromId(store), nil);
+static NSURL *(*orig_fileURLForStore)(Class, SEL, uintptr_t) = NULL;
+static NSURL *hooked_fileURLForStore(Class cls, SEL sel, uintptr_t store) {
+    (void)cls; (void)sel; (void)orig_fileURLForStore;
+    return syntheticPrivateStoreURL(tokenFromRaw(store), nil);
 }
 
-static NSURL *(*orig_fileURLForStoreOfType)(Class, SEL, id, NSInteger) = NULL;
-static NSURL *hooked_fileURLForStoreOfType(Class cls, SEL sel, id store, NSInteger type) {
-    NSURL *url = orig_fileURLForStoreOfType ? orig_fileURLForStoreOfType(cls, sel, store, type) : nil;
-    url = remapFileURL(url);
-    if (url && url.path.length > 0) return url;
-    return syntheticPrivateStoreURL(tokenFromId(store),
+static NSURL *(*orig_fileURLForStoreOfType)(Class, SEL, uintptr_t, NSInteger) = NULL;
+static NSURL *hooked_fileURLForStoreOfType(Class cls, SEL sel, uintptr_t store, NSInteger type) {
+    (void)cls; (void)sel; (void)orig_fileURLForStoreOfType;
+    return syntheticPrivateStoreURL(tokenFromRaw(store),
                                    [NSString stringWithFormat:@"ty%ld", (long)type]);
 }
 
-static NSURL *(*orig_fileURLForStoreSubstore)(Class, SEL, id, id) = NULL;
-static NSURL *hooked_fileURLForStoreSubstore(Class cls, SEL sel, id store, id sub) {
-    NSURL *url = orig_fileURLForStoreSubstore ? orig_fileURLForStoreSubstore(cls, sel, store, sub) : nil;
-    url = remapFileURL(url);
-    if (url && url.path.length > 0) return url;
-    return syntheticPrivateStoreURL(tokenFromId(store), tokenFromId(sub));
+static NSURL *(*orig_fileURLForStoreSubstore)(Class, SEL, uintptr_t, uintptr_t) = NULL;
+static NSURL *hooked_fileURLForStoreSubstore(Class cls, SEL sel, uintptr_t store, uintptr_t sub) {
+    (void)cls; (void)sel; (void)orig_fileURLForStoreSubstore;
+    return syntheticPrivateStoreURL(tokenFromRaw(store), tokenFromRaw(sub));
 }
 
-static NSURL *(*orig_fileURLForFileInStore)(Class, SEL, id, id) = NULL;
-static NSURL *hooked_fileURLForFileInStore(Class cls, SEL sel, id name, id store) {
-    NSURL *url = orig_fileURLForFileInStore ? orig_fileURLForFileInStore(cls, sel, name, store) : nil;
-    url = remapFileURL(url);
-    if (url && url.path.length > 0) return url;
-    NSURL *dir = syntheticPrivateStoreURL(tokenFromId(store), nil);
-    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
+static NSURL *(*orig_fileURLForFileInStore)(Class, SEL, uintptr_t, uintptr_t) = NULL;
+static NSURL *hooked_fileURLForFileInStore(Class cls, SEL sel, uintptr_t name, uintptr_t store) {
+    (void)cls; (void)sel; (void)orig_fileURLForFileInStore;
+    NSURL *dir = syntheticPrivateStoreURL(tokenFromRaw(store), nil);
+    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromRaw(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
 
-static NSURL *(*orig_fileURLForFileInStoreOfType)(Class, SEL, id, id, NSInteger) = NULL;
-static NSURL *hooked_fileURLForFileInStoreOfType(Class cls, SEL sel, id name, id store, NSInteger type) {
-    NSURL *url = orig_fileURLForFileInStoreOfType
-        ? orig_fileURLForFileInStoreOfType(cls, sel, name, store, type) : nil;
-    url = remapFileURL(url);
-    if (url && url.path.length > 0) return url;
-    NSURL *dir = syntheticPrivateStoreURL(tokenFromId(store),
+static NSURL *(*orig_fileURLForFileInStoreOfType)(Class, SEL, uintptr_t, uintptr_t, NSInteger) = NULL;
+static NSURL *hooked_fileURLForFileInStoreOfType(Class cls, SEL sel, uintptr_t name, uintptr_t store, NSInteger type) {
+    (void)cls; (void)sel; (void)orig_fileURLForFileInStoreOfType;
+    NSURL *dir = syntheticPrivateStoreURL(tokenFromRaw(store),
                                          [NSString stringWithFormat:@"ty%ld", (long)type]);
-    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
+    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromRaw(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
 
-static NSURL *(*orig_fileURLForFileInStoreSub)(Class, SEL, id, id, id) = NULL;
-static NSURL *hooked_fileURLForFileInStoreSub(Class cls, SEL sel, id name, id store, id sub) {
-    NSURL *url = orig_fileURLForFileInStoreSub
-        ? orig_fileURLForFileInStoreSub(cls, sel, name, store, sub) : nil;
-    url = remapFileURL(url);
-    if (url && url.path.length > 0) return url;
-    NSURL *dir = syntheticPrivateStoreURL(tokenFromId(store), tokenFromId(sub));
-    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromId(name)];
+static NSURL *(*orig_fileURLForFileInStoreSub)(Class, SEL, uintptr_t, uintptr_t, uintptr_t) = NULL;
+static NSURL *hooked_fileURLForFileInStoreSub(Class cls, SEL sel, uintptr_t name, uintptr_t store, uintptr_t sub) {
+    (void)cls; (void)sel; (void)orig_fileURLForFileInStoreSub;
+    NSURL *dir = syntheticPrivateStoreURL(tokenFromRaw(store), tokenFromRaw(sub));
+    NSString *path = [dir.path stringByAppendingPathComponent:tokenFromRaw(name)];
     mkdirp([path stringByDeletingLastPathComponent]);
     return [NSURL fileURLWithPath:path isDirectory:NO];
 }
@@ -1110,10 +1099,10 @@ static void enterAccountSlot(NSInteger slot) {
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    // 选账号后装 LFM：accessible=YES + fileURL 优先 orig/remap，nil 才 PrivateStore 兜底
+    // 选账号后装 LFM：accessible=YES + 只合成 URL（不调 orig，避免登录时 objc AV）
     g_selectedSlot = slot;
     installLineFileManagerHooks();
-    NSLog(@"[LineAccount] selected slot %ld — LFM hybrid (orig+remap, nil fallback)", (long)slot);
+    NSLog(@"[LineAccount] selected slot %ld — LFM synthetic only (no orig)", (long)slot);
     resumeLINELaunch();
 }
 
