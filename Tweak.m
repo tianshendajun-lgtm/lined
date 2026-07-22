@@ -956,19 +956,54 @@ static void dismissPicker(void) {
     }
 }
 
+// 选一次「面积最大且有 rootVC」的窗口作为 key，避免黑屏；不循环抢焦点
+static void promoteMainWindowOnce(void) {
+    UIWindow *best = nil;
+    CGFloat bestArea = 0;
+
+    void (^consider)(UIWindow *) = ^(UIWindow *w) {
+        if (!w || !w.rootViewController) return;
+        CGRect f = w.bounds;
+        CGFloat area = f.size.width * f.size.height;
+        if (area > bestArea) {
+            bestArea = area;
+            best = w;
+        }
+    };
+
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        consider(w);
+    }
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                consider(w);
+            }
+        }
+    }
+
+    if (best) {
+        best.hidden = NO;
+        best.alpha = 1;
+        best.userInteractionEnabled = YES;
+        // 直接调原始实现（若 hook 已卸则走正常消息）
+        if (orig_makeKeyAndVisible) {
+            ((void(*)(id,SEL))orig_makeKeyAndVisible)(best, @selector(makeKeyAndVisible));
+        } else {
+            [best makeKeyAndVisible];
+        }
+        NSLog(@"[LineAccount] promoted main window %@", best);
+    } else {
+        NSLog(@"[LineAccount] no window with rootVC to promote");
+    }
+}
+
 static void resumeLINELaunch(void) {
     if (g_launchResumed) return;
     g_launchResumed = YES;
 
     dismissPicker();
-
-    // 卸掉 makeKeyAndVisible hook，避免之后任何逻辑再挡登录/注册弹窗
-    if (orig_makeKeyAndVisible) {
-        Method m = class_getInstanceMethod([UIWindow class], @selector(makeKeyAndVisible));
-        if (m) method_setImplementation(m, orig_makeKeyAndVisible);
-        orig_makeKeyAndVisible = NULL;
-        NSLog(@"[LineAccount] UIWindow makeKeyAndVisible hook removed");
-    }
 
     if (g_launchDeferred && orig_didFinishLaunching && g_deferredDelegate) {
         NSLog(@"[LineAccount] resume didFinishLaunching, slot=%ld", (long)g_selectedSlot);
@@ -986,8 +1021,22 @@ static void resumeLINELaunch(void) {
     g_deferredOpts = nil;
     g_launchDeferred = NO;
 
-    // 仅再 unhide 一次；登录页自己会 makeKeyAndVisible
     dismissPicker();
+    promoteMainWindowOnce();
+
+    // hook 保留到 promote 之后再卸，避免 promote 被挡；卸掉后登录弹窗不再被干扰
+    if (orig_makeKeyAndVisible) {
+        Method m = class_getInstanceMethod([UIWindow class], @selector(makeKeyAndVisible));
+        if (m) method_setImplementation(m, orig_makeKeyAndVisible);
+        orig_makeKeyAndVisible = NULL;
+        NSLog(@"[LineAccount] UIWindow makeKeyAndVisible hook removed");
+    }
+
+    // 延迟一次：等 LINE 异步建好 rootVC 再 promote（只一次，不循环）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        promoteMainWindowOnce();
+    });
 }
 
 static void enterAccountSlot(NSInteger slot) {
