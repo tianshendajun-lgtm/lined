@@ -1328,6 +1328,50 @@ static void installHomeDirectoryHook(void) {
     NSLog(@"[LineAccount] NSHomeDirectory -> slot when selected");
 }
 
+#pragma mark - NSUserDefaults 隔离（登录态的真正存放处）
+
+// NSHomeDirectory 重定向覆盖不到 NSUserDefaults：它由 cfprefsd 守护进程按
+// applicationID 管理，写在真实容器的 Library/Preferences 下，进程内改 Home 无效。
+// 于是所有容器共用同一份 → 账号1 的登录态泄漏到账号2、互相覆盖。
+// 解决：把 +[NSUserDefaults standardUserDefaults] 换成「每槽独立 suite」，
+// cfprefsd 按 suite 名分成 4 份独立 plist，天然隔离且跨重启持久。
+static NSUserDefaults *g_slotDefaults = nil;
+static NSInteger g_slotDefaultsForSlot = -1;
+static IMP orig_standardUserDefaults = NULL;
+
+static NSString *slotDefaultsSuiteName(NSInteger slot) {
+    return [NSString stringWithFormat:@"LineAccountSlot%ld", (long)slot];
+}
+
+static NSUserDefaults *hooked_standardUserDefaults(id self, SEL _cmd) {
+    if (g_selectedSlot >= 1) {
+        if (!g_slotDefaults || g_slotDefaultsForSlot != g_selectedSlot) {
+            g_slotDefaults = [[NSUserDefaults alloc]
+                              initWithSuiteName:slotDefaultsSuiteName(g_selectedSlot)];
+            g_slotDefaultsForSlot = g_selectedSlot;
+            NSLog(@"[LineAccount] standardUserDefaults -> suite %@", slotDefaultsSuiteName(g_selectedSlot));
+        }
+        return g_slotDefaults;
+    }
+    if (orig_standardUserDefaults) {
+        return ((NSUserDefaults *(*)(id, SEL))orig_standardUserDefaults)(self, _cmd);
+    }
+    return nil;
+}
+
+static void installUserDefaultsIsolation(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    Method m = class_getClassMethod([NSUserDefaults class], @selector(standardUserDefaults));
+    if (!m) {
+        NSLog(@"[LineAccount] standardUserDefaults method missing");
+        return;
+    }
+    orig_standardUserDefaults = method_setImplementation(m, (IMP)hooked_standardUserDefaults);
+    NSLog(@"[LineAccount] hooked +[NSUserDefaults standardUserDefaults] -> per-slot suite");
+}
+
 // 重签 IPA 缺 Intents/Siri entitlement 时，进聊天会走：
 // +[INVocabulary sharedVocabulary] → dispatch_once 抛未捕获异常 → abort
 // Frida 已证实栈在 Intents!sharedVocabulary，与 PrivateStore 贴纸 exists FAIL 无关
@@ -1927,6 +1971,7 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
+    installUserDefaultsIsolation();
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
