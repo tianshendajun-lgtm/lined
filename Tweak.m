@@ -36,8 +36,24 @@ static IMP orig_makeKeyAndVisible = NULL;
 
 #pragma mark - 路径工具
 
+// 真实 App 沙盒 Home（不受 hook 影响）
+static NSString *(*orig_NSHomeDirectory)(void) = NULL;
+static NSArray *(*orig_NSSearchPathForDirectoriesInDomains)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL) = NULL;
+static NSString *g_realHomeCached = nil;
+
+static NSString *realHomePath(void) {
+    if (g_realHomeCached.length > 0) return g_realHomeCached;
+    if (orig_NSHomeDirectory) {
+        g_realHomeCached = [orig_NSHomeDirectory() copy];
+    } else {
+        g_realHomeCached = [NSHomeDirectory() copy];
+    }
+    return g_realHomeCached;
+}
+
 static NSString *slotsRootPath(void) {
-    NSString *home = NSHomeDirectory();
+    // 必须用真实沙盒 Home，不能走 hook 后的 NSHomeDirectory（否则会嵌套 LineAccountSlots）
+    NSString *home = realHomePath();
     return [home stringByAppendingPathComponent:SLOT_DIR_NAME];
 }
 
@@ -82,6 +98,13 @@ static void ensureSlotDirectories(NSInteger slot) {
     for (NSString *sub in subs) {
         mkdirp([root stringByAppendingPathComponent:sub]);
     }
+    // Core Data Talk DB：保护等级过高会导致 “failed to load talk db” → unauthorize → exit(0)
+    NSString *msgDir = [root stringByAppendingPathComponent:@"Library/Application Support/Messages"];
+    NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
+    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:msgDir error:nil];
+    [[NSFileManager defaultManager] setAttributes:prot
+                                     ofItemAtPath:[root stringByAppendingPathComponent:@"Library/Application Support"]
+                                            error:nil];
 }
 
 #pragma mark - 元数据（写在 LineAccountSlots 下，不被 remap）
@@ -107,9 +130,9 @@ static NSString *slotKeyPrefix(NSInteger slot) {
 static BOOL pathNeedsRemap(NSString *path) {
     if (path.length == 0) return NO;
     if ([path containsString:SLOT_DIR_NAME]) return NO;
-    // g_selectedSlot>=0 时启用（含临时槽 0）
-    if (g_selectedSlot < 0) return NO;
-    NSString *home = NSHomeDirectory();
+    // 仅正式账号槽 remap（选号前不碰）
+    if (g_selectedSlot < 1) return NO;
+    NSString *home = realHomePath();
     if ([path hasPrefix:home]) return YES;
     if ([path containsString:@"/Library/Group Containers/"] ||
         [path containsString:@"group.com.linecorp"]) {
@@ -119,9 +142,9 @@ static BOOL pathNeedsRemap(NSString *path) {
 }
 
 static NSString *remapPath(NSString *path) {
-    if (g_selectedSlot < 0 || !pathNeedsRemap(path)) return path;
+    if (g_selectedSlot < 1 || !pathNeedsRemap(path)) return path;
 
-    NSString *home = NSHomeDirectory();
+    NSString *home = realHomePath();
     NSString *slotHome = slotHomePath(g_selectedSlot);
 
     if ([path hasPrefix:home]) {
@@ -184,7 +207,6 @@ typedef OSStatus (*SecItemUpdate_t)(CFDictionaryRef, CFDictionaryRef);
 typedef OSStatus (*SecItemDelete_t)(CFDictionaryRef);
 typedef NSURL * (*ContainerURL_t)(id, SEL, NSString *);
 typedef NSArray * (*SearchPath_t)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL);
-typedef NSString * (*NSHomeDirectory_t)(void);
 
 static SecItemAdd_t orig_SecItemAdd = NULL;
 static SecItemCopyMatching_t orig_SecItemCopyMatching = NULL;
@@ -845,7 +867,48 @@ static int rebind_symbols(struct rebinding rebindings[], size_t count) {
     return 0;
 }
 
+static NSString *hooked_NSHomeDirectory(void) {
+    // 登录成功后 Core Data 用 NSHomeDirectory()/Library/Application Support/Messages/Line.sqlite
+    // 若只 hook NSFileManager、不改 Home，会加载失败 → unauthorize → exit(0)
+    if (g_selectedSlot >= 1) {
+        ensureSlotDirectories(g_selectedSlot);
+        return slotHomePath(g_selectedSlot);
+    }
+    return realHomePath();
+}
+
+static NSArray *hooked_NSSearchPathForDirectoriesInDomains(NSSearchPathDirectory directory,
+                                                           NSSearchPathDomainMask domainMask,
+                                                           BOOL expandTilde) {
+    NSArray *arr = orig_NSSearchPathForDirectoriesInDomains
+        ? orig_NSSearchPathForDirectoriesInDomains(directory, domainMask, expandTilde)
+        : nil;
+    if (g_selectedSlot < 1 || !arr) return arr;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
+    for (NSString *p in arr) {
+        NSString *mapped = remapPath(p);
+        [out addObject:mapped ?: p];
+        if (mapped && ![mapped isEqualToString:p]) {
+            mkdirp(mapped);
+        }
+    }
+    return out;
+}
+
 static void installKeychainHooks(void) {
+    // 先缓存真实 Home，再 hook（Core Data Talk DB 用 NSHomeDirectory / NSSearchPath，不走 NSFileManager）
+    if (!g_realHomeCached) {
+        g_realHomeCached = [NSHomeDirectory() copy];
+    }
+    if (!orig_NSHomeDirectory) {
+        orig_NSHomeDirectory = (NSString *(*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory");
+    }
+    if (!orig_NSSearchPathForDirectoriesInDomains) {
+        orig_NSSearchPathForDirectoriesInDomains =
+            (NSArray *(*)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL))
+            dlsym(RTLD_DEFAULT, "NSSearchPathForDirectoriesInDomains");
+    }
+
     // 先保留原始指针，防止 rebind 失败时调用空指针
     if (!orig_SecItemAdd)
         orig_SecItemAdd = (SecItemAdd_t)dlsym(RTLD_DEFAULT, "SecItemAdd");
@@ -856,14 +919,17 @@ static void installKeychainHooks(void) {
     if (!orig_SecItemDelete)
         orig_SecItemDelete = (SecItemDelete_t)dlsym(RTLD_DEFAULT, "SecItemDelete");
 
-    struct rebinding rebs[4] = {
+    struct rebinding rebs[6] = {
         {"SecItemAdd", (void *)hooked_SecItemAdd, (void **)&orig_SecItemAdd},
         {"SecItemCopyMatching", (void *)hooked_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching},
         {"SecItemUpdate", (void *)hooked_SecItemUpdate, (void **)&orig_SecItemUpdate},
         {"SecItemDelete", (void *)hooked_SecItemDelete, (void **)&orig_SecItemDelete},
+        {"NSHomeDirectory", (void *)hooked_NSHomeDirectory, (void **)&orig_NSHomeDirectory},
+        {"NSSearchPathForDirectoriesInDomains", (void *)hooked_NSSearchPathForDirectoriesInDomains,
+         (void **)&orig_NSSearchPathForDirectoriesInDomains},
     };
-    rebind_symbols(rebs, 4);
-    NSLog(@"[LineAccount] Keychain hooks installed (app-local + vm_protect, non-JB OK)");
+    rebind_symbols(rebs, 6);
+    NSLog(@"[LineAccount] Keychain + Home/SearchPath hooks installed (talk db path fix)");
 }
 
 #pragma mark - 账号选择 UI
@@ -1099,10 +1165,12 @@ static void enterAccountSlot(NSInteger slot) {
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    // 选账号后装 LFM：accessible=YES + 只合成 URL（不调 orig，避免登录时 objc AV）
+    // 选账号后：装 LFM + Home 已指向槽位，保证 Talk DB 路径一致
     g_selectedSlot = slot;
     installLineFileManagerHooks();
-    NSLog(@"[LineAccount] selected slot %ld — LFM synthetic only (no orig)", (long)slot);
+    ensureSlotDirectories(slot);
+    NSLog(@"[LineAccount] selected slot %ld — home=%@ talkDir ready",
+          (long)slot, slotHomePath(slot));
     resumeLINELaunch();
 }
 
