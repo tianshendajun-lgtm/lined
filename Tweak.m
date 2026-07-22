@@ -19,6 +19,7 @@
 #import <unistd.h>
 #import <errno.h>
 #import <stdlib.h>
+#import <stdio.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -79,11 +80,9 @@ static NSString *realHomePath(void) {
 static NSString *slotsRootPath(void) {
     // 必须用真实沙盒 Home，不能走 hook 后的 NSHomeDirectory（否则会嵌套 LineAccountSlots）
     NSString *home = realHomePath();
-    // ★ 关键：绝不能建在容器根 <UUID>/ 下 —— iOS 沙盒对容器根 mkdir 返回 EPERM(errno=1)，
-    //   只有 Documents / Library / tmp 等标准子目录可写。放到 Library/Application Support 下
-    //   （已证实可写，且属持久数据、不会被系统按缓存清理）。
-    return [[home stringByAppendingPathComponent:@"Library/Application Support"]
-            stringByAppendingPathComponent:SLOT_DIR_NAME];
+    // ★ 容器交换模型：槽备份区必须放在「被交换的目录之外」，否则交换 Application Support 时
+    //   会把我们自己的槽存储也搬走。故放在 Library/ 下的独立目录（Library 可写、持久）。
+    return [home stringByAppendingPathComponent:@"Library/LineSlots"];
 }
 
 static NSString *slotHomePath(NSInteger slot) {
@@ -523,17 +522,9 @@ static NSString *slotKeyPrefix(NSInteger slot) {
 }
 
 static BOOL pathNeedsRemap(NSString *path) {
-    if (path.length == 0) return NO;
-    if ([path containsString:SLOT_DIR_NAME]) return NO; // 槽位自身与 meta 不二次映射
-    if (g_selectedSlot < 1) return NO;
-
-    NSString *home = realHomePath();
-    // 选中账号后：整个 App 沙盒 Home 下的路径都进 account_N（真正隔离）
-    if (home.length > 0 && [path hasPrefix:home]) return YES;
-
-    // 系统 Group Containers 也进槽位 AppGroup
-    if ([path containsString:@"/Library/Group Containers/"]) return YES;
-
+    // ★ 容器交换模型：不再重定向任何路径 —— LINE 直接用真实 Home，隔离由「选账号时搬数据」完成。
+    //   保留此函数（及依赖它的文件 hook）只为兼容旧调用点，全部直通不改写。
+    (void)path;
     return NO;
 }
 
@@ -649,24 +640,16 @@ static OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
 }
 
 static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
-    if (g_selectedSlot < 1) {
-        if (orig_containerURL) {
-            return orig_containerURL(self, _cmd, groupId);
-        }
-        return nil;
+    // ★ 容器交换模型：App Group 真实容器在 /var/.../Shared/ 下，是所有槽共享的，且不在 Home 内、
+    //   交换搬不到。故把它重定向到 Home 内的固定子目录 AppGroup/<groupId>，再把整个 AppGroup
+    //   纳入交换集 —— 这样 App Group 数据也随账号隔离。
+    if (groupId.length == 0) {
+        return orig_containerURL ? orig_containerURL(self, _cmd, groupId) : nil;
     }
-    // 假 App Group 根 = 槽位 home，LINE 拼 PrivateStore/P_<mid>/… 会落在 account_N 下
-    if (groupId.length > 0) {
-        ensureSlotDirectories(g_selectedSlot);
-        NSString *path = slotHomePath(g_selectedSlot);
-        mkdirp([path stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]);
-        NSLog(@"[LineAccount] containerURL(%@) -> slot %ld %@", groupId, (long)g_selectedSlot, path);
-        return [NSURL fileURLWithPath:path isDirectory:YES];
-    }
-    if (orig_containerURL) {
-        return orig_containerURL(self, _cmd, groupId);
-    }
-    return nil;
+    NSString *path = [[realHomePath() stringByAppendingPathComponent:@"AppGroup"]
+                      stringByAppendingPathComponent:groupId];
+    mkdirp(path);
+    return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
 typedef BOOL (*CreateDirURL_t)(id, SEL, NSURL *, BOOL, NSDictionary *, NSError **);
@@ -880,6 +863,127 @@ static NSArray *hooked_URLsForDirectory(id self, SEL _cmd, NSSearchPathDirectory
     return out;
 }
 
+#pragma mark - NSData / NSDictionary 文件 I/O 重定向（堵 backupUserDefaults.dict 等共享泄漏）
+
+// 这些读写文件方法在 NSData / NSDictionary 上，不在 NSFileManager 上，之前完全没拦。
+// LINE 的加密 UserDefaults 备份（backupUserDefaults.dict / encryptedBackupUserDefaults.dict）
+// 就是用 NSDictionary/NSData writeToFile: 直接写到共享真实 home，导致 4 槽共用登录态/身份。
+// 在最终 I/O 层按最终路径 remap：无论路径怎么拼出来的（哪怕选账号前就缓存成真实 home），
+// 只要落点在真实 home 一律拉回当前槽 —— 这是最彻底的兜底。
+
+static NSURL *remapFileURL(NSURL *url); // 定义在后面（LineFileManager 段）
+
+static void logIfInteresting(NSString *from, NSString *to) {
+    if ([from containsString:@"UserDefaults"] || [from.lastPathComponent hasSuffix:@".dict"]) {
+        NSLog(@"[LineAccount] IO redirect %@ -> %@", from.lastPathComponent, to);
+    }
+}
+static NSString *remapForWrite(NSString *path) {
+    if (path.length == 0) return path;
+    NSString *m = remapPath(path);
+    if (m.length && ![m isEqualToString:path]) {
+        mkdirp([m stringByDeletingLastPathComponent]);
+        logIfInteresting(path, m);
+        return m;
+    }
+    return path;
+}
+static NSURL *remapURLForWrite(NSURL *url) {
+    NSString *op = nil;
+    @try { op = url.path; } @catch (__unused id e) {}
+    NSURL *u = remapFileURL(url); // 会为写入建好父目录
+    if (u && op) { @try { logIfInteresting(op, u.path); } @catch (__unused id e) {} }
+    return u ?: url;
+}
+
+// ---- NSData 写 ----
+static BOOL (*orig_data_writeFileAtom)(id,SEL,NSString*,BOOL) = NULL;
+static BOOL hk_data_writeFileAtom(id s, SEL c, NSString *p, BOOL a) {
+    return orig_data_writeFileAtom(s, c, remapForWrite(p), a);
+}
+static BOOL (*orig_data_writeFileOpt)(id,SEL,NSString*,NSUInteger,NSError**) = NULL;
+static BOOL hk_data_writeFileOpt(id s, SEL c, NSString *p, NSUInteger o, NSError **e) {
+    return orig_data_writeFileOpt(s, c, remapForWrite(p), o, e);
+}
+static BOOL (*orig_data_writeURLAtom)(id,SEL,NSURL*,BOOL) = NULL;
+static BOOL hk_data_writeURLAtom(id s, SEL c, NSURL *u, BOOL a) {
+    return orig_data_writeURLAtom(s, c, remapURLForWrite(u), a);
+}
+static BOOL (*orig_data_writeURLOpt)(id,SEL,NSURL*,NSUInteger,NSError**) = NULL;
+static BOOL hk_data_writeURLOpt(id s, SEL c, NSURL *u, NSUInteger o, NSError **e) {
+    return orig_data_writeURLOpt(s, c, remapURLForWrite(u), o, e);
+}
+// ---- NSData 读 ----
+static id (*orig_data_ctxFile)(id,SEL,NSString*) = NULL;
+static id hk_data_ctxFile(id s, SEL c, NSString *p) {
+    return orig_data_ctxFile(s, c, remapPath(p) ?: p);
+}
+static id (*orig_data_ctxFileOpt)(id,SEL,NSString*,NSUInteger,NSError**) = NULL;
+static id hk_data_ctxFileOpt(id s, SEL c, NSString *p, NSUInteger o, NSError **e) {
+    return orig_data_ctxFileOpt(s, c, remapPath(p) ?: p, o, e);
+}
+static id (*orig_data_initFile)(id,SEL,NSString*) = NULL;
+static id hk_data_initFile(id s, SEL c, NSString *p) {
+    return orig_data_initFile(s, c, remapPath(p) ?: p);
+}
+
+// ---- NSDictionary 写 ----
+static BOOL (*orig_dict_writeFileAtom)(id,SEL,NSString*,BOOL) = NULL;
+static BOOL hk_dict_writeFileAtom(id s, SEL c, NSString *p, BOOL a) {
+    return orig_dict_writeFileAtom(s, c, remapForWrite(p), a);
+}
+static BOOL (*orig_dict_writeURLAtom)(id,SEL,NSURL*,BOOL) = NULL;
+static BOOL hk_dict_writeURLAtom(id s, SEL c, NSURL *u, BOOL a) {
+    return orig_dict_writeURLAtom(s, c, remapURLForWrite(u), a);
+}
+static BOOL (*orig_dict_writeURLErr)(id,SEL,NSURL*,NSError**) = NULL;
+static BOOL hk_dict_writeURLErr(id s, SEL c, NSURL *u, NSError **e) {
+    return orig_dict_writeURLErr(s, c, remapURLForWrite(u), e);
+}
+// ---- NSDictionary 读 ----
+static id (*orig_dict_ctxFile)(id,SEL,NSString*) = NULL;
+static id hk_dict_ctxFile(id s, SEL c, NSString *p) {
+    return orig_dict_ctxFile(s, c, remapPath(p) ?: p);
+}
+static id (*orig_dict_initFile)(id,SEL,NSString*) = NULL;
+static id hk_dict_initFile(id s, SEL c, NSString *p) {
+    return orig_dict_initFile(s, c, remapPath(p) ?: p);
+}
+
+#define SWZ_INST(CLS, SELNAME, HOOK, ORIG, TYPE) do { \
+    Method _m = class_getInstanceMethod([CLS class], @selector(SELNAME)); \
+    if (_m) *(void **)&ORIG = (void *)method_setImplementation(_m, (IMP)HOOK); \
+} while (0)
+#define SWZ_CLS(CLS, SELNAME, HOOK, ORIG) do { \
+    Method _m = class_getClassMethod([CLS class], @selector(SELNAME)); \
+    if (_m) *(void **)&ORIG = (void *)method_setImplementation(_m, (IMP)HOOK); \
+} while (0)
+
+static void installFileIORedirect(void) {
+    static BOOL done = NO;
+    if (done) return; done = YES;
+
+    // NSData 写
+    SWZ_INST(NSData, writeToFile:atomically:,        hk_data_writeFileAtom, orig_data_writeFileAtom, 0);
+    SWZ_INST(NSData, writeToFile:options:error:,     hk_data_writeFileOpt,  orig_data_writeFileOpt, 0);
+    SWZ_INST(NSData, writeToURL:atomically:,         hk_data_writeURLAtom,  orig_data_writeURLAtom, 0);
+    SWZ_INST(NSData, writeToURL:options:error:,      hk_data_writeURLOpt,   orig_data_writeURLOpt, 0);
+    // NSData 读
+    SWZ_CLS (NSData, dataWithContentsOfFile:,        hk_data_ctxFile,       orig_data_ctxFile);
+    SWZ_CLS (NSData, dataWithContentsOfFile:options:error:, hk_data_ctxFileOpt, orig_data_ctxFileOpt);
+    SWZ_INST(NSData, initWithContentsOfFile:,        hk_data_initFile,      orig_data_initFile, 0);
+
+    // NSDictionary 写
+    SWZ_INST(NSDictionary, writeToFile:atomically:,  hk_dict_writeFileAtom, orig_dict_writeFileAtom, 0);
+    SWZ_INST(NSDictionary, writeToURL:atomically:,   hk_dict_writeURLAtom,  orig_dict_writeURLAtom, 0);
+    SWZ_INST(NSDictionary, writeToURL:error:,        hk_dict_writeURLErr,   orig_dict_writeURLErr, 0);
+    // NSDictionary 读
+    SWZ_CLS (NSDictionary, dictionaryWithContentsOfFile:, hk_dict_ctxFile,  orig_dict_ctxFile);
+    SWZ_INST(NSDictionary, initWithContentsOfFile:,  hk_dict_initFile,      orig_dict_initFile, 0);
+
+    NSLog(@"[LineAccount] NSData/NSDictionary 文件 I/O 重定向已装（堵 .dict 共享泄漏）");
+}
+
 static void installLineFileManagerHooks(void);
 
 static void installRuntimeHooks(void) {
@@ -933,6 +1037,9 @@ static void installRuntimeHooks(void) {
         orig_containerURL = (ContainerURL_t)method_getImplementation(m);
         method_setImplementation(m, (IMP)hooked_containerURL);
     }
+
+    // NSData/NSDictionary 文件 I/O 重定向（堵 backupUserDefaults.dict 等共享泄漏）
+    installFileIORedirect();
 
     // LineFileManager 在选账号前绝不能 hook：
     // privateFileStoresAreAccessible=YES + 合成 URL 会让 LINE 后续把 storeType 当对象用 → AV
@@ -1723,29 +1830,151 @@ static void resumeLINELaunch(void) {
     });
 }
 
+#pragma mark - 容器交换（core：让 LINE 永远用真实 Home，选账号时搬数据实现隔离）
+
+// 需要按账号隔离、且位于 Home 内的顶层目录（相对 Home）。
+// 不含 Library/Preferences（cfprefsd 内存缓存，换文件无效）→ 用 NSUserDefaults suite 隔离。
+// 不含 Library/LineSlots（我们的槽存储本身）。
+static NSArray<NSString *> *swapItems(void) {
+    return @[
+        @"Documents",
+        @"Library/Application Support",
+        @"Library/Caches",
+        @"Library/Cookies",
+        @"Library/WebKit",
+        @"AppGroup",
+    ];
+}
+
+static NSString *swapStatePath(NSString *name) {
+    return [slotsRootPath() stringByAppendingPathComponent:name];
+}
+static NSInteger readCurrentSlot(void) {
+    NSString *s = [NSString stringWithContentsOfFile:swapStatePath(@".current")
+                                            encoding:NSUTF8StringEncoding error:nil];
+    return s ? s.integerValue : 0;
+}
+static void writeCurrentSlot(NSInteger slot) {
+    mkdirp(slotsRootPath());
+    [[NSString stringWithFormat:@"%ld", (long)slot]
+        writeToFile:swapStatePath(@".current") atomically:YES
+           encoding:NSUTF8StringEncoding error:nil];
+}
+static void writeJournal(NSInteger from, NSInteger to, NSString *phase) {
+    mkdirp(slotsRootPath());
+    [[NSString stringWithFormat:@"%ld,%ld,%@", (long)from, (long)to, phase]
+        writeToFile:swapStatePath(@".journal") atomically:YES
+           encoding:NSUTF8StringEncoding error:nil];
+}
+static void clearJournal(void) {
+    removePathPOSIX(swapStatePath(@".journal"));
+}
+
+static BOOL posixExists(NSString *p) {
+    if (p.length == 0) return NO;
+    struct stat st;
+    return lstat([p fileSystemRepresentation], &st) == 0;
+}
+
+// 原子移动一个顶层项（目录/文件）。src 不存在视为成功（等价于空）。
+static BOOL moveOne(NSString *src, NSString *dst) {
+    if (!posixExists(src)) return YES;
+    mkdirp([dst stringByDeletingLastPathComponent]);
+    removePathPOSIX(dst);                      // rename 目录要求 dst 不存在/为空
+    if (rename([src fileSystemRepresentation], [dst fileSystemRepresentation]) == 0) return YES;
+    NSLog(@"[LineAccount] SWAP rename FAIL errno=%d %@ -> %@", errno, src, dst);
+    return NO;
+}
+
+static NSString *homeRel(NSString *rel) {
+    return [realHomePath() stringByAppendingPathComponent:rel];
+}
+static NSString *slotRel(NSInteger slot, NSString *rel) {
+    return [slotHomePath(slot) stringByAppendingPathComponent:rel]; // slotHomePath = LineSlots/account_N
+}
+
+// 把当前 Home 里的账号数据搬进 slot（幂等，可重复执行）
+static void drainHomeToSlot(NSInteger slot) {
+    if (slot < 1) return;
+    for (NSString *rel in swapItems()) {
+        moveOne(homeRel(rel), slotRel(slot, rel));
+    }
+    NSLog(@"[LineAccount] SWAP drained Home -> slot %ld", (long)slot);
+}
+// 把 slot 里的账号数据搬回 Home（幂等，可重复执行）
+static void fillHomeFromSlot(NSInteger slot) {
+    if (slot < 1) return;
+    for (NSString *rel in swapItems()) {
+        moveOne(slotRel(slot, rel), homeRel(rel));
+    }
+    // 确保基本目录在（LINE 首次进空槽也要有骨架）
+    mkdirp(homeRel(@"Library/Application Support"));
+    mkdirp(homeRel(@"Documents"));
+    NSLog(@"[LineAccount] SWAP filled slot %ld -> Home", (long)slot);
+}
+
+// 切换到目标槽：先把上一个账号的实时数据搬回它的槽，再把目标槽数据搬进 Home。
+static void swapToSlot(NSInteger to) {
+    if (to < 1 || to > ACCOUNT_COUNT) return;
+    NSInteger from = readCurrentSlot();
+    if (from == to) {
+        NSLog(@"[LineAccount] SWAP same slot %ld，Home 数据原样保留（重开同账号）", (long)to);
+        return;
+    }
+    NSLog(@"[LineAccount] SWAP %ld -> %ld begin", (long)from, (long)to);
+    writeJournal(from, to, @"drain");
+    if (from >= 1) drainHomeToSlot(from);
+    writeCurrentSlot(0);                 // Home 已清空（数据在各槽），中间安全静止点
+    writeJournal(from, to, @"fill");
+    fillHomeFromSlot(to);
+    writeCurrentSlot(to);
+    clearJournal();
+    NSLog(@"[LineAccount] SWAP %ld -> %ld done", (long)from, (long)to);
+}
+
+// 启动时若发现上次交换被中断，完成它（drain/fill 都幂等，直接补跑对应阶段）
+static void recoverSwapJournalIfAny(void) {
+    NSString *j = [NSString stringWithContentsOfFile:swapStatePath(@".journal")
+                                            encoding:NSUTF8StringEncoding error:nil];
+    if (j.length == 0) return;
+    NSArray *parts = [j componentsSeparatedByString:@","];
+    if (parts.count < 3) { clearJournal(); return; }
+    NSInteger from = [parts[0] integerValue];
+    NSInteger to   = [parts[1] integerValue];
+    NSString *phase = parts[2];
+    NSLog(@"[LineAccount] SWAP 检测到中断的交换 from=%ld to=%ld phase=%@ — 自愈中",
+          (long)from, (long)to, phase);
+    if ([phase isEqualToString:@"drain"]) {
+        if (from >= 1) drainHomeToSlot(from);
+        writeCurrentSlot(0);             // 停在「Home 空、数据在槽」，交给选择页重新决定
+    } else { // fill
+        fillHomeFromSlot(to);
+        writeCurrentSlot(to);
+    }
+    clearJournal();
+    NSLog(@"[LineAccount] SWAP 自愈完成");
+}
+
 static void enterAccountSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
 
-    ensureSlotDirectories(slot);
+    mkdirp(slotHomePath(slot));
     [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
 
-    // 仅用于 UI 上标记「已有数据」；不做「重启跳过选择页」用途
+    // 仅用于 UI 上标记「已有数据」
     NSMutableDictionary *meta = loadMeta();
     meta[@"selectedSlot"] = @(slot);
     saveMeta(meta);
 
-    // ★ 选中后立刻在本进程激活该槽的隔离，再放行此前被拦住的 LINE 启动。
-    //   关键前提：didFinishLaunching / scene:willConnect 之前已被拦下（未执行），
-    //   所以此刻改 NSHomeDirectory + 路径重定向，LINE 会「全新」初始化到 account_N，
-    //   不存在「已用真实 Home 初始化后再中途改」导致的崩溃。
-    g_selectedSlot = slot;
-    NSLog(@"[LineAccount] selected slot %ld — activate isolation & resume in-process", (long)slot);
+    g_selectedSlot = slot;   // Keychain 前缀 + NSUserDefaults suite 按此隔离
+    NSLog(@"[LineAccount] selected slot %ld — 容器交换 + 放行", (long)slot);
 
-    installHomeDirectoryHook();      // NSHomeDirectory() + NSSearchPath -> account_N
-    installCoreDataRedirect();       // 所有 CoreData store URL 强制落到 account_N（堵 split-brain）
-    installLineFileManagerHooks();   // PrivateStore 等落到 account_N
-    installIntentsCrashGuards();     // 进聊天避免 INVocabulary abort
-    installBGTaskCrashGuards();      // 放行后 LINE 注册后台任务会晚，桩掉避免 abort
+    // ★ 核心：把该账号数据搬进真实 Home（此时 didFinishLaunching/scene 仍被拦，Home 无写句柄，安全）
+    swapToSlot(slot);
+
+    // 崩溃防护（App Group 目录也已就绪）
+    installIntentsCrashGuards();
+    installBGTaskCrashGuards();
     installTalkDBAccountHooks();
 
     resumeLINELaunch();              // 放行 didFinishLaunching / scene:willConnect
@@ -2019,8 +2248,11 @@ static void line_account_init(void) {
     (void)realHomePath();
     mkdirp(slotsRootPath());
 
+    // ★ 若上次「容器交换」被中途杀死，先自愈（把 Home 恢复到一致状态），再弹选择页
+    recoverSwapJournalIfAny();
+
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号");
+    NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
     NSLog(@"[LineAccount] ========================================");
 
     // 每次冷启动都从头来：拦住 LINE、弹选择页；选中后当场激活隔离并放行。
