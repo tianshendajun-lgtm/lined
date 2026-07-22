@@ -31,6 +31,8 @@ echo "[*] Building LineAccount.dylib ..."
   -framework Foundation \
   -framework UIKit \
   -framework Security \
+  -framework CoreGraphics \
+  -framework QuartzCore \
   -isysroot "${SDK}" \
   -miphoneos-version-min="${MIN_IOS}" \
   -fobjc-arc \
