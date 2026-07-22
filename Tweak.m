@@ -1347,6 +1347,36 @@ static void installIntentsCrashGuards(void) {
     NSLog(@"[LineAccount] hooked +[INVocabulary sharedVocabulary] -> nil stub");
 }
 
+// 我们把 didFinishLaunching 延后到「选完账号」才执行，此时 iOS 认为启动早已完成，
+// LINE 再调 BGTaskScheduler 注册后台任务就会抛：
+//   NSInternalInconsistencyException: All launch handlers must be registered
+//   before application finishes launching  → abort
+// 后台任务对多账号核心功能不是必需的，直接把注册桩成 no-op（返回 NO，不抛异常）。
+static BOOL hooked_BGTaskScheduler_register(id self, SEL _cmd, id identifier, id queue, id handler) {
+    (void)self; (void)_cmd; (void)queue; (void)handler;
+    NSLog(@"[LineAccount] stub BGTaskScheduler register '%@' (skip, avoid late-register crash)", identifier);
+    return NO;
+}
+
+static void installBGTaskCrashGuards(void) {
+    static BOOL done = NO;
+    if (done) return;
+    Class cls = NSClassFromString(@"BGTaskScheduler");
+    if (!cls) {
+        NSLog(@"[LineAccount] BGTaskScheduler class missing");
+        return;
+    }
+    SEL sel = @selector(registerForTaskWithIdentifier:usingQueue:launchHandler:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        NSLog(@"[LineAccount] BGTaskScheduler register selector missing");
+        return;
+    }
+    method_setImplementation(m, (IMP)hooked_BGTaskScheduler_register);
+    done = YES;
+    NSLog(@"[LineAccount] hooked -[BGTaskScheduler register...] -> no-op (avoid late-register abort)");
+}
+
 #pragma mark - 账号选择 UI
 
 static void enterAccountSlot(NSInteger slot);
@@ -1603,6 +1633,7 @@ static void enterAccountSlot(NSInteger slot) {
     installHomeDirectoryHook();      // NSHomeDirectory() -> account_N
     installLineFileManagerHooks();   // PrivateStore 等落到 account_N
     installIntentsCrashGuards();     // 进聊天避免 INVocabulary abort
+    installBGTaskCrashGuards();      // 放行后 LINE 注册后台任务会晚，桩掉避免 abort
     installTalkDBAccountHooks();
 
     resumeLINELaunch();              // 放行 didFinishLaunching / scene:willConnect
@@ -1894,6 +1925,7 @@ static void line_account_init(void) {
     installKeychainHooks();
     installUIApplicationMainHook();
     installIntentsCrashGuards();
+    installBGTaskCrashGuards();
     hookAppDelegate();
 
     dispatch_async(dispatch_get_main_queue(), ^{
