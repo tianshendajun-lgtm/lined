@@ -245,17 +245,61 @@ static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
 typedef BOOL (*CreateDirURL_t)(id, SEL, NSURL *, BOOL, NSDictionary *, NSError **);
 static CreateDirURL_t orig_createDirectoryURL = NULL;
 
+// 小整数绝不是合法 ObjC 对象（LINE 会把 storeType 枚举误当 NSURL 传入）
+static BOOL isBogusObjPtr(const void *p) {
+    return !p || ((uintptr_t)p) < 0x100000ULL;
+}
+
+static NSURL *urlFromMaybeBogus(NSURL *url) {
+    uintptr_t v = (uintptr_t)(__bridge void *)url;
+    if (v < 0x100000ULL) {
+        NSInteger slot = g_selectedSlot >= 0 ? g_selectedSlot : 0;
+        NSString *path = [[slotHomePath(slot)
+                           stringByAppendingPathComponent:@"Library/Application Support/LineStores"]
+                          stringByAppendingPathComponent:[NSString stringWithFormat:@"st%lu", (unsigned long)v]];
+        mkdirp(path);
+        NSLog(@"[LineAccount] coerce bogus URL %p -> %@", (void *)v, path);
+        return [NSURL fileURLWithPath:path isDirectory:YES];
+    }
+    return url;
+}
+
+static NSString *pathFromMaybeBogus(NSString *path) {
+    uintptr_t v = (uintptr_t)(__bridge void *)path;
+    if (v == 0) return nil;
+    if (v < 0x100000ULL) {
+        NSInteger slot = g_selectedSlot >= 0 ? g_selectedSlot : 0;
+        NSString *p = [[slotHomePath(slot)
+                        stringByAppendingPathComponent:@"Library/Application Support/LineStores"]
+                       stringByAppendingPathComponent:[NSString stringWithFormat:@"st%lu", (unsigned long)v]];
+        mkdirp(p);
+        NSLog(@"[LineAccount] coerce bogus path %p -> %@", (void *)v, p);
+        return p;
+    }
+    return path;
+}
+
 static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL intermediates,
                                       NSDictionary *attr, NSError **err) {
-    if (!url) {
-        NSLog(@"[LineAccount] blocked createDirectoryAtURL:nil");
-        if (err) {
-            *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
-                                   userInfo:@{NSLocalizedDescriptionKey: @"URL is nil (blocked)"}];
+    if (isBogusObjPtr((__bridge void *)url)) {
+        url = urlFromMaybeBogus(url);
+        if (isBogusObjPtr((__bridge void *)url)) {
+            NSLog(@"[LineAccount] blocked createDirectoryAtURL:bogus/nil");
+            if (err) {
+                *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
+                                       userInfo:@{NSLocalizedDescriptionKey: @"URL is bogus (blocked)"}];
+            }
+            return NO;
         }
-        return NO; // 不要抛异常
     }
     NSString *path = url.path;
+    if (path.length == 0) {
+        if (err) {
+            *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
+                                   userInfo:@{NSLocalizedDescriptionKey: @"URL path empty"}];
+        }
+        return NO;
+    }
     NSString *mapped = remapPath(path);
     if (mapped && ![mapped isEqualToString:path]) {
         url = [NSURL fileURLWithPath:mapped isDirectory:YES];
@@ -264,34 +308,56 @@ static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL interm
 }
 
 static BOOL hooked_createDirectory(id self, SEL _cmd, NSString *path, BOOL intermediates, NSDictionary *attr, NSError **err) {
+    path = pathFromMaybeBogus(path);
+    if (path.length == 0) {
+        if (err) {
+            *err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
+                                   userInfo:@{NSLocalizedDescriptionKey: @"path bogus/nil"}];
+        }
+        return NO;
+    }
     return ((BOOL(*)(id,SEL,NSString*,BOOL,NSDictionary*,NSError**))orig_createDirectory)
         (self, _cmd, remapPath(path), intermediates, attr, err);
 }
 
 static BOOL hooked_fileExists(id self, SEL _cmd, NSString *path) {
+    path = pathFromMaybeBogus(path);
+    if (path.length == 0) return NO;
     return ((BOOL(*)(id,SEL,NSString*))orig_fileExists)(self, _cmd, remapPath(path));
 }
 
 static NSArray *hooked_contentsOfDirectory(id self, SEL _cmd, NSString *path, NSError **err) {
+    path = pathFromMaybeBogus(path);
+    if (path.length == 0) return @[];
     return ((NSArray*(*)(id,SEL,NSString*,NSError**))orig_contentsOfDirectory)
         (self, _cmd, remapPath(path), err);
 }
 
 static BOOL hooked_removeItem(id self, SEL _cmd, NSString *path, NSError **err) {
+    path = pathFromMaybeBogus(path);
+    if (path.length == 0) return NO;
     return ((BOOL(*)(id,SEL,NSString*,NSError**))orig_removeItem)(self, _cmd, remapPath(path), err);
 }
 
 static BOOL hooked_copyItem(id self, SEL _cmd, NSString *src, NSString *dst, NSError **err) {
+    src = pathFromMaybeBogus(src);
+    dst = pathFromMaybeBogus(dst);
+    if (src.length == 0 || dst.length == 0) return NO;
     return ((BOOL(*)(id,SEL,NSString*,NSString*,NSError**))orig_copyItem)
         (self, _cmd, remapPath(src), remapPath(dst), err);
 }
 
 static BOOL hooked_moveItem(id self, SEL _cmd, NSString *src, NSString *dst, NSError **err) {
+    src = pathFromMaybeBogus(src);
+    dst = pathFromMaybeBogus(dst);
+    if (src.length == 0 || dst.length == 0) return NO;
     return ((BOOL(*)(id,SEL,NSString*,NSString*,NSError**))orig_moveItem)
         (self, _cmd, remapPath(src), remapPath(dst), err);
 }
 
 static BOOL hooked_createFile(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) {
+    path = pathFromMaybeBogus(path);
+    if (path.length == 0) return NO;
     return ((BOOL(*)(id,SEL,NSString*,NSData*,NSDictionary*))orig_createFile)
         (self, _cmd, remapPath(path), data, attr);
 }
