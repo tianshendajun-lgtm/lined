@@ -632,6 +632,25 @@ static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
     NSString *path = [[realHomePath() stringByAppendingPathComponent:@"AppGroup"]
                       stringByAppendingPathComponent:groupId];
     mkdirp(path);
+    // ★ iOS 真实 App Group 容器由系统预建了 Library/Caches 等骨架目录。重定向到 Home 内后
+    //   必须自己补齐，否则 LINE（如 MessageExtCoreDataManager）往 Library/Caches/... 建 sqlite 时
+    //   父目录缺失 → mkdir ENOENT → CoreData "Error validating url for store" → 抛异常 abort。
+    static NSArray *skel;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        skel = @[@"Library",
+                 @"Library/Caches",
+                 @"Library/Caches/PrivateStore",
+                 @"Library/Preferences",
+                 @"Library/Application Support",
+                 @"Library/Application Support/PrivateStore",
+                 @"Library/Application Support/PublicStore",
+                 @"Documents",
+                 @"tmp"];
+    });
+    for (NSString *sub in skel) {
+        mkdirp([path stringByAppendingPathComponent:sub]);
+    }
     return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
