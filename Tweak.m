@@ -1466,15 +1466,22 @@ static void installHomeDirectoryHook(void) {
 static IMP orig_addPersistentStore = NULL;
 static id hooked_addPersistentStore(id self, SEL _cmd, id storeType, id configuration,
                                     NSURL *url, NSDictionary *options, NSError **error) {
-    if (url && g_selectedSlot >= 1) {
+    if (url) {
         NSString *p = url.path;
         if (p.length > 0) {
-            NSString *mapped = remapPath(p);
-            if (mapped.length && ![mapped isEqualToString:p]) {
-                mkdirp([mapped stringByDeletingLastPathComponent]);
-                url = [NSURL fileURLWithPath:mapped];
-                NSLog(@"[LineAccount] addPersistentStore remap -> %@", mapped);
+            if (g_selectedSlot >= 1) {
+                NSString *mapped = remapPath(p);
+                if (mapped.length && ![mapped isEqualToString:p]) {
+                    url = [NSURL fileURLWithPath:mapped];
+                    p = mapped;
+                    NSLog(@"[LineAccount] addPersistentStore remap -> %@", mapped);
+                }
             }
+            // ★ 兜底：CoreData 加 SQLite store 前要求父目录已存在，否则抛
+            //   NSInvalidArgumentException "Error validating url for store" → abort。
+            //   典型受害者：App Group 里的 MessageExt.sqlite，其 .../PrivateStore/P_<mid>/Messages/
+            //   由动态 mid 组成、系统不会预建。这里对任何 store 都先把父目录建齐。
+            mkdirp([p stringByDeletingLastPathComponent]);
         }
     }
     return ((id(*)(id, SEL, id, id, NSURL *, NSDictionary *, NSError **))orig_addPersistentStore)
@@ -2074,6 +2081,7 @@ static void enterAccountSlot(NSInteger slot) {
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
     installTalkDBAccountHooks();
+    installCoreDataRedirect();       // ★ 给每个 CoreData store 兜底建父目录，堵 "Error validating url"
 
     resumeLINELaunch();              // 放行 didFinishLaunching / scene:willConnect
 }
