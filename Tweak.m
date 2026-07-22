@@ -362,6 +362,46 @@ static BOOL hooked_createFile(id self, SEL _cmd, NSString *path, NSData *data, N
         (self, _cmd, remapPath(path), data, attr);
 }
 
+typedef BOOL (*ItemAtURL_t)(id, SEL, NSURL *, NSError **);
+typedef BOOL (*CopyURL_t)(id, SEL, NSURL *, NSURL *, NSError **);
+static ItemAtURL_t orig_removeItemURL = NULL;
+static CopyURL_t orig_copyItemURL = NULL;
+static CopyURL_t orig_moveItemURL = NULL;
+
+static BOOL hooked_removeItemURL(id self, SEL _cmd, NSURL *url, NSError **err) {
+    url = urlFromMaybeBogus(url);
+    if (isBogusObjPtr((__bridge void *)url)) return NO;
+    NSString *path = url.path;
+    if (path.length == 0) return NO;
+    NSString *mapped = remapPath(path);
+    if (mapped && ![mapped isEqualToString:path]) {
+        url = [NSURL fileURLWithPath:mapped isDirectory:NO];
+    }
+    return orig_removeItemURL(self, _cmd, url, err);
+}
+
+static BOOL hooked_copyItemURL(id self, SEL _cmd, NSURL *src, NSURL *dst, NSError **err) {
+    src = urlFromMaybeBogus(src);
+    dst = urlFromMaybeBogus(dst);
+    if (isBogusObjPtr((__bridge void *)src) || isBogusObjPtr((__bridge void *)dst)) return NO;
+    NSString *sp = remapPath(src.path);
+    NSString *dp = remapPath(dst.path);
+    return orig_copyItemURL(self, _cmd,
+                            [NSURL fileURLWithPath:sp isDirectory:NO],
+                            [NSURL fileURLWithPath:dp isDirectory:NO], err);
+}
+
+static BOOL hooked_moveItemURL(id self, SEL _cmd, NSURL *src, NSURL *dst, NSError **err) {
+    src = urlFromMaybeBogus(src);
+    dst = urlFromMaybeBogus(dst);
+    if (isBogusObjPtr((__bridge void *)src) || isBogusObjPtr((__bridge void *)dst)) return NO;
+    NSString *sp = remapPath(src.path);
+    NSString *dp = remapPath(dst.path);
+    return orig_moveItemURL(self, _cmd,
+                            [NSURL fileURLWithPath:sp isDirectory:NO],
+                            [NSURL fileURLWithPath:dp isDirectory:NO], err);
+}
+
 static NSArray *hooked_URLsForDirectory(id self, SEL _cmd, NSSearchPathDirectory dir, NSSearchPathDomainMask domain) {
     NSArray *urls = ((NSArray*(*)(id,SEL,NSSearchPathDirectory,NSSearchPathDomainMask))orig_URLsForDirectory)
         (self, _cmd, dir, domain);
@@ -410,6 +450,15 @@ static void installRuntimeHooks(void) {
     m = class_getInstanceMethod(fm, @selector(createFileAtPath:contents:attributes:));
     if (m) orig_createFile = method_setImplementation(m, (IMP)hooked_createFile);
 
+    m = class_getInstanceMethod(fm, @selector(removeItemAtURL:error:));
+    if (m) orig_removeItemURL = (ItemAtURL_t)method_setImplementation(m, (IMP)hooked_removeItemURL);
+
+    m = class_getInstanceMethod(fm, @selector(copyItemAtURL:toURL:error:));
+    if (m) orig_copyItemURL = (CopyURL_t)method_setImplementation(m, (IMP)hooked_copyItemURL);
+
+    m = class_getInstanceMethod(fm, @selector(moveItemAtURL:toURL:error:));
+    if (m) orig_moveItemURL = (CopyURL_t)method_setImplementation(m, (IMP)hooked_moveItemURL);
+
     m = class_getInstanceMethod(fm, @selector(URLsForDirectory:inDomains:));
     if (m) orig_URLsForDirectory = method_setImplementation(m, (IMP)hooked_URLsForDirectory);
 
@@ -419,9 +468,9 @@ static void installRuntimeHooks(void) {
         method_setImplementation(m, (IMP)hooked_containerURL);
     }
 
-    // 启动早期就会走到 LineFileManager；必须立刻 hook，且 storeType 按整数处理
-    installLineFileManagerHooks();
-    NSLog(@"[LineAccount] FileManager / AppGroup hooks installed");
+    // LineFileManager 在选账号前绝不能 hook：
+    // privateFileStoresAreAccessible=YES + 合成 URL 会让 LINE 后续把 storeType 当对象用 → AV
+    NSLog(@"[LineAccount] FileManager / AppGroup hooks installed (LFM deferred)");
 }
 
 #pragma mark - LineFileManager（重签无 App Group 时返回 nil 的根因）
@@ -1097,9 +1146,9 @@ static void line_account_init(void) {
 
     g_needPicker = YES;
     g_blockLINEUI = YES;
-    g_selectedSlot = 0;
+    g_selectedSlot = -1; // 选择页前不 remap，避免提前进 account_0 / LineStores
     g_launchResumed = NO;
-    ensureSlotDirectories(0);
+    mkdirp(slotsRootPath());
 
     installRuntimeHooks();
     installKeychainHooks();
