@@ -143,27 +143,33 @@ static NSString *remapPath(NSString *path) {
 #pragma mark - Keychain 字典改写
 
 static CFDictionaryRef rewriteKeychainQuery(CFDictionaryRef query, BOOL forWrite) {
-    if (!query || g_selectedSlot < 1) return query; // 临时槽 0 不隔离 Keychain
+    if (!query) return query;
 
     NSDictionary *orig = (__bridge NSDictionary *)query;
     NSMutableDictionary *m = [orig mutableCopy];
-    NSString *prefix = slotKeyPrefix(g_selectedSlot);
 
-    id account = m[(__bridge id)kSecAttrAccount];
-    if ([account isKindOfClass:[NSString class]]) {
-        NSString *s = (NSString *)account;
-        if (![s hasPrefix:prefix]) {
-            m[(__bridge id)kSecAttrAccount] = [prefix stringByAppendingString:s];
+    // 重签 IPA 没有 LINE 原 keychain-access-groups，保留会 SecItem* → -34018
+    [m removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
+
+    if (g_selectedSlot >= 1) {
+        NSString *prefix = slotKeyPrefix(g_selectedSlot);
+
+        id account = m[(__bridge id)kSecAttrAccount];
+        if ([account isKindOfClass:[NSString class]]) {
+            NSString *s = (NSString *)account;
+            if (![s hasPrefix:prefix]) {
+                m[(__bridge id)kSecAttrAccount] = [prefix stringByAppendingString:s];
+            }
+        } else if (forWrite) {
+            m[(__bridge id)kSecAttrAccount] = [prefix stringByAppendingString:@"default"];
         }
-    } else if (forWrite) {
-        m[(__bridge id)kSecAttrAccount] = [prefix stringByAppendingString:@"default"];
-    }
 
-    id service = m[(__bridge id)kSecAttrService];
-    if ([service isKindOfClass:[NSString class]]) {
-        NSString *s = (NSString *)service;
-        if (![s hasPrefix:prefix]) {
-            m[(__bridge id)kSecAttrService] = [prefix stringByAppendingString:s];
+        id service = m[(__bridge id)kSecAttrService];
+        if ([service isKindOfClass:[NSString class]]) {
+            NSString *s = (NSString *)service;
+            if (![s hasPrefix:prefix]) {
+                m[(__bridge id)kSecAttrService] = [prefix stringByAppendingString:s];
+            }
         }
     }
 
@@ -935,14 +941,16 @@ static void dismissPicker(void) {
         pickerWindow = nil;
     }
 
-    // 有 rootVC 的才显示；空窗口（HUD/level 2002 等）必须藏住，否则盖住登录页且 keyWindow=nil
+    // 只藏「高层 + 无 root」的空覆盖窗；不要动 level=0 的 HUD（登录流程可能用到）
     void (^fix)(UIWindow *) = ^(UIWindow *w) {
         if (!w) return;
         if (w.rootViewController) {
             w.hidden = NO;
             w.alpha = 1;
             w.userInteractionEnabled = YES;
-        } else {
+            return;
+        }
+        if (w.windowLevel > UIWindowLevelNormal) {
             w.hidden = YES;
             w.alpha = 0;
             w.userInteractionEnabled = NO;
@@ -962,7 +970,7 @@ static void dismissPicker(void) {
     }
 }
 
-// 把带 rootVC 的主窗口设为 key；藏掉空覆盖层
+// 把带 rootVC 的主窗口设为 key；只藏高层空覆盖层
 static void promoteMainWindowOnce(void) {
     __block UIWindow *best = nil;
     __block CGFloat bestArea = 0;
@@ -970,9 +978,11 @@ static void promoteMainWindowOnce(void) {
     void (^scan)(UIWindow *) = ^(UIWindow *w) {
         if (!w) return;
         if (!w.rootViewController) {
-            w.hidden = YES;
-            w.alpha = 0;
-            w.userInteractionEnabled = NO;
+            if (w.windowLevel > UIWindowLevelNormal) {
+                w.hidden = YES;
+                w.alpha = 0;
+                w.userInteractionEnabled = NO;
+            }
             return;
         }
         w.hidden = NO;
@@ -980,7 +990,6 @@ static void promoteMainWindowOnce(void) {
         w.userInteractionEnabled = YES;
         CGRect f = w.bounds;
         CGFloat area = f.size.width * f.size.height;
-        // 优先普通 level，避免选到异常高层窗口
         if (w.windowLevel > UIWindowLevelNormal + 1) {
             area *= 0.1;
         }
@@ -1002,16 +1011,19 @@ static void promoteMainWindowOnce(void) {
         }
     }
 
-    if (best) {
-        if (orig_makeKeyAndVisible) {
-            ((void(*)(id,SEL))orig_makeKeyAndVisible)(best, @selector(makeKeyAndVisible));
-        } else {
-            [best makeKeyAndVisible];
-        }
-        NSLog(@"[LineAccount] promoted main window %@ root=%@", best, best.rootViewController);
-    } else {
+    if (!best) {
         NSLog(@"[LineAccount] no window with rootVC to promote");
+        return;
     }
+    if (best.isKeyWindow && !best.hidden && best.alpha > 0.99) {
+        return; // 已是 key，别反复抢，否则打掉登录/注册弹层
+    }
+    if (orig_makeKeyAndVisible) {
+        ((void(*)(id,SEL))orig_makeKeyAndVisible)(best, @selector(makeKeyAndVisible));
+    } else {
+        [best makeKeyAndVisible];
+    }
+    NSLog(@"[LineAccount] promoted main window %@ root=%@", best, best.rootViewController);
 }
 
 static void resumeLINELaunch(void) {
@@ -1047,13 +1059,11 @@ static void resumeLINELaunch(void) {
         NSLog(@"[LineAccount] UIWindow makeKeyAndVisible hook removed");
     }
 
-    // LINE 异步建 Auth 窗：再 promote 几次，并持续藏空覆盖层
-    for (int i = 1; i <= 8; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.25 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            promoteMainWindowOnce();
-        });
-    }
+    // LINE 异步建 Auth 窗：再 promote 一次即可（多次会抢登录弹层焦点）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        promoteMainWindowOnce();
+    });
 }
 
 static void enterAccountSlot(NSInteger slot) {
@@ -1068,9 +1078,10 @@ static void enterAccountSlot(NSInteger slot) {
     saveMeta(meta);
 
     // 先切沙盒，再放行 LINE（无需重启进程）
+    // 注意：不要在登录前装 LineFileManager hooks——
+    // privateFileStoresAreAccessible=YES 会让点「登入」时走坏路径 → libobjc AV
     g_selectedSlot = slot;
-    installLineFileManagerHooks(); // 确保进入沙盒前 LineFileManager 已 hook
-    NSLog(@"[LineAccount] selected slot %ld — continue without restart", (long)slot);
+    NSLog(@"[LineAccount] selected slot %ld — continue without restart (LFM hooks deferred until stable)", (long)slot);
     resumeLINELaunch();
 }
 
