@@ -1295,6 +1295,29 @@ static void installKeychainHooks(void) {
     NSLog(@"[LineAccount] Keychain hooks installed (app-local + vm_protect, non-JB OK)");
 }
 
+// 重签 IPA 缺 Intents/Siri entitlement 时，进聊天会走：
+// +[INVocabulary sharedVocabulary] → dispatch_once 抛未捕获异常 → abort
+// Frida 已证实栈在 Intents!sharedVocabulary，与 PrivateStore 贴纸 exists FAIL 无关
+static id hooked_INVocabulary_sharedVocabulary(id self, SEL _cmd) {
+    NSLog(@"[LineAccount] stub +[INVocabulary sharedVocabulary] (avoid Intents crash)");
+    return nil;
+}
+
+static void installIntentsCrashGuards(void) {
+    Class cls = NSClassFromString(@"INVocabulary");
+    if (!cls) {
+        NSLog(@"[LineAccount] INVocabulary class missing");
+        return;
+    }
+    Method m = class_getClassMethod(cls, @selector(sharedVocabulary));
+    if (!m) {
+        NSLog(@"[LineAccount] INVocabulary sharedVocabulary missing");
+        return;
+    }
+    method_setImplementation(m, (IMP)hooked_INVocabulary_sharedVocabulary);
+    NSLog(@"[LineAccount] hooked +[INVocabulary sharedVocabulary] -> nil stub");
+}
+
 #pragma mark - 账号选择 UI
 
 static void enterAccountSlot(NSInteger slot);
@@ -1706,6 +1729,7 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
+    installIntentsCrashGuards();
     hookAppDelegate();
 
     dispatch_async(dispatch_get_main_queue(), ^{
