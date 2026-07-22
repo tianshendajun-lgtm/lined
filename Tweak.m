@@ -1488,23 +1488,67 @@ static id hooked_addPersistentStore(id self, SEL _cmd, id storeType, id configur
         (self, _cmd, storeType, configuration, url, options, error);
 }
 
+// ★ 最可靠的兜底点：LINE 的 Swift 代码经 objc_msgSend 调 NSPersistentContainer 的
+//   loadPersistentStoresWithCompletionHandler:（CoreData 内部再调 addPersistentStore，
+//   那层可能是直接 IMP 调用、swizzle 拦不到）。在这最外层把每个 store 的父目录建齐，
+//   CoreData 校验前父目录就存在 → 不再抛 "Error validating url for store"。
+typedef void (*LoadPS_t)(id, SEL, id);
+static LoadPS_t orig_loadPersistentStores = NULL;
+
+static void ensureStoreDescriptionDirs(id container) {
+    @try {
+        NSArray *descs = [container performSelector:@selector(persistentStoreDescriptions)];
+        for (id d in descs) {
+            NSURL *u = nil;
+            @try { u = [d performSelector:@selector(URL)]; } @catch (__unused NSException *e) {}
+            NSString *p = u.path;
+            if (p.length > 0) {
+                NSString *dir = [p stringByDeletingLastPathComponent];
+                mkdirp(dir);
+                NSLog(@"[LineAccount] CD ensure store dir: %@", dir);
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[LineAccount] CD ensureStoreDescriptionDirs ex: %@", e);
+    }
+}
+
+static void hooked_loadPersistentStores(id self, SEL _cmd, id completion) {
+    ensureStoreDescriptionDirs(self);
+    if (orig_loadPersistentStores) orig_loadPersistentStores(self, _cmd, completion);
+}
+
 static void installCoreDataRedirect(void) {
     static BOOL done = NO;
     if (done) return;
-    Class psc = NSClassFromString(@"NSPersistentStoreCoordinator");
-    if (!psc) {
-        NSLog(@"[LineAccount] NSPersistentStoreCoordinator missing");
-        return;
-    }
-    SEL sel = @selector(addPersistentStoreWithType:configuration:URL:options:error:);
-    Method m = class_getInstanceMethod(psc, sel);
-    if (!m) {
-        NSLog(@"[LineAccount] addPersistentStore selector missing");
-        return;
-    }
-    orig_addPersistentStore = method_setImplementation(m, (IMP)hooked_addPersistentStore);
     done = YES;
-    NSLog(@"[LineAccount] hooked addPersistentStore -> force slot redirect");
+
+    Class psc = NSClassFromString(@"NSPersistentStoreCoordinator");
+    if (psc) {
+        SEL sel = @selector(addPersistentStoreWithType:configuration:URL:options:error:);
+        Method m = class_getInstanceMethod(psc, sel);
+        if (m) {
+            orig_addPersistentStore = method_setImplementation(m, (IMP)hooked_addPersistentStore);
+            NSLog(@"[LineAccount] hooked addPersistentStore");
+        }
+    } else {
+        NSLog(@"[LineAccount] NSPersistentStoreCoordinator missing");
+    }
+
+    // 关键兜底：NSPersistentContainer loadPersistentStores（LINE 直调，必拦得到）
+    Class pc = NSClassFromString(@"NSPersistentContainer");
+    if (pc) {
+        SEL sel2 = @selector(loadPersistentStoresWithCompletionHandler:);
+        Method m2 = class_getInstanceMethod(pc, sel2);
+        if (m2) {
+            orig_loadPersistentStores = (LoadPS_t)method_setImplementation(m2, (IMP)hooked_loadPersistentStores);
+            NSLog(@"[LineAccount] hooked loadPersistentStores -> pre-create store dirs");
+        } else {
+            NSLog(@"[LineAccount] loadPersistentStores selector missing");
+        }
+    } else {
+        NSLog(@"[LineAccount] NSPersistentContainer missing");
+    }
 }
 
 #pragma mark - NSUserDefaults 隔离（登录态的真正存放处）
@@ -2358,6 +2402,7 @@ static void line_account_init(void) {
     recoverSwapJournalIfAny();
 
     NSLog(@"[LineAccount] ========================================");
+    NSLog(@"[LineAccount] BUILD=swap+kcswap+cd-loadPS-mkdir v4");
     NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
     NSLog(@"[LineAccount] ========================================");
 
