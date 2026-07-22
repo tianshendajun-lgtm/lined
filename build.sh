@@ -9,16 +9,24 @@ MIN_IOS="${MIN_IOS:-15.0}"
 
 mkdir -p "${OUT_DIR}"
 
+if [[ ! -f "${ROOT}/Tweak.m" ]]; then
+  echo "[!] 缺少 Tweak.m（当前目录文件：）"
+  ls -la "${ROOT}"
+  exit 1
+fi
+
 if ! command -v xcrun >/dev/null 2>&1; then
   echo "[!] 需要 macOS + Xcode Command Line Tools"
   exit 1
 fi
 
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+CLANG="$(xcrun --sdk iphoneos --find clang)"
 echo "[*] SDK: ${SDK}"
+echo "[*] clang: ${CLANG}"
 echo "[*] Building LineAccount.dylib ..."
 
-clang -arch arm64 -shared \
+"${CLANG}" -arch arm64 -shared \
   -o "${OUT_DYLIB}" \
   -framework Foundation \
   -framework UIKit \
