@@ -353,7 +353,8 @@ static void installRuntimeHooks(void) {
         method_setImplementation(m, (IMP)hooked_containerURL);
     }
 
-    // LineFileManager 等到选账号后再 hook，避免启动阶段枚举参数把整数当对象打崩
+    // 启动早期就会走到 LineFileManager；必须立刻 hook，且 storeType 按整数处理
+    installLineFileManagerHooks();
     NSLog(@"[LineAccount] FileManager / AppGroup hooks installed");
 }
 
