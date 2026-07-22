@@ -79,7 +79,11 @@ static NSString *realHomePath(void) {
 static NSString *slotsRootPath(void) {
     // 必须用真实沙盒 Home，不能走 hook 后的 NSHomeDirectory（否则会嵌套 LineAccountSlots）
     NSString *home = realHomePath();
-    return [home stringByAppendingPathComponent:SLOT_DIR_NAME];
+    // ★ 关键：绝不能建在容器根 <UUID>/ 下 —— iOS 沙盒对容器根 mkdir 返回 EPERM(errno=1)，
+    //   只有 Documents / Library / tmp 等标准子目录可写。放到 Library/Application Support 下
+    //   （已证实可写，且属持久数据、不会被系统按缓存清理）。
+    return [[home stringByAppendingPathComponent:@"Library/Application Support"]
+            stringByAppendingPathComponent:SLOT_DIR_NAME];
 }
 
 static NSString *slotHomePath(NSInteger slot) {
