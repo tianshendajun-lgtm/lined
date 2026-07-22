@@ -1599,6 +1599,146 @@ static void installUserDefaultsIsolation(void) {
     NSLog(@"[LineAccount] hooked +[NSUserDefaults standardUserDefaults] -> per-slot suite");
 }
 
+#pragma mark - CFPreferences 按槽重定向（堵住 mid 等身份泄漏到共享 bundle 域）
+
+// 关键发现：LINE 把 mid（当前账号）通过 CFPreferences 直接写共享 bundle 域
+// jp.naver.line.9YV3UM7J6Z.plist，还会从 backupUserDefaults.dict 恢复到该域，
+// 完全绕过我们的 standardUserDefaults suite。→ 各槽都读到同一个 mid = 同一个账号 = 聊天混。
+// 解决：在 CFPreferences C 层，把「本 app 的偏好域」(bundle id 或 current-app 哨兵)
+// 统一重定向到 LineAccountSlotN（与 suite 同名，读写归一到同一份按槽 plist）。
+// ★ bundle id 运行时动态取（重签后会变，绝不能硬编码）。
+static CFStringRef appBundleID(void) {
+    static CFStringRef cached = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if (bid.length) cached = (CFStringRef)CFBridgingRetain(bid);
+    });
+    return cached;
+}
+
+static CFStringRef g_slotAppIDCache = NULL;
+static NSInteger g_slotAppIDForSlot = -1;
+static CFStringRef currentSlotAppID(void) {
+    if (g_selectedSlot < 1) return NULL;
+    if (!g_slotAppIDCache || g_slotAppIDForSlot != g_selectedSlot) {
+        if (g_slotAppIDCache) { CFRelease(g_slotAppIDCache); g_slotAppIDCache = NULL; }
+        NSString *s = [NSString stringWithFormat:@"LineAccountSlot%ld", (long)g_selectedSlot];
+        g_slotAppIDCache = (CFStringRef)CFBridgingRetain(s);
+        g_slotAppIDForSlot = g_selectedSlot;
+    }
+    return g_slotAppIDCache;
+}
+static CFStringRef remapAppID(CFStringRef appID) {
+    if (g_selectedSlot < 1 || appID == NULL) return appID;
+    CFStringRef bid = appBundleID();
+    if (appID == kCFPreferencesCurrentApplication ||
+        CFStringCompare(appID, CFSTR("kCFPreferencesCurrentApplication"), 0) == kCFCompareEqualTo ||
+        (bid && CFStringCompare(appID, bid, 0) == kCFCompareEqualTo)) {
+        CFStringRef s = currentSlotAppID();
+        return s ? s : appID;
+    }
+    return appID;
+}
+
+typedef CFPropertyListRef (*CFPCopyAppValue_t)(CFStringRef, CFStringRef);
+typedef void (*CFPSetAppValue_t)(CFStringRef, CFPropertyListRef, CFStringRef);
+typedef Boolean (*CFPAppSync_t)(CFStringRef);
+typedef CFArrayRef (*CFPCopyKeyList_t)(CFStringRef, CFStringRef, CFStringRef);
+typedef Boolean (*CFPAppValueIsForced_t)(CFStringRef, CFStringRef);
+typedef CFDictionaryRef (*CFPCopyMultiple_t)(CFArrayRef, CFStringRef, CFStringRef, CFStringRef);
+typedef void (*CFPSetMultiple_t)(CFDictionaryRef, CFArrayRef, CFStringRef, CFStringRef, CFStringRef);
+typedef CFPropertyListRef (*CFPCopyValue_t)(CFStringRef, CFStringRef, CFStringRef, CFStringRef);
+typedef void (*CFPSetValue_t)(CFStringRef, CFPropertyListRef, CFStringRef, CFStringRef, CFStringRef);
+typedef Boolean (*CFPSync_t)(CFStringRef, CFStringRef, CFStringRef);
+typedef CFIndex (*CFPGetAppInt_t)(CFStringRef, CFStringRef, Boolean *);
+typedef Boolean (*CFPGetAppBool_t)(CFStringRef, CFStringRef, Boolean *);
+
+static CFPCopyAppValue_t     orig_CFPCopyAppValue = NULL;
+static CFPSetAppValue_t      orig_CFPSetAppValue = NULL;
+static CFPAppSync_t          orig_CFPAppSync = NULL;
+static CFPCopyKeyList_t      orig_CFPCopyKeyList = NULL;
+static CFPAppValueIsForced_t orig_CFPAppValueIsForced = NULL;
+static CFPCopyMultiple_t     orig_CFPCopyMultiple = NULL;
+static CFPSetMultiple_t      orig_CFPSetMultiple = NULL;
+static CFPCopyValue_t        orig_CFPCopyValue = NULL;
+static CFPSetValue_t         orig_CFPSetValue = NULL;
+static CFPSync_t             orig_CFPSync = NULL;
+static CFPGetAppInt_t        orig_CFPGetAppInt = NULL;
+static CFPGetAppBool_t       orig_CFPGetAppBool = NULL;
+
+static CFPropertyListRef hooked_CFPCopyAppValue(CFStringRef key, CFStringRef app) {
+    return orig_CFPCopyAppValue(key, remapAppID(app));
+}
+static void hooked_CFPSetAppValue(CFStringRef key, CFPropertyListRef val, CFStringRef app) {
+    orig_CFPSetAppValue(key, val, remapAppID(app));
+}
+static Boolean hooked_CFPAppSync(CFStringRef app) {
+    return orig_CFPAppSync(remapAppID(app));
+}
+static CFArrayRef hooked_CFPCopyKeyList(CFStringRef app, CFStringRef user, CFStringRef host) {
+    return orig_CFPCopyKeyList(remapAppID(app), user, host);
+}
+static Boolean hooked_CFPAppValueIsForced(CFStringRef key, CFStringRef app) {
+    return orig_CFPAppValueIsForced(key, remapAppID(app));
+}
+static CFDictionaryRef hooked_CFPCopyMultiple(CFArrayRef keys, CFStringRef app, CFStringRef user, CFStringRef host) {
+    return orig_CFPCopyMultiple(keys, remapAppID(app), user, host);
+}
+static void hooked_CFPSetMultiple(CFDictionaryRef set, CFArrayRef rm, CFStringRef app, CFStringRef user, CFStringRef host) {
+    orig_CFPSetMultiple(set, rm, remapAppID(app), user, host);
+}
+static CFPropertyListRef hooked_CFPCopyValue(CFStringRef key, CFStringRef app, CFStringRef user, CFStringRef host) {
+    return orig_CFPCopyValue(key, remapAppID(app), user, host);
+}
+static void hooked_CFPSetValue(CFStringRef key, CFPropertyListRef val, CFStringRef app, CFStringRef user, CFStringRef host) {
+    orig_CFPSetValue(key, val, remapAppID(app), user, host);
+}
+static Boolean hooked_CFPSync(CFStringRef app, CFStringRef user, CFStringRef host) {
+    return orig_CFPSync(remapAppID(app), user, host);
+}
+static CFIndex hooked_CFPGetAppInt(CFStringRef key, CFStringRef app, Boolean *ok) {
+    return orig_CFPGetAppInt(key, remapAppID(app), ok);
+}
+static Boolean hooked_CFPGetAppBool(CFStringRef key, CFStringRef app, Boolean *ok) {
+    return orig_CFPGetAppBool(key, remapAppID(app), ok);
+}
+
+static void installPrefsRedirect(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    orig_CFPCopyAppValue     = (CFPCopyAppValue_t)dlsym(RTLD_DEFAULT, "CFPreferencesCopyAppValue");
+    orig_CFPSetAppValue      = (CFPSetAppValue_t)dlsym(RTLD_DEFAULT, "CFPreferencesSetAppValue");
+    orig_CFPAppSync          = (CFPAppSync_t)dlsym(RTLD_DEFAULT, "CFPreferencesAppSynchronize");
+    orig_CFPCopyKeyList      = (CFPCopyKeyList_t)dlsym(RTLD_DEFAULT, "CFPreferencesCopyKeyList");
+    orig_CFPAppValueIsForced = (CFPAppValueIsForced_t)dlsym(RTLD_DEFAULT, "CFPreferencesAppValueIsForced");
+    orig_CFPCopyMultiple     = (CFPCopyMultiple_t)dlsym(RTLD_DEFAULT, "CFPreferencesCopyMultiple");
+    orig_CFPSetMultiple      = (CFPSetMultiple_t)dlsym(RTLD_DEFAULT, "CFPreferencesSetMultiple");
+    orig_CFPCopyValue        = (CFPCopyValue_t)dlsym(RTLD_DEFAULT, "CFPreferencesCopyValue");
+    orig_CFPSetValue         = (CFPSetValue_t)dlsym(RTLD_DEFAULT, "CFPreferencesSetValue");
+    orig_CFPSync             = (CFPSync_t)dlsym(RTLD_DEFAULT, "CFPreferencesSynchronize");
+    orig_CFPGetAppInt        = (CFPGetAppInt_t)dlsym(RTLD_DEFAULT, "CFPreferencesGetAppIntegerValue");
+    orig_CFPGetAppBool       = (CFPGetAppBool_t)dlsym(RTLD_DEFAULT, "CFPreferencesGetAppBooleanValue");
+
+    struct rebinding rebs[12] = {
+        {"CFPreferencesCopyAppValue",      (void *)hooked_CFPCopyAppValue,     (void **)&orig_CFPCopyAppValue},
+        {"CFPreferencesSetAppValue",       (void *)hooked_CFPSetAppValue,      (void **)&orig_CFPSetAppValue},
+        {"CFPreferencesAppSynchronize",    (void *)hooked_CFPAppSync,          (void **)&orig_CFPAppSync},
+        {"CFPreferencesCopyKeyList",       (void *)hooked_CFPCopyKeyList,      (void **)&orig_CFPCopyKeyList},
+        {"CFPreferencesAppValueIsForced",  (void *)hooked_CFPAppValueIsForced, (void **)&orig_CFPAppValueIsForced},
+        {"CFPreferencesCopyMultiple",      (void *)hooked_CFPCopyMultiple,     (void **)&orig_CFPCopyMultiple},
+        {"CFPreferencesSetMultiple",       (void *)hooked_CFPSetMultiple,      (void **)&orig_CFPSetMultiple},
+        {"CFPreferencesCopyValue",         (void *)hooked_CFPCopyValue,        (void **)&orig_CFPCopyValue},
+        {"CFPreferencesSetValue",          (void *)hooked_CFPSetValue,         (void **)&orig_CFPSetValue},
+        {"CFPreferencesSynchronize",       (void *)hooked_CFPSync,             (void **)&orig_CFPSync},
+        {"CFPreferencesGetAppIntegerValue",(void *)hooked_CFPGetAppInt,        (void **)&orig_CFPGetAppInt},
+        {"CFPreferencesGetAppBooleanValue",(void *)hooked_CFPGetAppBool,       (void **)&orig_CFPGetAppBool},
+    };
+    rebind_symbols(rebs, 12);
+    NSLog(@"[LineAccount] CFPreferences 按槽重定向已安装 (bundle/current-app -> LineAccountSlotN)");
+}
+
 // 重签 IPA 缺 Intents/Siri entitlement 时，进聊天会走：
 // +[INVocabulary sharedVocabulary] → dispatch_once 抛未捕获异常 → abort
 // Frida 已证实栈在 Intents!sharedVocabulary，与 PrivateStore 贴纸 exists FAIL 无关
@@ -1633,6 +1773,16 @@ static BOOL hooked_BGTaskScheduler_register(id self, SEL _cmd, id identifier, id
     return NO;
 }
 
+// register 被桩掉后，LINE 仍会 submitTaskRequest: 提交未注册 handler 的任务，
+// iOS 抛 NSInternalInconsistencyException "No launch handler registered" → abort。
+// 一并桩掉 submit：直接返回 YES(成功) 且不真正提交，避免异常。
+static BOOL hooked_BGTaskScheduler_submit(id self, SEL _cmd, id request, NSError **error) {
+    (void)self; (void)_cmd; (void)request;
+    if (error) *error = nil;
+    NSLog(@"[LineAccount] stub BGTaskScheduler submitTaskRequest (skip, avoid no-handler abort)");
+    return YES;
+}
+
 static void installBGTaskCrashGuards(void) {
     static BOOL done = NO;
     if (done) return;
@@ -1648,6 +1798,14 @@ static void installBGTaskCrashGuards(void) {
         return;
     }
     method_setImplementation(m, (IMP)hooked_BGTaskScheduler_register);
+
+    SEL selSubmit = @selector(submitTaskRequest:error:);
+    Method mSubmit = class_getInstanceMethod(cls, selSubmit);
+    if (mSubmit) {
+        method_setImplementation(mSubmit, (IMP)hooked_BGTaskScheduler_submit);
+        NSLog(@"[LineAccount] hooked -[BGTaskScheduler submitTaskRequest:error:] -> no-op");
+    }
+
     done = YES;
     NSLog(@"[LineAccount] hooked -[BGTaskScheduler register...] -> no-op (avoid late-register abort)");
 }
@@ -2406,7 +2564,7 @@ static void line_account_init(void) {
     recoverSwapJournalIfAny();
 
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] BUILD=appgroup-under-Library v5");
+    NSLog(@"[LineAccount] BUILD=cfprefs-slot-redirect+bgsubmit v6");
     NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
     NSLog(@"[LineAccount] ========================================");
 
@@ -2423,6 +2581,7 @@ static void line_account_init(void) {
     installRuntimeHooks();
     installKeychainHooks();
     installUserDefaultsIsolation();
+    installPrefsRedirect();          // ★ CFPreferences 按槽重定向：堵 mid 泄漏到共享 bundle 域
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
