@@ -308,6 +308,8 @@ static NSArray *hooked_URLsForDirectory(id self, SEL _cmd, NSSearchPathDirectory
     return out;
 }
 
+static void installLineFileManagerHooks(void);
+
 static void installRuntimeHooks(void) {
     if (g_hooksInstalled) return;
     g_hooksInstalled = YES;
@@ -351,7 +353,199 @@ static void installRuntimeHooks(void) {
         method_setImplementation(m, (IMP)hooked_containerURL);
     }
 
+    installLineFileManagerHooks();
     NSLog(@"[LineAccount] FileManager / AppGroup hooks installed");
+}
+
+#pragma mark - LineFileManager（重签无 App Group 时返回 nil 的根因）
+
+static NSInteger activeSlotOrZero(void) {
+    return g_selectedSlot >= 0 ? g_selectedSlot : 0;
+}
+
+static NSString *sanitizePathComponent(id obj) {
+    if (!obj) return @"unknown";
+    NSString *s = nil;
+    if ([obj isKindOfClass:[NSString class]]) s = (NSString *)obj;
+    else if ([obj respondsToSelector:@selector(stringValue)]) s = [obj stringValue];
+    else s = [obj description];
+    if (s.length == 0) return @"unknown";
+    s = [[s componentsSeparatedByCharactersInSet:
+          [NSCharacterSet characterSetWithCharactersInString:@"/:\\"]] componentsJoinedByString:@"_"];
+    return s;
+}
+
+static NSURL *syntheticStoreURL(id storeOrType, id typeOrSub) {
+    NSInteger slot = activeSlotOrZero();
+    ensureSlotDirectories(slot);
+    NSString *a = sanitizePathComponent(storeOrType);
+    NSString *b = typeOrSub ? sanitizePathComponent(typeOrSub) : nil;
+    NSString *path = [[slotHomePath(slot)
+                       stringByAppendingPathComponent:@"Library/Application Support/LineStores"]
+                      stringByAppendingPathComponent:a];
+    if (b.length) path = [path stringByAppendingPathComponent:b];
+    mkdirp(path);
+    return [NSURL fileURLWithPath:path isDirectory:YES];
+}
+
+static NSURL *ensureNonNilFileURL(NSURL *url, id fallbackKey) {
+    if (url && url.path.length > 0) {
+        NSString *mapped = remapPath(url.path);
+        if (mapped && ![mapped isEqualToString:url.path]) {
+            BOOL isDir = NO;
+            [[NSFileManager defaultManager] fileExistsAtPath:mapped isDirectory:&isDir];
+            // 目录型 URL 保持 isDirectory；文件型用原逻辑
+            if ([url.pathExtension length] == 0 || isDir) {
+                mkdirp(mapped);
+                return [NSURL fileURLWithPath:mapped isDirectory:YES];
+            }
+            mkdirp([mapped stringByDeletingLastPathComponent]);
+            return [NSURL fileURLWithPath:mapped isDirectory:NO];
+        }
+        return url;
+    }
+    return syntheticStoreURL(fallbackKey, nil);
+}
+
+// + privateFileStoresAreAccessible
+static BOOL (*orig_privateFileStoresAreAccessible)(Class, SEL) = NULL;
+static BOOL hooked_privateFileStoresAreAccessible(Class cls, SEL sel) {
+    NSLog(@"[LineAccount] privateFileStoresAreAccessible -> YES");
+    return YES;
+}
+
+// + fileURLForStoreType:
+static NSURL *(*orig_fileURLForStoreType)(Class, SEL, id) = NULL;
+static NSURL *hooked_fileURLForStoreType(Class cls, SEL sel, id storeType) {
+    NSURL *url = orig_fileURLForStoreType ? orig_fileURLForStoreType(cls, sel, storeType) : nil;
+    NSURL *fixed = ensureNonNilFileURL(url, storeType ?: @"storeType");
+    if (!url) NSLog(@"[LineAccount] fileURLForStoreType nil -> %@", fixed.path);
+    return fixed;
+}
+
+// + fileURLForStore:
+static NSURL *(*orig_fileURLForStore)(Class, SEL, id) = NULL;
+static NSURL *hooked_fileURLForStore(Class cls, SEL sel, id store) {
+    NSURL *url = orig_fileURLForStore ? orig_fileURLForStore(cls, sel, store) : nil;
+    return ensureNonNilFileURL(url, store ?: @"store");
+}
+
+// + fileURLForStore:ofType:
+static NSURL *(*orig_fileURLForStoreOfType)(Class, SEL, id, id) = NULL;
+static NSURL *hooked_fileURLForStoreOfType(Class cls, SEL sel, id store, id type) {
+    NSURL *url = orig_fileURLForStoreOfType ? orig_fileURLForStoreOfType(cls, sel, store, type) : nil;
+    if (url && url.path.length) return ensureNonNilFileURL(url, store);
+    NSURL *fixed = syntheticStoreURL(store, type);
+    NSLog(@"[LineAccount] fileURLForStore:ofType: nil -> %@", fixed.path);
+    return fixed;
+}
+
+// + fileURLForStore:substore:
+static NSURL *(*orig_fileURLForStoreSubstore)(Class, SEL, id, id) = NULL;
+static NSURL *hooked_fileURLForStoreSubstore(Class cls, SEL sel, id store, id sub) {
+    NSURL *url = orig_fileURLForStoreSubstore ? orig_fileURLForStoreSubstore(cls, sel, store, sub) : nil;
+    if (url && url.path.length) return ensureNonNilFileURL(url, store);
+    return syntheticStoreURL(store, sub);
+}
+
+// + fileURLForFileNamed:inStore:
+static NSURL *(*orig_fileURLForFileInStore)(Class, SEL, id, id) = NULL;
+static NSURL *hooked_fileURLForFileInStore(Class cls, SEL sel, id name, id store) {
+    NSURL *url = orig_fileURLForFileInStore ? orig_fileURLForFileInStore(cls, sel, name, store) : nil;
+    if (url && url.path.length) return ensureNonNilFileURL(url, name);
+    NSURL *dir = syntheticStoreURL(store, nil);
+    NSString *path = [dir.path stringByAppendingPathComponent:sanitizePathComponent(name)];
+    mkdirp([path stringByDeletingLastPathComponent]);
+    return [NSURL fileURLWithPath:path isDirectory:NO];
+}
+
+// + fileURLForFileNamed:inStore:ofType:
+static NSURL *(*orig_fileURLForFileInStoreOfType)(Class, SEL, id, id, id) = NULL;
+static NSURL *hooked_fileURLForFileInStoreOfType(Class cls, SEL sel, id name, id store, id type) {
+    NSURL *url = orig_fileURLForFileInStoreOfType ? orig_fileURLForFileInStoreOfType(cls, sel, name, store, type) : nil;
+    if (url && url.path.length) return ensureNonNilFileURL(url, name);
+    NSURL *dir = syntheticStoreURL(store, type);
+    NSString *path = [dir.path stringByAppendingPathComponent:sanitizePathComponent(name)];
+    mkdirp([path stringByDeletingLastPathComponent]);
+    return [NSURL fileURLWithPath:path isDirectory:NO];
+}
+
+// + fileURLForFileNamed:inStore:substore:
+static NSURL *(*orig_fileURLForFileInStoreSub)(Class, SEL, id, id, id) = NULL;
+static NSURL *hooked_fileURLForFileInStoreSub(Class cls, SEL sel, id name, id store, id sub) {
+    NSURL *url = orig_fileURLForFileInStoreSub ? orig_fileURLForFileInStoreSub(cls, sel, name, store, sub) : nil;
+    if (url && url.path.length) return ensureNonNilFileURL(url, name);
+    NSURL *dir = syntheticStoreURL(store, sub);
+    NSString *path = [dir.path stringByAppendingPathComponent:sanitizePathComponent(name)];
+    mkdirp([path stringByDeletingLastPathComponent]);
+    return [NSURL fileURLWithPath:path isDirectory:NO];
+}
+
+static void swizzleClassMethod(Class cls, SEL sel, IMP neu, void **origOut) {
+    if (!cls || !neu) return;
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) {
+        NSLog(@"[LineAccount] missing class method: %@ %@", NSStringFromClass(cls), NSStringFromSelector(sel));
+        return;
+    }
+    IMP old = method_setImplementation(m, neu);
+    if (origOut) *origOut = (void *)old;
+}
+
+static void installLineFileManagerHooks(void) {
+    Class cls = NSClassFromString(@"LineFileManager");
+    if (!cls) {
+        NSLog(@"[LineAccount] LineFileManager not found yet, will retry later");
+        // LINE 类可能稍后才加载
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            Class c2 = NSClassFromString(@"LineFileManager");
+            if (!c2) {
+                NSLog(@"[LineAccount] LineFileManager still missing");
+                return;
+            }
+            installLineFileManagerHooks();
+        });
+        return;
+    }
+
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    swizzleClassMethod(cls, @selector(privateFileStoresAreAccessible),
+                       (IMP)hooked_privateFileStoresAreAccessible,
+                       (void **)&orig_privateFileStoresAreAccessible);
+
+    swizzleClassMethod(cls, @selector(fileURLForStoreType:),
+                       (IMP)hooked_fileURLForStoreType,
+                       (void **)&orig_fileURLForStoreType);
+
+    swizzleClassMethod(cls, @selector(fileURLForStore:),
+                       (IMP)hooked_fileURLForStore,
+                       (void **)&orig_fileURLForStore);
+
+    swizzleClassMethod(cls, @selector(fileURLForStore:ofType:),
+                       (IMP)hooked_fileURLForStoreOfType,
+                       (void **)&orig_fileURLForStoreOfType);
+
+    swizzleClassMethod(cls, @selector(fileURLForStore:substore:),
+                       (IMP)hooked_fileURLForStoreSubstore,
+                       (void **)&orig_fileURLForStoreSubstore);
+
+    swizzleClassMethod(cls, @selector(fileURLForFileNamed:inStore:),
+                       (IMP)hooked_fileURLForFileInStore,
+                       (void **)&orig_fileURLForFileInStore);
+
+    swizzleClassMethod(cls, @selector(fileURLForFileNamed:inStore:ofType:),
+                       (IMP)hooked_fileURLForFileInStoreOfType,
+                       (void **)&orig_fileURLForFileInStoreOfType);
+
+    swizzleClassMethod(cls, @selector(fileURLForFileNamed:inStore:substore:),
+                       (IMP)hooked_fileURLForFileInStoreSub,
+                       (void **)&orig_fileURLForFileInStoreSub);
+
+    NSLog(@"[LineAccount] LineFileManager hooks OK");
 }
 
 #pragma mark - fishhook Keychain（非越狱可用：只改 App 内镜像 + vm_protect）
@@ -696,6 +890,7 @@ static void enterAccountSlot(NSInteger slot) {
 
     // 先切沙盒，再放行 LINE（无需重启进程）
     g_selectedSlot = slot;
+    installLineFileManagerHooks(); // 确保进入沙盒前 LineFileManager 已 hook
     NSLog(@"[LineAccount] selected slot %ld — continue without restart", (long)slot);
     resumeLINELaunch();
 }
