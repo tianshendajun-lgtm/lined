@@ -35,6 +35,14 @@ static BOOL g_needPicker = NO;      // 本次启动要先选账号
 static BOOL g_blockLINEUI = NO;     // 挡住 LINE 原窗口，避免先闪登录页
 static UIWindow *pickerWindow = nil;
 static IMP orig_makeKeyAndVisible = NULL;
+static IMP orig_didFinishLaunching = NULL;
+static id g_deferredDelegate = nil;
+static UIApplication *g_deferredApp = nil;
+static NSDictionary *g_deferredOpts = nil;
+static BOOL g_launchDeferred = NO;
+static BOOL g_launchResumed = NO;
+
+static void showAccountPicker(void);
 
 #pragma mark - 路径工具
 
@@ -353,7 +361,6 @@ static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
     mkdirp(realAS);
     ensureSlotDirectories(slot);
 
-    // 拆掉坏 symlink（真实路径上）
     for (NSString *name in @[@"Messages", @"PrivateStore", @"PublicStore"]) {
         NSString *p = [realAS stringByAppendingPathComponent:name];
         const char *c = [p fileSystemRepresentation];
@@ -362,10 +369,19 @@ static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
             NSLog(@"[LineAccount] removing stale %@ symlink", name);
             unlink(c);
         }
+        mkdirp(p);
+    }
+    // 真实 Talk DB：PrivateStore/P_<mid>/Messages/（Frida 已证实），不是只有 t0
+    mkdirp([realAS stringByAppendingPathComponent:@"PrivateStore"]);
+
+    // ★ 若 didFinishLaunching 未拦住，LINE/CoreData 已打开 sqlite —— 此时绝不能 wipe
+    //   否则 → SQLite 6922 disk I/O error / abort（日志已证实）
+    if (!g_launchDeferred) {
+        NSLog(@"[LineAccount] WARNING launch NOT deferred — skip wipe/load, only ensure dirs + backup");
+        persistRealTalkDataToSlot(slot);
+        return;
     }
 
-    // ★ 同槽重进（重启后再选同一账号）：绝不能 wipe 真实数据
-    //   旧逻辑会 remove PrivateStore 再从空槽覆盖 → 丢登录态/聊天记录
     if (previousSlot == slot) {
         persistRealTalkDataToSlot(slot);
         NSLog(@"[LineAccount] same slot %ld re-enter: kept real Talk DB, backed up to slot", (long)slot);
@@ -376,11 +392,21 @@ static void syncTalkDBForSlot(NSInteger slot, NSInteger previousSlot) {
         loadTalkDataFromSlotToReal(slot);
     }
 
-    NSString *realDb = [realAS stringByAppendingPathComponent:@"Messages/Line.sqlite"];
-    NSString *realTalk = [realAS stringByAppendingPathComponent:@"PrivateStore/t0/Line.sqlite"];
-    NSLog(@"[LineAccount] talkdb ready Messages=%d PrivateStore/t0=%d",
-          [[NSFileManager defaultManager] fileExistsAtPath:realDb],
-          [[NSFileManager defaultManager] fileExistsAtPath:realTalk]);
+    // 探测 P_*/Messages/Line.sqlite
+    NSString *ps = [realAS stringByAppendingPathComponent:@"PrivateStore"];
+    NSArray *kids = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:ps error:nil];
+    NSInteger pCount = 0;
+    BOOL anyTalk = NO;
+    for (NSString *k in kids) {
+        if (![k hasPrefix:@"P_"] && ![k hasPrefix:@"p"]) continue;
+        pCount++;
+        NSString *talk = [[ps stringByAppendingPathComponent:k]
+                          stringByAppendingPathComponent:@"Messages/Line.sqlite"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:talk]) anyTalk = YES;
+    }
+    NSLog(@"[LineAccount] talkdb ready PrivateStore children=%lu P_like=%ld hasTalkSqlite=%d t0=%d",
+          (unsigned long)kids.count, (long)pCount, anyTalk,
+          [[NSFileManager defaultManager] fileExistsAtPath:[ps stringByAppendingPathComponent:@"t0/Line.sqlite"]]);
 }
 
 static NSMutableDictionary *loadMeta(void); // forward — used by bindRealTalkDBDirToSlot
@@ -1112,11 +1138,9 @@ static void installLineFileManagerHooks(void) {
     Class cls = NSClassFromString(@"LineFileManager");
     if (!cls) {
         NSLog(@"[LineAccount] LineFileManager not found yet, will retry later");
-        // LINE 类可能稍后才加载
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            Class c2 = NSClassFromString(@"LineFileManager");
-            if (!c2) {
+            if (!NSClassFromString(@"LineFileManager")) {
                 NSLog(@"[LineAccount] LineFileManager still missing");
                 return;
             }
@@ -1129,39 +1153,14 @@ static void installLineFileManagerHooks(void) {
     if (done) return;
     done = YES;
 
+    // ★ 只强制 accessible=YES。不要再伪造 fileURLForStore*：
+    //   tokenFromRaw 把对象指针编成 p%lx，与真实 PrivateStore/P_<mid>/Messages 分叉，
+    //   Frida 已证实崩溃库在 P_u3df.../Messages/Line.sqlite。
     swizzleClassMethod(cls, @selector(privateFileStoresAreAccessible),
                        (IMP)hooked_privateFileStoresAreAccessible,
                        (void **)&orig_privateFileStoresAreAccessible);
 
-    swizzleClassMethod(cls, @selector(fileURLForStoreType:),
-                       (IMP)hooked_fileURLForStoreType,
-                       (void **)&orig_fileURLForStoreType);
-
-    swizzleClassMethod(cls, @selector(fileURLForStore:),
-                       (IMP)hooked_fileURLForStore,
-                       (void **)&orig_fileURLForStore);
-
-    swizzleClassMethod(cls, @selector(fileURLForStore:ofType:),
-                       (IMP)hooked_fileURLForStoreOfType,
-                       (void **)&orig_fileURLForStoreOfType);
-
-    swizzleClassMethod(cls, @selector(fileURLForStore:substore:),
-                       (IMP)hooked_fileURLForStoreSubstore,
-                       (void **)&orig_fileURLForStoreSubstore);
-
-    swizzleClassMethod(cls, @selector(fileURLForFileNamed:inStore:),
-                       (IMP)hooked_fileURLForFileInStore,
-                       (void **)&orig_fileURLForFileInStore);
-
-    swizzleClassMethod(cls, @selector(fileURLForFileNamed:inStore:ofType:),
-                       (IMP)hooked_fileURLForFileInStoreOfType,
-                       (void **)&orig_fileURLForFileInStoreOfType);
-
-    swizzleClassMethod(cls, @selector(fileURLForFileNamed:inStore:substore:),
-                       (IMP)hooked_fileURLForFileInStoreSub,
-                       (void **)&orig_fileURLForFileInStoreSub);
-
-    NSLog(@"[LineAccount] LineFileManager hooks OK");
+    NSLog(@"[LineAccount] LineFileManager hooks OK (accessible only; keep native P_<mid> paths)");
 }
 
 #pragma mark - fishhook Keychain（非越狱可用：只改 App 内镜像 + vm_protect）
@@ -1466,15 +1465,7 @@ static void enterAccountSlot(NSInteger slot);
 
 #pragma mark - 无重启进入沙盒
 
-static IMP orig_didFinishLaunching = NULL;
-static id g_deferredDelegate = nil;
-static UIApplication *g_deferredApp = nil;
-static NSDictionary *g_deferredOpts = nil;
-static BOOL g_launchDeferred = NO;
-static BOOL g_launchResumed = NO;
-
 static void hideLINEWindows(void);
-static void showAccountPicker(void);
 
 static void dismissPicker(void) {
     g_blockLINEUI = NO;
@@ -1736,6 +1727,29 @@ static void showAccountPicker(void) {
     }
 }
 
+static void (*orig_setDelegate)(id, SEL, id) = NULL;
+
+static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts);
+
+static void tryHookDidFinishOnDelegate(id del) {
+    if (!del || orig_didFinishLaunching) return;
+    Class cls = [del class];
+    Method target = class_getInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
+    if (!target) {
+        NSLog(@"[LineAccount] delegate %@ has no didFinishLaunching", cls);
+        return;
+    }
+    orig_didFinishLaunching = method_setImplementation(target, (IMP)hooked_didFinishLaunching);
+    NSLog(@"[LineAccount] hooked didFinishLaunching on %@", NSStringFromClass(cls));
+}
+
+static void hooked_setDelegate(id self, SEL _cmd, id del) {
+    tryHookDidFinishOnDelegate(del);
+    if (orig_setDelegate) {
+        orig_setDelegate(self, _cmd, del);
+    }
+}
+
 static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
     // 需要选账号：暂缓 LINE 真正启动，只出选择页
     if (g_needPicker && !g_launchResumed) {
@@ -1746,7 +1760,7 @@ static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSD
         g_deferredOpts = opts;
         showAccountPicker();
         NSLog(@"[LineAccount] didFinishLaunching deferred until account selected");
-        return YES; // 告诉系统启动成功，实际业务等选完再跑
+        return YES;
     }
 
     if (orig_didFinishLaunching) {
@@ -1758,19 +1772,44 @@ static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSD
 static void hookAppDelegate(void) {
     installWindowBlockHook();
 
+    // 1) 尽早 hook setDelegate，抓住真实 AppDelegate 类名（可能是 Swift mangled）
+    Method sd = class_getInstanceMethod([UIApplication class], @selector(setDelegate:));
+    if (sd && !orig_setDelegate) {
+        orig_setDelegate = (void (*)(id, SEL, id))method_setImplementation(sd, (IMP)hooked_setDelegate);
+        NSLog(@"[LineAccount] hooked UIApplication setDelegate:");
+    }
+    // 若 delegate 已设置
+    tryHookDidFinishOnDelegate(UIApplication.sharedApplication.delegate);
+
     NSArray *names = @[@"AppDelegate", @"LINEAppDelegate", @"NLAppDelegate", @"LineAppDelegate"];
     for (NSString *name in names) {
         Class cls = NSClassFromString(name);
         if (!cls) continue;
         Method m = class_getInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
-        if (m) {
+        if (m && !orig_didFinishLaunching) {
             orig_didFinishLaunching = method_setImplementation(m, (IMP)hooked_didFinishLaunching);
             NSLog(@"[LineAccount] hooked %@", name);
-            return;
         }
     }
 
+    // 2) 扫一遍带 AppDelegate 后缀的类
+    if (!orig_didFinishLaunching) {
+        unsigned int n = 0;
+        Class *list = objc_copyClassList(&n);
+        for (unsigned int i = 0; i < n && !orig_didFinishLaunching; i++) {
+            NSString *name = NSStringFromClass(list[i]);
+            if (![name containsString:@"AppDelegate"] && ![name containsString:@"appDelegate"]) continue;
+            if ([name hasPrefix:@"UI"]) continue;
+            Method m = class_getInstanceMethod(list[i], @selector(application:didFinishLaunchingWithOptions:));
+            if (!m) continue;
+            orig_didFinishLaunching = method_setImplementation(m, (IMP)hooked_didFinishLaunching);
+            NSLog(@"[LineAccount] hooked scanned %@", name);
+        }
+        if (list) free(list);
+    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
+        tryHookDidFinishOnDelegate(UIApplication.sharedApplication.delegate);
         if (g_needPicker) showAccountPicker();
     });
 }
