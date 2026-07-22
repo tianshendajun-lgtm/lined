@@ -96,7 +96,13 @@ static void ensureSlotDirectories(NSInteger slot) {
         @"Library/Application Support/Messages",
         @"tmp",
         @"AppGroup/group.com.linecorp.line",
+        // ★ 实测 Talk DB 在这里：AppGroup/.../PrivateStore/t0/Line.sqlite
+        @"AppGroup/group.com.linecorp.line/Library",
+        @"AppGroup/group.com.linecorp.line/Library/Application Support",
+        @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore",
+        @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore/t0",
         @"AppGroup/group.com.linecorp.Line.encrypted.app",
+        @"AppGroup/group.com.linecorp.Line.encrypted.app/Library/Application Support/PrivateStore",
         @"AppGroup/group.share.com.linecorp.line",
         @"AppGroup/group.com.linecorp.Line.encrypted.share",
         @"AppGroup/group.com.linecorp.Line.encrypted.standard",
@@ -106,10 +112,15 @@ static void ensureSlotDirectories(NSInteger slot) {
     for (NSString *sub in subs) {
         mkdirp([root stringByAppendingPathComponent:sub]);
     }
-    // Core Data Talk DB：保护等级过高会导致 “failed to load talk db” → unauthorize → exit(0)
-    NSString *msgDir = [root stringByAppendingPathComponent:@"Library/Application Support/Messages"];
+    // 预建一批 PrivateStore/tN，避免登录时并发 createDir 失败 → sqlite ENOENT
+    NSString *ps = [root stringByAppendingPathComponent:
+                    @"AppGroup/group.com.linecorp.line/Library/Application Support/PrivateStore"];
+    for (NSInteger i = 0; i <= 128; i++) {
+        mkdirp([ps stringByAppendingPathComponent:[NSString stringWithFormat:@"t%ld", (long)i]]);
+    }
     NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
-    // 用 POSIX 路径，避免走可能 remap 的 NSFileManager
+    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:ps error:nil];
+    NSString *msgDir = [root stringByAppendingPathComponent:@"Library/Application Support/Messages"];
     mkdirp(msgDir);
     [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:msgDir error:nil];
 }
@@ -535,6 +546,24 @@ static NSString *pathFromMaybeBogus(NSString *path) {
     return path;
 }
 
+// 槽位内 PrivateStore：createDirectory 经常失败（intermediates/权限），直接 POSIX 建齐并返回 YES
+static BOOL ensureSlotPrivateStorePath(NSString *path) {
+    if (path.length == 0) return NO;
+    if (![path containsString:SLOT_DIR_NAME]) return NO;
+    if (![path containsString:@"PrivateStore"] && ![path containsString:@"Line.sqlite"]) return NO;
+    NSString *dir = path;
+    if ([path hasSuffix:@".sqlite"] || [path.pathExtension length] > 0) {
+        dir = [path stringByDeletingLastPathComponent];
+    }
+    mkdirp(dir);
+    const char *c = [dir fileSystemRepresentation];
+    struct stat st;
+    if (c && stat(c, &st) == 0 && S_ISDIR(st.st_mode)) {
+        return YES;
+    }
+    return NO;
+}
+
 static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL intermediates,
                                       NSDictionary *attr, NSError **err) {
     // 若传入的是枚举整数/nil：不要「假装建成功」，直接失败，避免 LINE 后续 Swift 解包其它 nil 崩掉。
@@ -556,6 +585,10 @@ static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL interm
         return NO;
     }
     NSString *mapped = remapPath(path);
+    if (ensureSlotPrivateStorePath(mapped)) {
+        NSLog(@"[LineAccount] createDirURL OK(forced) %@", mapped);
+        return YES;
+    }
     if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
         mkdirp(mapped);
     }
@@ -575,6 +608,10 @@ static BOOL hooked_createDirectory(id self, SEL _cmd, NSString *path, BOOL inter
         return NO;
     }
     NSString *mapped = remapPath(path);
+    if (ensureSlotPrivateStorePath(mapped)) {
+        NSLog(@"[LineAccount] createDir OK(forced) %@", mapped);
+        return YES;
+    }
     // Talk DB 相关：强制建齐父目录
     if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
         mkdirp(mapped);
@@ -623,8 +660,8 @@ static BOOL hooked_createFile(id self, SEL _cmd, NSString *path, NSData *data, N
     path = pathFromMaybeBogus(path);
     if (path.length == 0) return NO;
     NSString *mapped = remapPath(path);
-    if ([mapped containsString:@"Line.sqlite"] || [mapped containsString:@"/Messages"] ||
-        [mapped containsString:@"talk.sqlite"]) {
+    if ([mapped containsString:@"Line.sqlite"] || [mapped containsString:@"PrivateStore"] ||
+        [mapped containsString:@"/Messages"] || [mapped containsString:@"talk.sqlite"]) {
         mkdirp([mapped stringByDeletingLastPathComponent]);
         NSLog(@"[LineAccount] createFile %@", mapped);
     }
