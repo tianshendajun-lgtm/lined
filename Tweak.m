@@ -42,7 +42,17 @@ static NSDictionary *g_deferredOpts = nil;
 static BOOL g_launchDeferred = NO;
 static BOOL g_launchResumed = NO;
 
+// Scene 生命周期也可能先于选择页初始化 LINE，必须一起暂缓
+static IMP orig_sceneWillConnect = NULL;
+static id g_deferredSceneTarget = nil;
+static UIScene *g_deferredScene = nil;
+static UISceneSession *g_deferredSceneSession = nil;
+static id g_deferredSceneOpts = nil;
+static BOOL g_sceneDeferred = NO;
+
 static void showAccountPicker(void);
+static void installHomeDirectoryHook(void);
+static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts);
 
 #pragma mark - 路径工具
 
@@ -106,19 +116,17 @@ static void mkdirp(NSString *path) {
 }
 
 static void ensureSlotDirectories(NSInteger slot) {
-    // 与 LINE 真实布局对齐：PrivateStore 在 Library/Application Support 下，不在 AppGroup 嵌套里
-    // SSH 已证实真实路径是：$HOME/Library/Application Support/PrivateStore/
+    // 槽位内按 LINE 真实布局建目录；Talk DB 在 PrivateStore/P_<mid>/Messages
     NSArray *subs = @[
         @"Documents",
         @"Library/Preferences",
         @"Library/Caches",
+        @"Library/Cookies",
         @"Library/Application Support",
         @"Library/Application Support/Messages",
         @"Library/Application Support/PrivateStore",
-        @"Library/Application Support/PrivateStore/t0",
         @"Library/Application Support/PublicStore",
         @"tmp",
-        // 仍保留假 App Group 根（其它 API 可能问 containerURL），但不再把 Talk DB 放这里
         @"AppGroup/group.com.linecorp.line",
         @"AppGroup/group.com.linecorp.Line.encrypted.app",
         @"AppGroup/group.share.com.linecorp.line",
@@ -130,31 +138,9 @@ static void ensureSlotDirectories(NSInteger slot) {
     for (NSString *sub in subs) {
         mkdirp([root stringByAppendingPathComponent:sub]);
     }
-    NSString *ps = [root stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
-    mkdirp(ps);
-    for (NSInteger i = 0; i <= 128; i++) {
-        mkdirp([ps stringByAppendingPathComponent:[NSString stringWithFormat:@"t%ld", (long)i]]);
-    }
-    // 真实 Home 下也建齐（登录时 LINE 可能直接用真实 AS/PrivateStore）
-    NSString *realPS = [realHomePath() stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
-    mkdirp(realPS);
-    for (NSInteger i = 0; i <= 128; i++) {
-        mkdirp([realPS stringByAppendingPathComponent:[NSString stringWithFormat:@"t%ld", (long)i]]);
-    }
-
     NSDictionary *prot = @{NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
-    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:ps error:nil];
-    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:realPS error:nil];
-    NSString *msgDir = [root stringByAppendingPathComponent:@"Library/Application Support/Messages"];
-    mkdirp(msgDir);
-    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:msgDir error:nil];
-
-    NSString *t0 = [ps stringByAppendingPathComponent:@"t0"];
-    struct stat st;
-    NSLog(@"[LineAccount] slot=%ld root=%@ PrivateStore/t0 is_dir=%d realPS is_dir=%d",
-          (long)slot, root,
-          (stat([t0 fileSystemRepresentation], &st) == 0 && S_ISDIR(st.st_mode)),
-          (stat([realPS fileSystemRepresentation], &st) == 0 && S_ISDIR(st.st_mode)));
+    [[NSFileManager defaultManager] setAttributes:prot ofItemAtPath:root error:nil];
+    NSLog(@"[LineAccount] slot=%ld root=%@", (long)slot, root);
 }
 
 // Talk DB 策略（已证实 symlink 易 ENOENT）：
@@ -579,18 +565,15 @@ static NSString *slotKeyPrefix(NSInteger slot) {
 
 static BOOL pathNeedsRemap(NSString *path) {
     if (path.length == 0) return NO;
-    if ([path containsString:SLOT_DIR_NAME]) return NO;
+    if ([path containsString:SLOT_DIR_NAME]) return NO; // 槽位自身与 meta 不二次映射
     if (g_selectedSlot < 1) return NO;
 
-    // 仅隔离「真·Group Containers」路径到槽位 AppGroup。
-    // Documents / Preferences / Caches / Application Support 一律走真实 Home：
-    // - NSHomeDirectory() 未 hook，FM remap 会造成「库在真实路径、附件在槽路径」→ 进聊天闪退
-    // - CFPreferences/NSUserDefaults 不走 NSFileManager，remap Preferences 也无法隔离登录态
-    if ([path containsString:@"/Library/Group Containers/"] ||
-        [path containsString:@"group.com.linecorp"]) {
-        // 但 containerURL 已返回真实 Home 时，其下的 group 字符串可能误伤 — 仅匹配系统 Group Containers
-        if ([path containsString:@"/Library/Group Containers/"]) return YES;
-    }
+    NSString *home = realHomePath();
+    // 选中账号后：整个 App 沙盒 Home 下的路径都进 account_N（真正隔离）
+    if (home.length > 0 && [path hasPrefix:home]) return YES;
+
+    // 系统 Group Containers 也进槽位 AppGroup
+    if ([path containsString:@"/Library/Group Containers/"]) return YES;
 
     return NO;
 }
@@ -713,15 +696,12 @@ static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
         }
         return nil;
     }
-    // ★ 关键：LineAccountSlots/.../PrivateStore 下 createDir 全部 FAIL；
-    //    真实 $HOME/Library/Application Support/PrivateStore 可用（SSH+探针已证实）。
-    // LINE 拼接：containerURL + "Library/Application Support/PrivateStore/tN"
-    // 因此假 group 根 = 真实 Home，Talk DB 落在已验证可写的位置。
+    // 假 App Group 根 = 槽位 home，LINE 拼 PrivateStore/P_<mid>/… 会落在 account_N 下
     if (groupId.length > 0) {
         ensureSlotDirectories(g_selectedSlot);
-        NSString *path = realHomePath();
+        NSString *path = slotHomePath(g_selectedSlot);
         mkdirp([path stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]);
-        NSLog(@"[LineAccount] containerURL(%@) -> REAL home %@", groupId, path);
+        NSLog(@"[LineAccount] containerURL(%@) -> slot %ld %@", groupId, (long)g_selectedSlot, path);
         return [NSURL fileURLWithPath:path isDirectory:YES];
     }
     if (orig_containerURL) {
@@ -767,11 +747,10 @@ static NSString *pathFromMaybeBogus(NSString *path) {
     return path;
 }
 
-// PrivateStore（真实或槽位镜像）：POSIX 建齐后一律视为成功
-// （NSFileManager 对「已存在」常返回 FAIL；槽路径下探针也几乎全 FAIL）
+// PrivateStore / 槽位路径：POSIX 建齐后一律视为成功
 static BOOL ensurePrivateStoreDir(NSString *path) {
     if (path.length == 0) return NO;
-    if (![path containsString:@"PrivateStore"]) return NO;
+    if (![path containsString:@"PrivateStore"] && ![path containsString:SLOT_DIR_NAME]) return NO;
 
     NSString *dir = path;
     if (path.pathExtension.length > 0) {
@@ -805,8 +784,12 @@ static BOOL hooked_createDirectoryURL(id self, SEL _cmd, NSURL *url, BOOL interm
     }
     NSString *mapped = remapPath(path);
     if (ensurePrivateStoreDir(mapped)) return YES;
-    if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
+    if ([mapped containsString:SLOT_DIR_NAME] ||
+        [mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
         mkdirp(mapped);
+        struct stat st;
+        const char *c = [mapped fileSystemRepresentation];
+        if (c && lstat(c, &st) == 0 && S_ISDIR(st.st_mode)) return YES;
     }
     if (mapped && ![mapped isEqualToString:path]) {
         url = [NSURL fileURLWithPath:mapped isDirectory:YES];
@@ -825,8 +808,12 @@ static BOOL hooked_createDirectory(id self, SEL _cmd, NSString *path, BOOL inter
     }
     NSString *mapped = remapPath(path);
     if (ensurePrivateStoreDir(mapped)) return YES;
-    if ([mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
+    if ([mapped containsString:SLOT_DIR_NAME] ||
+        [mapped containsString:@"Application Support"] || [mapped containsString:@"Messages"]) {
         mkdirp(mapped);
+        struct stat st;
+        const char *c = [mapped fileSystemRepresentation];
+        if (c && lstat(c, &st) == 0 && S_ISDIR(st.st_mode)) return YES;
     }
     return ((BOOL(*)(id,SEL,NSString*,BOOL,NSDictionary*,NSError**))orig_createDirectory)
         (self, _cmd, mapped, intermediates, attr, err);
@@ -1023,31 +1010,25 @@ static NSURL *remapFileURL(NSURL *url) {
     return [NSURL fileURLWithPath:mapped isDirectory:isDir];
 }
 
-// 运行时 Talk DB 落在真实 Home（createDir 唯一稳定成功的位置）；
-// 多账号：选槽时把真实 PrivateStore 与槽位互拷。
+// 若仍走到合成 URL：一律进当前槽位（与 NSHomeDirectory/containerURL 一致）
 static NSURL *syntheticPrivateStoreURL(NSString *token, NSString *sub) {
     NSInteger slot = activeSlotOrZero();
     ensureSlotDirectories(slot);
     if (token.length == 0) token = @"t0";
     if ([token hasPrefix:@"st"]) {
         token = [@"t" stringByAppendingString:[token substringFromIndex:2]];
-    } else if (![token hasPrefix:@"t"] && ![token hasPrefix:@"p"]) {
+    } else if (![token hasPrefix:@"t"] && ![token hasPrefix:@"p"] && ![token hasPrefix:@"P"]) {
         token = [NSString stringWithFormat:@"t%@", token];
     }
-    NSString *path = [[realHomePath()
+    NSString *base = (slot >= 1) ? slotHomePath(slot) : realHomePath();
+    NSString *path = [[base
                        stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]
                       stringByAppendingPathComponent:token];
     if (sub.length > 0) {
         path = [path stringByAppendingPathComponent:sub];
     }
     mkdirp(path);
-    // 槽位镜像目录也建好，便于切换账号时拷贝
-    NSString *slotPath = [[slotHomePath(slot)
-                           stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"]
-                          stringByAppendingPathComponent:token];
-    if (sub.length > 0) slotPath = [slotPath stringByAppendingPathComponent:sub];
-    mkdirp(slotPath);
-    NSLog(@"[LineAccount] PrivateStore(real) -> %@", path);
+    NSLog(@"[LineAccount] PrivateStore -> %@", path);
     return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
@@ -1341,7 +1322,7 @@ static int rebind_symbols(struct rebinding rebindings[], size_t count) {
 }
 
 static void installKeychainHooks(void) {
-    // 启动时缓存真实 Home（此后永不 fishhook NSHomeDirectory，避免启动即崩）
+    // 启动时缓存真实 Home（选账号前绝不把 NSHomeDirectory 指到槽位）
     (void)realHomePath();
 
     // 先保留原始指针，防止 rebind 失败时调用空指针
@@ -1362,6 +1343,30 @@ static void installKeychainHooks(void) {
     };
     rebind_symbols(rebs, 4);
     NSLog(@"[LineAccount] Keychain hooks installed (app-local + vm_protect, non-JB OK)");
+}
+
+// 选中账号后才 hook：让 CFPreferences / 大量 API 的 Home 落到 account_N
+static NSString *hooked_NSHomeDirectory(void) {
+    if (g_selectedSlot >= 1) {
+        return slotHomePath(g_selectedSlot);
+    }
+    if (orig_NSHomeDirectory) return orig_NSHomeDirectory();
+    return realHomePath();
+}
+
+static void installHomeDirectoryHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    (void)realHomePath();
+    if (!orig_NSHomeDirectory) {
+        orig_NSHomeDirectory = (NSString *(*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory");
+    }
+    struct rebinding reb = {
+        "NSHomeDirectory", (void *)hooked_NSHomeDirectory, (void **)&orig_NSHomeDirectory
+    };
+    rebind_symbols(&reb, 1);
+    NSLog(@"[LineAccount] NSHomeDirectory -> slot when selected");
 }
 
 // 重签 IPA 缺 Intents/Siri entitlement 时，进聊天会走：
@@ -1411,10 +1416,11 @@ static void enterAccountSlot(NSInteger slot);
     [self.view addSubview:title];
 
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectZero];
-    sub.text = @"每个账号独立登录与聊天数据";
+    sub.text = @"选完直接进入；换号请完全退出 App 再打开";
     sub.textColor = [UIColor colorWithWhite:1 alpha:0.85];
-    sub.font = [UIFont systemFontOfSize:15];
+    sub.font = [UIFont systemFontOfSize:14];
     sub.textAlignment = NSTextAlignmentCenter;
+    sub.numberOfLines = 2;
     sub.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:sub];
 
@@ -1427,10 +1433,13 @@ static void enterAccountSlot(NSInteger slot);
     for (NSInteger i = 1; i <= ACCOUNT_COUNT; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         NSString *flag = [slotHomePath(i) stringByAppendingPathComponent:@".used"];
-        NSString *db = [slotHomePath(i) stringByAppendingPathComponent:@"Library/Application Support/Messages/Line.sqlite"];
-        NSString *mark = ([[NSFileManager defaultManager] fileExistsAtPath:flag] ||
-                          [[NSFileManager defaultManager] fileExistsAtPath:db])
-                         ? @"已有数据" : @"新建容器";
+        NSString *prefs = [slotHomePath(i) stringByAppendingPathComponent:@"Library/Preferences"];
+        NSArray *prefItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prefs error:nil];
+        NSString *ps = [slotHomePath(i) stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
+        NSArray *psItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:ps error:nil];
+        BOOL hasData = [[NSFileManager defaultManager] fileExistsAtPath:flag] ||
+                       prefItems.count > 0 || psItems.count > 0;
+        NSString *mark = hasData ? @"已有数据" : @"新建容器";
         [btn setTitle:[NSString stringWithFormat:@"账号 %ld  ·  %@", (long)i, mark]
              forState:UIControlStateNormal];
         btn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
@@ -1564,6 +1573,8 @@ static void promoteMainWindowOnce(void) {
 static void resumeLINELaunch(void) {
     if (g_launchResumed) return;
     g_launchResumed = YES;
+    g_needPicker = NO;
+    g_blockLINEUI = NO;
 
     dismissPicker();
 
@@ -1582,6 +1593,21 @@ static void resumeLINELaunch(void) {
     g_deferredApp = nil;
     g_deferredOpts = nil;
     g_launchDeferred = NO;
+
+    if (g_sceneDeferred && orig_sceneWillConnect && g_deferredSceneTarget && g_deferredScene) {
+        NSLog(@"[LineAccount] resume scene:willConnectToSession: slot=%ld", (long)g_selectedSlot);
+        ((void(*)(id,SEL,UIScene*,UISceneSession*,id))orig_sceneWillConnect)(
+            g_deferredSceneTarget,
+            @selector(scene:willConnectToSession:options:),
+            g_deferredScene,
+            g_deferredSceneSession,
+            g_deferredSceneOpts);
+    }
+    g_deferredSceneTarget = nil;
+    g_deferredScene = nil;
+    g_deferredSceneSession = nil;
+    g_deferredSceneOpts = nil;
+    g_sceneDeferred = NO;
 
     dismissPicker();
     promoteMainWindowOnce();
@@ -1604,22 +1630,21 @@ static void resumeLINELaunch(void) {
 static void enterAccountSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
 
+    // ★ 选完立刻激活槽位重定向，再放行 LINE —— 此时 LINE 还没读库（若 defer 成功）
     ensureSlotDirectories(slot);
     [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
 
-    // 先同步 Talk DB（此时 meta 里仍是旧 selectedSlot），再写 meta
     g_selectedSlot = slot;
-    installLineFileManagerHooks();
-    bindRealTalkDBDirToSlot(slot);
+    installHomeDirectoryHook();   // NSHomeDirectory → account_N
+    installLineFileManagerHooks(); // privateFileStoresAreAccessible=YES
     installTalkDBAccountHooks();
-    installTalkDataPersistObservers();
 
     NSMutableDictionary *meta = loadMeta();
     meta[@"selectedSlot"] = @(slot);
     meta[@"pendingEnter"] = @NO;
     saveMeta(meta);
 
-    NSLog(@"[LineAccount] selected slot %ld — talkdb ready (same-slot keeps real data)", (long)slot);
+    NSLog(@"[LineAccount] selected slot %ld — remap ON, resume LINE (no file sync)", (long)slot);
     resumeLINELaunch();
 }
 
@@ -1769,8 +1794,89 @@ static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSD
     return YES;
 }
 
+static void hooked_sceneWillConnect(id self, SEL _cmd, UIScene *scene, UISceneSession *session, id opts) {
+    if (g_needPicker && !g_launchResumed) {
+        g_blockLINEUI = YES;
+        g_sceneDeferred = YES;
+        g_deferredSceneTarget = self;
+        g_deferredScene = scene;
+        g_deferredSceneSession = session;
+        g_deferredSceneOpts = opts;
+        showAccountPicker();
+        NSLog(@"[LineAccount] scene:willConnect deferred until account selected (%@)", [self class]);
+        return;
+    }
+    if (orig_sceneWillConnect) {
+        ((void(*)(id,SEL,UIScene*,UISceneSession*,id))orig_sceneWillConnect)(self, _cmd, scene, session, opts);
+    }
+}
+
+static void hookSceneDelegates(void) {
+    if (orig_sceneWillConnect) return;
+    SEL sel = @selector(scene:willConnectToSession:options:);
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    for (unsigned int i = 0; i < n; i++) {
+        Class cls = list[i];
+        NSString *name = NSStringFromClass(cls);
+        if ([name hasPrefix:@"UI"] || [name hasPrefix:@"_"]) continue;
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) continue;
+        // 优先 LINE / App 相关
+        BOOL likely = [name containsString:@"Scene"] || [name containsString:@"LINE"] ||
+                      [name containsString:@"Line"] || [name containsString:@"App"];
+        if (!likely && orig_sceneWillConnect) continue;
+        IMP old = method_setImplementation(m, (IMP)hooked_sceneWillConnect);
+        if (!orig_sceneWillConnect) {
+            orig_sceneWillConnect = old;
+            NSLog(@"[LineAccount] hooked scene:willConnect on %@", name);
+            if (likely) break;
+        }
+    }
+    if (list) free(list);
+}
+
+typedef int (*UIApplicationMain_t)(int, char **, NSString *, NSString *);
+static UIApplicationMain_t orig_UIApplicationMain = NULL;
+
+static int hooked_UIApplicationMain(int argc, char **argv, NSString *principal, NSString *delegateClassName) {
+    NSLog(@"[LineAccount] UIApplicationMain principal=%@ delegate=%@", principal, delegateClassName);
+    if ([delegateClassName isKindOfClass:[NSString class]] && delegateClassName.length > 0) {
+        Class cls = NSClassFromString(delegateClassName);
+        if (cls) {
+            Method m = class_getInstanceMethod(cls, @selector(application:didFinishLaunchingWithOptions:));
+            if (m && !orig_didFinishLaunching) {
+                orig_didFinishLaunching = method_setImplementation(m, (IMP)hooked_didFinishLaunching);
+                NSLog(@"[LineAccount] hooked didFinish via UIApplicationMain: %@", delegateClassName);
+            }
+        }
+    }
+    installWindowBlockHook();
+    Method sd = class_getInstanceMethod([UIApplication class], @selector(setDelegate:));
+    if (sd && !orig_setDelegate) {
+        orig_setDelegate = (void (*)(id, SEL, id))method_setImplementation(sd, (IMP)hooked_setDelegate);
+    }
+    hookSceneDelegates();
+    return orig_UIApplicationMain(argc, argv, principal, delegateClassName);
+}
+
+static void installUIApplicationMainHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    if (!orig_UIApplicationMain) {
+        orig_UIApplicationMain = (UIApplicationMain_t)dlsym(RTLD_DEFAULT, "UIApplicationMain");
+    }
+    struct rebinding reb = {
+        "UIApplicationMain", (void *)hooked_UIApplicationMain, (void **)&orig_UIApplicationMain
+    };
+    rebind_symbols(&reb, 1);
+    NSLog(@"[LineAccount] UIApplicationMain hooked");
+}
+
 static void hookAppDelegate(void) {
     installWindowBlockHook();
+    installUIApplicationMainHook();
 
     // 1) 尽早 hook setDelegate，抓住真实 AppDelegate 类名（可能是 Swift mangled）
     Method sd = class_getInstanceMethod([UIApplication class], @selector(setDelegate:));
@@ -1778,7 +1884,6 @@ static void hookAppDelegate(void) {
         orig_setDelegate = (void (*)(id, SEL, id))method_setImplementation(sd, (IMP)hooked_setDelegate);
         NSLog(@"[LineAccount] hooked UIApplication setDelegate:");
     }
-    // 若 delegate 已设置
     tryHookDidFinishOnDelegate(UIApplication.sharedApplication.delegate);
 
     NSArray *names = @[@"AppDelegate", @"LINEAppDelegate", @"NLAppDelegate", @"LineAppDelegate"];
@@ -1808,8 +1913,11 @@ static void hookAppDelegate(void) {
         if (list) free(list);
     }
 
+    hookSceneDelegates();
+
     dispatch_async(dispatch_get_main_queue(), ^{
         tryHookDidFinishOnDelegate(UIApplication.sharedApplication.delegate);
+        hookSceneDelegates();
         if (g_needPicker) showAccountPicker();
     });
 }
@@ -1817,31 +1925,27 @@ static void hookAppDelegate(void) {
 __attribute__((constructor))
 static void line_account_init(void) {
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] multi-account dylib loaded (no-restart mode)");
+    NSLog(@"[LineAccount] multi-account: picker BEFORE LINE data load");
     NSLog(@"[LineAccount] ========================================");
-
-    // 每次冷启动都先选账号；选完再进沙盒，不杀进程
-    // 清理旧版 pending 重启标记
-    NSMutableDictionary *meta = loadMeta();
-    if (meta[@"pendingEnter"]) {
-        meta[@"pendingEnter"] = @NO;
-        saveMeta(meta);
-    }
 
     g_needPicker = YES;
     g_blockLINEUI = YES;
-    g_selectedSlot = -1; // 选择页前不 remap，避免提前进 account_0 / LineStores
+    g_selectedSlot = -1; // 选择前不 remap
     g_launchResumed = NO;
-    (void)realHomePath(); // 启动最早缓存真实 Home
+    g_launchDeferred = NO;
+    g_sceneDeferred = NO;
+    (void)realHomePath();
     mkdirp(slotsRootPath());
     NSLog(@"[LineAccount] realHome=%@ slots=%@", realHomePath(), slotsRootPath());
 
+    // 尽早拦 UIApplicationMain（比 setDelegate 更靠前）
     installRuntimeHooks();
     installKeychainHooks();
+    installUIApplicationMainHook();
     installIntentsCrashGuards();
     hookAppDelegate();
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        showAccountPicker();
+        if (g_needPicker && !g_launchResumed) showAccountPicker();
     });
 }
