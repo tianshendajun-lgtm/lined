@@ -1,5 +1,5 @@
 /*
- * LINE 多账号容1器 Dylib
+ * LINE 多账号容器 Dylib
  * 启动时显示账号选择页，每个账号使用独立沙盒 + Keychain 前缀
  *
  * 编译方式与 HookDylib 相同：
@@ -17,6 +17,7 @@
 #import <dlfcn.h>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <dirent.h>
 #import <errno.h>
 #import <stdlib.h>
 #import <stdio.h>
@@ -2047,18 +2048,48 @@ static void resumeLINELaunch(void) {
 
 #pragma mark - 容器交换（core：让 LINE 永远用真实 Home，选账号时搬数据实现隔离）
 
-// 需要按账号隔离、且位于 Home 内的顶层目录（相对 Home）。
-// 不含 Library/Preferences（cfprefsd 内存缓存，换文件无效）→ 用 NSUserDefaults suite 隔离。
-// 不含 Library/LineSlots（我们的槽存储本身）。
-static NSArray<NSString *> *swapItems(void) {
-    return @[
-        @"Documents",
-        @"Library/Application Support",
-        @"Library/Caches",
-        @"Library/Cookies",
-        @"Library/WebKit",
-        @"Library/AppGroup",
-    ];
+// 用 POSIX 枚举目录子项，绕开所有 ObjC/NSFileManager hook（交换时 g_selectedSlot 已设，
+// 走 NSFileManager 可能被 remap 到错误路径）。
+static NSArray<NSString *> *listChildrenPOSIX(NSString *dir) {
+    NSMutableArray *out = [NSMutableArray array];
+    const char *c = [dir fileSystemRepresentation];
+    if (!c) return out;
+    DIR *d = opendir(c);
+    if (!d) return out;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        NSString *n = [NSString stringWithUTF8String:e->d_name];
+        if (n) [out addObject:n];
+    }
+    closedir(d);
+    return out;
+}
+
+// ★ 动态交换集：把 base(=Home 或某个槽) 里「需要按账号隔离」的相对路径全列出来。
+// 策略：除白名单外，Home 顶层项 + Library 下的子项全部纳入交换 —— 这样无论备忘录/Keep/
+// 各种 CoreData 落在哪个目录都会被隔离，避免"固定 6 目录漏掉某类数据"的老问题。
+// 顶层排除：Library(单独展开其子项)、SystemData/tmp(瞬态)、容器元数据 plist。
+// Library 内排除：LineSlots(我们的槽存储本身)、Preferences(cfprefsd 内存缓存，换文件无效，
+//                改由 NSUserDefaults suite + CFPreferences 按槽重定向隔离)。
+static NSArray<NSString *> *swapRelItemsUnder(NSString *base) {
+    NSMutableArray *items = [NSMutableArray array];
+    NSSet *skipTop = [NSSet setWithArray:@[
+        @"Library", @"SystemData", @"tmp",
+        @".com.apple.mobile_container_manager.metadata.plist",
+        @".used", @".current", @".journal", @"meta.plist",
+    ]];
+    for (NSString *name in listChildrenPOSIX(base)) {
+        if ([skipTop containsObject:name]) continue;
+        [items addObject:name];
+    }
+    NSSet *skipLib = [NSSet setWithArray:@[@"LineSlots", @"Preferences"]];
+    NSString *lib = [base stringByAppendingPathComponent:@"Library"];
+    for (NSString *name in listChildrenPOSIX(lib)) {
+        if ([skipLib containsObject:name]) continue;
+        [items addObject:[@"Library" stringByAppendingPathComponent:name]];
+    }
+    return items;
 }
 
 static NSString *swapStatePath(NSString *name) {
@@ -2108,24 +2139,26 @@ static NSString *slotRel(NSInteger slot, NSString *rel) {
     return [slotHomePath(slot) stringByAppendingPathComponent:rel]; // slotHomePath = LineSlots/account_N
 }
 
-// 把当前 Home 里的账号数据搬进 slot（幂等，可重复执行）
+// 把当前 Home 里的账号数据搬进 slot（幂等，可重复执行）。枚举 Home 现有内容为准。
 static void drainHomeToSlot(NSInteger slot) {
     if (slot < 1) return;
-    for (NSString *rel in swapItems()) {
+    NSArray *items = swapRelItemsUnder(realHomePath());
+    for (NSString *rel in items) {
         moveOne(homeRel(rel), slotRel(slot, rel));
     }
-    NSLog(@"[LineAccount] SWAP drained Home -> slot %ld", (long)slot);
+    NSLog(@"[LineAccount] SWAP drained Home -> slot %ld (%lu items)", (long)slot, (unsigned long)items.count);
 }
-// 把 slot 里的账号数据搬回 Home（幂等，可重复执行）
+// 把 slot 里的账号数据搬回 Home（幂等，可重复执行）。枚举槽内现有内容为准。
 static void fillHomeFromSlot(NSInteger slot) {
     if (slot < 1) return;
-    for (NSString *rel in swapItems()) {
+    NSArray *items = swapRelItemsUnder(slotHomePath(slot));
+    for (NSString *rel in items) {
         moveOne(slotRel(slot, rel), homeRel(rel));
     }
     // 确保基本目录在（LINE 首次进空槽也要有骨架）
     mkdirp(homeRel(@"Library/Application Support"));
     mkdirp(homeRel(@"Documents"));
-    NSLog(@"[LineAccount] SWAP filled slot %ld -> Home", (long)slot);
+    NSLog(@"[LineAccount] SWAP filled slot %ld -> Home (%lu items)", (long)slot, (unsigned long)items.count);
 }
 
 #pragma mark - Keychain 交换（激活槽用原生无前缀凭证；非激活槽存 line.slot.N.*）
@@ -2564,7 +2597,7 @@ static void line_account_init(void) {
     recoverSwapJournalIfAny();
 
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] BUILD=cfprefs-slot-redirect+bgsubmit v6");
+    NSLog(@"[LineAccount] BUILD=dynamic-swapset+cfprefs-slot-redirect v7");
     NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
     NSLog(@"[LineAccount] ========================================");
 
