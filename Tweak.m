@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"dynamic-swapset+cfprefs-slot-redirect v7"
+#define LINE_BUILD_ID @"suiteName-redirect+eperm-childmove v8"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -1588,6 +1588,26 @@ static NSUserDefaults *hooked_standardUserDefaults(id self, SEL _cmd) {
     return nil;
 }
 
+// ★ 关键补丁：LINE 用 -[NSUserDefaults initWithSuiteName:] 直接绑到自己的 bundle 域(或传 nil)
+// 拿到「bundle 域 defaults 实例」写 mid，其读写走 Foundation→cfprefsd 内部 XPC，
+// 绕过 +standardUserDefaults 交换与 CFPreferences fishhook。→ mid 泄漏到共享 jp.naver.line.plist。
+// 这里把 nil / bundleID 域统一重定向到按槽 suite（与 standardUserDefaults 归一到同一份 LineAccountSlotN.plist）。
+static id (*orig_initWithSuiteName)(id, SEL, NSString *) = NULL;
+static id hooked_initWithSuiteName(id self, SEL _cmd, NSString *suiteName) {
+    if (g_selectedSlot >= 1) {
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        BOOL isBundleDomain = (suiteName == nil) || (suiteName.length == 0) ||
+                              (bid.length && [suiteName isEqualToString:bid]);
+        if (isBundleDomain) {
+            NSString *slotSuite = slotDefaultsSuiteName(g_selectedSlot);
+            NSLog([NSString stringWithFormat:@"[LineAccount] initWithSuiteName IN=%@ -> %@",
+                   suiteName ?: @"(nil)", slotSuite]);
+            return orig_initWithSuiteName(self, _cmd, slotSuite);
+        }
+    }
+    return orig_initWithSuiteName(self, _cmd, suiteName);
+}
+
 static void installUserDefaultsIsolation(void) {
     static BOOL done = NO;
     if (done) return;
@@ -1599,6 +1619,16 @@ static void installUserDefaultsIsolation(void) {
     }
     orig_standardUserDefaults = method_setImplementation(m, (IMP)hooked_standardUserDefaults);
     NSLog(@"[LineAccount] hooked +[NSUserDefaults standardUserDefaults] -> per-slot suite");
+
+    // 实例级：把 bundle 域 defaults 归一到按槽 suite（堵住 mid 泄漏共享域的真正入口）
+    Method mi = class_getInstanceMethod([NSUserDefaults class], @selector(initWithSuiteName:));
+    if (mi) {
+        orig_initWithSuiteName = (id (*)(id, SEL, NSString *))method_getImplementation(mi);
+        method_setImplementation(mi, (IMP)hooked_initWithSuiteName);
+        NSLog(@"[LineAccount] hooked -[NSUserDefaults initWithSuiteName:] (nil/bundleID -> per-slot suite)");
+    } else {
+        NSLog(@"[LineAccount] initWithSuiteName: method missing");
+    }
 }
 
 #pragma mark - CFPreferences 按槽重定向（堵住 mid 等身份泄漏到共享 bundle 域）
@@ -2122,12 +2152,37 @@ static BOOL posixExists(NSString *p) {
     struct stat st;
     return lstat([p fileSystemRepresentation], &st) == 0;
 }
+static BOOL posixIsDir(NSString *p) {
+    if (p.length == 0) return NO;
+    struct stat st;
+    if (lstat([p fileSystemRepresentation], &st) != 0) return NO;
+    return S_ISDIR(st.st_mode);
+}
 
 // 原子移动一个顶层项（目录/文件）。src 不存在视为成功（等价于空）。
+// iOS 容器管理器会「钉住」Documents / Library/Caches 等系统目录，整体 rename 会 EPERM(errno=1)。
+// 这种情况退化为「逐个搬子项」：目标目录建好，把 src 的每个子项 rename 进去，再删空 src。
 static BOOL moveOne(NSString *src, NSString *dst) {
     if (!posixExists(src)) return YES;
     mkdirp([dst stringByDeletingLastPathComponent]);
-    removePathPOSIX(dst);                      // rename 目录要求 dst 不存在/为空
+    if (posixIsDir(src)) {
+        // 仅当 dst 不存在时才做整体 rename；存在(残留)时直接走逐项合并，避免误删已有数据
+        if (!posixExists(dst)) {
+            if (rename([src fileSystemRepresentation], [dst fileSystemRepresentation]) == 0) return YES;
+            // rename 失败(通常 EPERM/EXDEV)：退化为逐项搬
+        }
+        mkdirp(dst);
+        BOOL allOK = YES;
+        for (NSString *child in listChildrenPOSIX(src)) {
+            NSString *cs = [src stringByAppendingPathComponent:child];
+            NSString *cd = [dst stringByAppendingPathComponent:child];
+            if (!moveOne(cs, cd)) allOK = NO;   // 递归：深层若同样受限继续退化
+        }
+        rmdir([src fileSystemRepresentation]);   // src 应已空；失败无害(空目录残留不影响隔离)
+        return allOK;
+    }
+    // 文件：dst 需不存在
+    removePathPOSIX(dst);
     if (rename([src fileSystemRepresentation], [dst fileSystemRepresentation]) == 0) return YES;
     NSLog(@"[LineAccount] SWAP rename FAIL errno=%d %@ -> %@", errno, src, dst);
     return NO;
