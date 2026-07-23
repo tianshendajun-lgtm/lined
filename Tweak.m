@@ -1,5 +1,5 @@
 /*
- * LINE 多账号容器 Dylib
+ * LINE 多账号容1器 Dylib
  * 启动时显示账号选择页，每个账号使用独立沙盒 + Keychain 前缀
  *
  * 编译方式与 HookDylib 相同：
