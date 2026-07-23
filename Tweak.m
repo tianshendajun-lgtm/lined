@@ -1,5 +1,5 @@
 /*
- * LINE 多账号容1器 Dylib
+ * LINE 多账号容器 Dylib
  * 启动时显示账号选择页，每个账号使用独立沙盒 + Keychain 前缀
  *
  * 编译方式与 HookDylib 相同：
@@ -28,6 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
+#define LINE_BUILD_ID @"dynamic-swapset+cfprefs-slot-redirect v7"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2597,9 +2598,12 @@ static void line_account_init(void) {
     recoverSwapJournalIfAny();
 
     NSLog(@"[LineAccount] ========================================");
-    NSLog(@"[LineAccount] BUILD=dynamic-swapset+cfprefs-slot-redirect v7");
+    NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
     NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
     NSLog(@"[LineAccount] ========================================");
+    // ★ 版本落地文件：时序无关，probe/人工都能直接读，确认设备上到底跑哪版 dylib
+    [LINE_BUILD_ID writeToFile:swapStatePath(@".build") atomically:YES
+                      encoding:NSUTF8StringEncoding error:nil];
 
     // 每次冷启动都从头来：拦住 LINE、弹选择页；选中后当场激活隔离并放行。
     // 杀进程重开 = 新的冷启动 = 再次弹选择页。不记忆上次选择。
