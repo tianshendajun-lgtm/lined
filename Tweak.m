@@ -1,7 +1,7 @@
 /*
  * LINE 多账号容器 Dylib
  * 启动时显示账号选择页，每个账号使用独立沙盒 + Keychain 前缀
- *
+ *当前版本可以隔离成功
  * 编译方式与 HookDylib 相同：
  *   clang -arch arm64 -shared -o LineAccount.dylib \
  *     -framework Foundation -framework UIKit -framework Security \
