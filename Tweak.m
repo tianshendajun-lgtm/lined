@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"3layer-swap+kc-rename-SynchronizableAny(fix cte/e2ee leak) v13"
+#define LINE_BUILD_ID @"3layer-swap+kc-sync-fix+eager-drain-at-boot(fix live-thread pollution) v14"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2514,6 +2514,28 @@ static void eagerAdoptAtBoot(void) {
     }
 }
 
+// ★ v14：重新启用开机 eager-drain —— 这是修复「切账号时数据污染」的关键。
+//   实测(watch_switch)证明：在选择页停留并点账号时，LINE 从 +load/静态构造启动的后台线程
+//   早已把「上一个 active 账号」的 mid 加载进内存；我们把三层数据搬走(drain→槽 / fill→新号)后，
+//   这些仍活着的线程会立刻把旧账号的 cte-<mid>/P_<mid> 等重新写回 Home → 与新号数据混合
+//   → LINE 判定「无法读取好友与聊天数据」并触发迁移/污染。
+//   解法：在构造函数最早期(选择页出现前、任何账号被加载之前)就把 Home 三层清空到归属槽，
+//   使选择页出现时 Home/keychain/共享偏好域全部白板 → 任何后台线程都读不到账号 → 不会写回。
+//   之后选账号只需 fill(swapToSlot 命中 from(0)!=to → 只 fill)，全程不存在「活账号被搬」的窗口。
+//   注：v12 曾因「重开同号往返破坏会话」而移除本函数，但那实为 v13 才修的 keychain 可同步项
+//   丢失所致；三层修复后往返是无损的(rename 进出、内容不变)，同号重开可安全还原。
+static void eagerDrainAtBoot(void) {
+    NSInteger owner = readHomeOwnerStamp();
+    if (owner < 1) owner = readCurrentSlot();
+    if (owner >= 1) {
+        NSLog(@"[LineAccount] 开机 eager-drain：把 Home(归属 slot %ld) 三层清空到槽，选择页前先白板", (long)owner);
+        drainHomeAllLayers(owner);   // 文件 + keychain + 偏好 → 槽；并 writeCurrentSlot(0)
+    } else {
+        NSLog(@"[LineAccount] 开机 eager-drain：Home 无归属(全新)，无需清空");
+        writeCurrentSlot(0);
+    }
+}
+
 static void enterAccountSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
 
@@ -2810,9 +2832,10 @@ static void line_account_init(void) {
 
     // ★ 若上次「容器交换」被中途杀死，先自愈（把 Home 恢复到一致状态）
     recoverSwapJournalIfAny();
-    // ★ v12：开机只「认领」不搬运——Home 保留上一个 active 账号的数据，重开同号零搬运。
-    //   （旧的 eagerDrainAtBoot 往返会破坏会话恢复，已废弃。切不同账号时 swapToSlot 才真正搬。）
-    eagerAdoptAtBoot();
+    // ★ v14：开机 eager-drain——在选择页出现前、任何账号被加载进内存之前，把 Home 三层清空到归属槽。
+    //   这样 swapToSlot 只会 fill、绝不会在「旧账号线程还活着」时 drain 活账号 → 根治切换污染。
+    //   （v12 的「只认领不搬运」会让切账号时活线程把旧数据写回 Home，实测已证实是污染源。）
+    eagerDrainAtBoot();
 
     NSLog(@"[LineAccount] ========================================");
     NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
