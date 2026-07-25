@@ -28,9 +28,10 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"remote-accounts+inline-hook-nw+http-proxy v19"
-// 稍后换域名只改这一处
+#define LINE_BUILD_ID @"remote-accounts+network-first+config-bypass v21"
+// 稍后换域名只改这两处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
+#define LA_CONFIG_HOST @"www.khpturuy.vip"   // 拉配置必须直连，不能走账号代理
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2019,9 +2020,9 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
         };
         if (error || data.length == 0) {
             NSString *msg = error.localizedDescription ?: @"空响应";
-            NSLog(@"[LineAccount] 拉取失败: %@", msg);
+            NSLog(@"[LineAccount] 拉取失败(将尝试缓存): %@", msg);
             if (loadRemoteAccountsFromCache()) {
-                done(YES, [NSString stringWithFormat:@"网络失败，已用缓存(%@)", msg]);
+                done(YES, @"cache");   // 第二选择：缓存
             } else {
                 done(NO, msg);
             }
@@ -2044,7 +2045,7 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
             NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
             NSLog(@"[LineAccount] JSON 无账号(解析失败或空列表) body=%@", body);
             if (loadRemoteAccountsFromCache()) {
-                done(YES, @"远端无账号，已用缓存");
+                done(YES, @"cache");
             } else {
                 done(NO, @"远端未返回账号");
             }
@@ -2120,21 +2121,25 @@ static void enterAccountSlot(NSInteger slot);
         [self.stack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-32],
     ]];
 
-    // 先尝试缓存秒开，再联网刷新
-    if (loadRemoteAccountsFromCache()) {
-        [self rebuildButtons];
-        self.statusLabel.text = @"已加载缓存，正在刷新…";
-    }
+    // 网络优先：先等拉取；失败再落缓存。不在这里抢先用缓存填列表（避免看起来像缓存优先）
+    self.statusLabel.text = @"正在拉取账号配置…";
     __weak typeof(self) weakSelf = self;
     fetchRemoteAccounts(^(BOOL ok, NSString *err) {
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) return;
         if (ok) {
             [self rebuildButtons];
-            self.statusLabel.text = err.length ? err : [NSString stringWithFormat:@"共 %lu 个账号", (unsigned long)g_remoteAccounts.count];
+            if ([err isEqualToString:@"cache"]) {
+                // 网络失败后的第二选择
+                self.statusLabel.text = [NSString stringWithFormat:@"共 %lu 个账号（离线缓存）",
+                                        (unsigned long)g_remoteAccounts.count];
+            } else {
+                self.statusLabel.text = [NSString stringWithFormat:@"共 %lu 个账号",
+                                        (unsigned long)g_remoteAccounts.count];
+            }
         } else {
             self.statusLabel.text = [NSString stringWithFormat:@"配置失败：%@\n请检查网络后重开 LINE", err ?: @"未知错误"];
-            if (g_remoteAccounts.count == 0) [self rebuildButtons]; // 空
+            if (g_remoteAccounts.count == 0) [self rebuildButtons];
         }
     });
 }
@@ -3186,6 +3191,7 @@ static void (*p_nw_parameters_set_effective_proxy_config)(la_nw_object_t, la_nw_
 static void (*p_nw_parameters_set_prefer_no_proxy)(la_nw_object_t, bool) = NULL;
 static void (*p_nw_parameters_set_no_proxy)(la_nw_object_t, bool) = NULL;
 static void (*p_nw_parameters_clear_custom_proxy_configs)(la_nw_object_t) = NULL;
+static const char *(*p_nw_endpoint_get_hostname)(la_nw_object_t) = NULL;
 
 static la_nw_object_t g_proxyCfgBySlot[ACCOUNT_COUNT + 1] = {0};
 static BOOL g_proxySPIReady = NO;
@@ -3221,6 +3227,7 @@ static BOOL loadProxySPI(void) {
     p_nw_parameters_set_prefer_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_prefer_no_proxy");
     p_nw_parameters_set_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_no_proxy");
     p_nw_parameters_clear_custom_proxy_configs = dlsym(RTLD_DEFAULT, "nw_parameters_clear_custom_proxy_configs");
+    p_nw_endpoint_get_hostname = dlsym(RTLD_DEFAULT, "nw_endpoint_get_hostname");
 #undef LA_SYM
     g_proxySPIReady = YES;
     return YES;
@@ -3280,9 +3287,19 @@ static void applyProxyToParameters(la_nw_object_t parameters, la_nw_object_t cfg
     }
 }
 
+static BOOL endpointIsConfigAPI(la_nw_object_t endpoint) {
+    if (!endpoint || !p_nw_endpoint_get_hostname) return NO;
+    const char *h = p_nw_endpoint_get_hostname(endpoint);
+    if (!h || !h[0]) return NO;
+    // 用短后缀匹配：www.khpturuy.vip / khpturuy.vip / xxx.khpturuy.vip 都直连
+    // （注意：是 hostname 里包含 "khpturuy.vip"，不是反过来）
+    if (strstr(h, "khpturuy.vip") != NULL) return YES;
+    return NO;
+}
+
 static la_nw_object_t hooked_nw_connection_create(la_nw_object_t endpoint, la_nw_object_t parameters) {
     NSInteger slot = g_selectedSlot >= 1 ? g_selectedSlot : g_proxyActiveSlot;
-    if (slot >= 1 && parameters) {
+    if (slot >= 1 && parameters && !endpointIsConfigAPI(endpoint)) {
         la_nw_object_t cfg = proxyConfigForSlot(slot);
         if (cfg) {
             applyProxyToParameters(parameters, cfg);
@@ -3295,6 +3312,9 @@ static la_nw_object_t hooked_nw_connection_create(la_nw_object_t endpoint, la_nw
             g_proxyHookEnterLogLeft--;
             NSLog(@"[LineAccount][Proxy] skip slot=%ld 无cfg(配置未就绪?)", (long)slot);
         }
+    } else if (endpointIsConfigAPI(endpoint) && g_proxyHookEnterLogLeft > 0) {
+        g_proxyHookEnterLogLeft--;
+        NSLog(@"[LineAccount][Proxy] 配置域名直连（不走账号代理）");
     }
     // orig 必须是 trampoline；绝不能 dlsym（会再次进 hook → 死循环）
     if (!orig_nw_connection_create) return NULL;
@@ -3468,14 +3488,15 @@ static void line_account_init(void) {
     recoverSwapJournalIfAny();
     reconcileTargetAtBoot();
 
-    // ★ 尽早确定代理槽 + 灌入缓存配置，抢在 LINE 建 legy 之前
+    // ★ 开机仅用缓存给「早期代理」垫底（选择页仍网络优先刷新列表）
     {
         NSInteger boot = readPending();
         if (boot < 1) boot = readHomeOwnerStamp();
         if (boot < 1) boot = readCurrentSlot();
         la_setProxyActiveSlot(boot);
         if (loadRemoteAccountsFromCache()) {
-            NSLog(@"[LineAccount] 启动已加载账号缓存 %lu 条", (unsigned long)g_remoteAccounts.count);
+            NSLog(@"[LineAccount] 启动垫底缓存 %lu 条（列表仍以网络为准）",
+                  (unsigned long)g_remoteAccounts.count);
         }
     }
 
