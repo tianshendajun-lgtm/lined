@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"proxy-unpatch-call v23"
+#define LINE_BUILD_ID @"proxy-trampoline-icache v24"
 // 稍后换域名只改这两处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 #define LA_CONFIG_HOST @"www.khpturuy.vip"   // 拉配置必须直连，不能走账号代理
@@ -3183,8 +3183,9 @@ typedef la_nw_object_t (*la_nw_connection_create_fn)(la_nw_object_t endpoint, la
 
 static la_nw_connection_create_fn orig_nw_connection_create = NULL; // fishhook 回退用
 
-// inline-hook：不用「复制前 16 字节」跳板（会弄坏 ADRP/PC 相对指令 → customCfgs=1 却发不出消息）
-// 改为调用原函数前临时恢复入口、调完再打补丁（与 Frida Interceptor 一样保证原函数完整执行）
+// inline-hook：入口跳到 hook；原函数走 mmap 跳板（前 16 字节复制 + 跳回 +16）。
+// v23 的「每次 unpatch+vm_protect」太重/易竞态 → 错端口和对端口都发不出。
+// 跳板仅在确认前 16 字节无 PC 相对指令时启用；否则回退 unpatch。
 #include <os/lock.h>
 #include <libkern/OSCacheControl.h>
 #if __has_feature(ptrauth_calls)
@@ -3192,9 +3193,11 @@ static la_nw_connection_create_fn orig_nw_connection_create = NULL; // fishhook 
 #endif
 static os_unfair_lock g_nwCreateLock = OS_UNFAIR_LOCK_INIT;
 static void *g_nwCreateTarget = NULL;
+static void *g_nwCreateTramp = NULL;
 static uint8_t g_nwCreateSaved[16];
 static uint8_t g_nwCreatePatch[16];
 static BOOL g_nwCreateInlineReady = NO;
+static BOOL g_nwCreateUseUnpatch = NO; // YES=每次恢复入口；NO=走 trampoline
 
 static la_nw_object_t (*p_nw_proxy_config_create_pac_script)(const char *) = NULL;
 static void (*p_nw_proxy_config_set_username_and_password)(la_nw_object_t, const char *, const char *) = NULL;
@@ -3316,6 +3319,26 @@ static BOOL la_proxyForceOff(void) {
     return [[NSFileManager defaultManager] fileExistsAtPath:p];
 }
 
+static BOOL arm64_insn_is_pcrel(uint32_t insn) {
+    if ((insn & 0x9F000000u) == 0x90000000u) return YES; // ADRP
+    if ((insn & 0x9F000000u) == 0x10000000u) return YES; // ADR
+    if ((insn & 0xFF000000u) == 0x58000000u) return YES; // LDR lit64
+    if ((insn & 0xFF000000u) == 0x18000000u) return YES; // LDR lit32
+    if ((insn & 0xFC000000u) == 0x14000000u) return YES; // B
+    if ((insn & 0xFC000000u) == 0x94000000u) return YES; // BL
+    if ((insn & 0xFE000000u) == 0x34000000u) return YES; // CBZ/CBNZ
+    if ((insn & 0xFE000000u) == 0x36000000u) return YES; // TBZ/TBNZ
+    return NO;
+}
+
+static BOOL arm64_bytes_safe_for_trampoline(const uint8_t *bytes) {
+    const uint32_t *insns = (const uint32_t *)bytes;
+    for (int i = 0; i < 4; i++) {
+        if (arm64_insn_is_pcrel(insns[i])) return NO;
+    }
+    return YES;
+}
+
 static BOOL nw_write_entry_bytes(void *addr, const void *bytes) {
     if (!addr || !bytes) return NO;
     size_t page = (size_t)getpagesize();
@@ -3329,14 +3352,18 @@ static BOOL nw_write_entry_bytes(void *addr, const void *bytes) {
     memcpy(addr, bytes, 16);
     kr = vm_protect(mach_task_self(), (vm_address_t)pageStart, (vm_size_t)page,
                     false, VM_PROT_READ | VM_PROT_EXECUTE);
-    // arm64 改代码后必须刷 I-cache，否则 CPU 仍执行旧指令 → 半残连接
     sys_icache_invalidate(addr, 16);
     return kr == KERN_SUCCESS;
 }
 
 static la_nw_object_t call_original_nw_connection_create(la_nw_object_t endpoint,
                                                          la_nw_object_t parameters) {
-    if (g_nwCreateInlineReady && g_nwCreateTarget) {
+    // 优先：固定 trampoline（无每连接 vm_protect）
+    if (g_nwCreateInlineReady && orig_nw_connection_create && !g_nwCreateUseUnpatch) {
+        return orig_nw_connection_create(endpoint, parameters);
+    }
+    // 回退：unpatch 调用（仅入口含 PC 相对指令时）
+    if (g_nwCreateInlineReady && g_nwCreateTarget && g_nwCreateUseUnpatch) {
         os_unfair_lock_lock(&g_nwCreateLock);
         if (!nw_write_entry_bytes(g_nwCreateTarget, g_nwCreateSaved)) {
             os_unfair_lock_unlock(&g_nwCreateLock);
@@ -3353,7 +3380,6 @@ static la_nw_object_t call_original_nw_connection_create(la_nw_object_t endpoint
         os_unfair_lock_unlock(&g_nwCreateLock);
         return result;
     }
-    // fishhook 回退：绝不能 dlsym（会再次进 hook）
     if (!orig_nw_connection_create) return NULL;
     return orig_nw_connection_create(endpoint, parameters);
 }
@@ -3387,7 +3413,6 @@ static void rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t
 static void _rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t slide);
 
 // ★ fishhook 改不了 CFNetwork→libnetwork 的共享缓存调用。
-//   入口 patch 跳到 hook；调原函数时用 unpatch（不用错误 trampoline）。
 static BOOL install_nw_connection_inline_hook(void) {
     void *sym = dlsym(RTLD_DEFAULT, "nw_connection_create");
     if (!sym) {
@@ -3403,11 +3428,58 @@ static BOOL install_nw_connection_inline_hook(void) {
 #endif
 
     memcpy(g_nwCreateSaved, target, 16);
+    NSLog(@"[LineAccount][Proxy] entry bytes %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x",
+          g_nwCreateSaved[0], g_nwCreateSaved[1], g_nwCreateSaved[2], g_nwCreateSaved[3],
+          g_nwCreateSaved[4], g_nwCreateSaved[5], g_nwCreateSaved[6], g_nwCreateSaved[7],
+          g_nwCreateSaved[8], g_nwCreateSaved[9], g_nwCreateSaved[10], g_nwCreateSaved[11],
+          g_nwCreateSaved[12], g_nwCreateSaved[13], g_nwCreateSaved[14], g_nwCreateSaved[15]);
+
     uint32_t patch[4];
     patch[0] = 0x58000050; // LDR X16, #8
     patch[1] = 0xD61F0200; // BR X16
     *(uint64_t *)(patch + 2) = (uint64_t)hookAddr;
     memcpy(g_nwCreatePatch, patch, 16);
+
+    BOOL safeTramp = arm64_bytes_safe_for_trampoline(g_nwCreateSaved);
+    if (safeTramp) {
+        size_t page = (size_t)getpagesize();
+        void *tramp = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (tramp == MAP_FAILED) {
+            NSLog(@"[LineAccount][Proxy] mmap tramp 失败，改 unpatch");
+            safeTramp = NO;
+        } else {
+            memcpy(tramp, g_nwCreateSaved, 16);
+            uint32_t *t = (uint32_t *)((uint8_t *)tramp + 16);
+            t[0] = 0x58000050;
+            t[1] = 0xD61F0200;
+            *(uint64_t *)(t + 2) = (uint64_t)((uint8_t *)target + 16);
+            if (mprotect(tramp, page, PROT_READ | PROT_EXEC) != 0 &&
+                mprotect(tramp, page, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                NSLog(@"[LineAccount][Proxy] mprotect tramp 失败 errno=%d，改 unpatch", errno);
+                munmap(tramp, page);
+                safeTramp = NO;
+            } else {
+                sys_icache_invalidate(tramp, 32);
+                g_nwCreateTramp = tramp;
+#if __has_feature(ptrauth_calls)
+                orig_nw_connection_create = (la_nw_connection_create_fn)ptrauth_sign_unauthenticated(
+                    tramp, ptrauth_key_function_pointer, 0);
+#else
+                orig_nw_connection_create = (la_nw_connection_create_fn)tramp;
+#endif
+                g_nwCreateUseUnpatch = NO;
+            }
+        }
+    } else {
+        NSLog(@"[LineAccount][Proxy] 入口含 PC 相对指令，改用 unpatch-call");
+        g_nwCreateUseUnpatch = YES;
+        orig_nw_connection_create = NULL;
+    }
+
+    if (!safeTramp) {
+        g_nwCreateUseUnpatch = YES;
+        orig_nw_connection_create = NULL;
+    }
 
     if (!nw_write_entry_bytes(target, g_nwCreatePatch)) {
         NSLog(@"[LineAccount][Proxy] 写入入口 patch 失败");
@@ -3415,10 +3487,9 @@ static BOOL install_nw_connection_inline_hook(void) {
     }
     g_nwCreateTarget = target;
     g_nwCreateInlineReady = YES;
-    // inline 路径不走 trampoline，清空以免误用
-    orig_nw_connection_create = NULL;
-    NSLog(@"[LineAccount][Proxy] inline-hook OK (unpatch-call) target=%p hook=%p saved[0]=%02x",
-          target, hookAddr, g_nwCreateSaved[0]);
+    NSLog(@"[LineAccount][Proxy] inline-hook OK mode=%s target=%p hook=%p tramp=%p",
+          g_nwCreateUseUnpatch ? "unpatch" : "trampoline",
+          target, hookAddr, g_nwCreateTramp);
     return YES;
 }
 
