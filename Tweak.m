@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"remote-accounts+dynamic-picker+http-proxy v17"
+#define LINE_BUILD_ID @"remote-accounts+boot-proxy-slot+http-proxy v18"
 // 稍后换域名只改这一处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 
@@ -1861,6 +1861,10 @@ static void installBGTaskCrashGuards(void) {
 static NSArray<LARemoteAccount *> *g_remoteAccounts = nil;
 static NSString *g_remoteFetchError = nil;
 static BOOL g_remoteFetchDone = NO;
+// 代理当前生效槽（选择页之前就要有值，定义见代理段 la_setProxyActiveSlot）
+static NSInteger g_proxyActiveSlot = 0;
+static void la_invalidateProxyCache(void);
+static void la_setProxyActiveSlot(NSInteger slot);
 
 static NSString *remoteConfigCachePath(void) {
     return [slotsRootPath() stringByAppendingPathComponent:@".remote_accounts.json"];
@@ -1964,12 +1968,15 @@ static NSArray<LARemoteAccount *> *parseAccountsJSON(id root) {
     return out;
 }
 
-static void la_invalidateProxyCache(void); // 定义在代理段
-
 static void applyRemoteAccounts(NSArray<LARemoteAccount *> *list) {
     g_remoteAccounts = [list copy] ?: @[];
     la_invalidateProxyCache();
-    NSLog(@"[LineAccount] 远程账号 %lu 个", (unsigned long)g_remoteAccounts.count);
+    // 只有 1 个账号时，选择页阶段也预先挂这个槽的代理（避免 legy 先直连）
+    if (g_remoteAccounts.count == 1) {
+        la_setProxyActiveSlot(g_remoteAccounts.firstObject.slot);
+    }
+    NSLog(@"[LineAccount] 远程账号 %lu 个 activeProxySlot=%ld",
+          (unsigned long)g_remoteAccounts.count, (long)g_proxyActiveSlot);
 }
 
 static BOOL loadRemoteAccountsFromCache(void) {
@@ -2882,6 +2889,7 @@ static void enterAccountSlot(NSInteger slot) {
     }
 
     g_selectedSlot = slot;   // Keychain 前缀 + NSUserDefaults suite 按此隔离
+    la_setProxyActiveSlot(slot); // 代理槽与选中账号对齐
     writePending(slot);      // 记住本次选择，供下次开机对账
     NSLog(@"[LineAccount] selected slot %ld（owner=%ld）— 同号/全新，直接放行", (long)slot, (long)owner);
 
@@ -3181,10 +3189,21 @@ static void (*p_nw_parameters_clear_custom_proxy_configs)(la_nw_object_t) = NULL
 
 static la_nw_object_t g_proxyCfgBySlot[ACCOUNT_COUNT + 1] = {0};
 static BOOL g_proxySPIReady = NO;
+static int g_proxyHookEnterLogLeft = 8;
+
+// ★ 选择页出现前 LINE 就会建 legy 连接。不能等 g_selectedSlot（点选后才有），
+//   否则前期直连、选完复用旧连接 → 改错端口也还能发。
+static void la_setProxyActiveSlot(NSInteger slot) {
+    if (slot < 0) slot = 0;
+    if (slot > ACCOUNT_COUNT) slot = 0;
+    if (g_proxyActiveSlot == slot) return;
+    g_proxyActiveSlot = slot;
+    NSLog(@"[LineAccount][Proxy] activeSlot -> %ld", (long)slot);
+}
 
 static void la_invalidateProxyCache(void) {
     for (NSInteger i = 0; i <= ACCOUNT_COUNT; i++) {
-        g_proxyCfgBySlot[i] = NULL; // nw 对象由系统管理引用；置空即可下次重建
+        g_proxyCfgBySlot[i] = NULL;
     }
 }
 
@@ -3262,9 +3281,20 @@ static void applyProxyToParameters(la_nw_object_t parameters, la_nw_object_t cfg
 }
 
 static la_nw_object_t hooked_nw_connection_create(la_nw_object_t endpoint, la_nw_object_t parameters) {
-    if (g_selectedSlot >= 1 && parameters) {
-        la_nw_object_t cfg = proxyConfigForSlot(g_selectedSlot);
-        if (cfg) applyProxyToParameters(parameters, cfg);
+    NSInteger slot = g_selectedSlot >= 1 ? g_selectedSlot : g_proxyActiveSlot;
+    if (slot >= 1 && parameters) {
+        la_nw_object_t cfg = proxyConfigForSlot(slot);
+        if (cfg) {
+            applyProxyToParameters(parameters, cfg);
+            if (g_proxyHookEnterLogLeft > 0) {
+                g_proxyHookEnterLogLeft--;
+                NSLog(@"[LineAccount][Proxy] inject slot=%ld cfg=%p (剩余日志%d)",
+                      (long)slot, cfg, g_proxyHookEnterLogLeft);
+            }
+        } else if (g_proxyHookEnterLogLeft > 0) {
+            g_proxyHookEnterLogLeft--;
+            NSLog(@"[LineAccount][Proxy] skip slot=%ld 无cfg(配置未就绪?)", (long)slot);
+        }
     }
     if (!orig_nw_connection_create) {
         orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
@@ -3345,26 +3375,47 @@ static void installPerAccountProxyHooks(void) {
         orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
     }
     uint32_t imgCount = _dyld_image_count();
+    int rebound = 0;
     for (uint32_t i = 0; i < imgCount; i++) {
-        rebind_nw_proxy_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!image_needs_nw_proxy_rebind(h)) continue;
+        const char *name = _dyld_get_image_name(i);
+        rebind_nw_proxy_for_image(h, _dyld_get_image_vmaddr_slide(i));
+        rebound++;
+        if (name && (strstr(name, "CFNetwork") || strstr(name, "libswiftNetwork") || strstr(name, "Network.framework"))) {
+            NSLog(@"[LineAccount][Proxy] rebind target: %s", name);
+        }
     }
     _dyld_register_func_for_add_image(_rebind_nw_proxy_for_image);
-    NSLog(@"[LineAccount][Proxy] nw_connection_create hooked（代理来自远程 JSON）");
+    NSLog(@"[LineAccount][Proxy] nw_connection_create hooked images~%d activeSlot=%ld",
+          rebound, (long)g_proxyActiveSlot);
 }
 
 __attribute__((constructor))
 static void line_account_init(void) {
     (void)realHomePath();
     mkdirp(slotsRootPath());
-    (void)deviceClientUUID(); // 尽早落盘设备码
+    (void)deviceClientUUID();
 
     recoverSwapJournalIfAny();
     reconcileTargetAtBoot();
+
+    // ★ 尽早确定代理槽 + 灌入缓存配置，抢在 LINE 建 legy 之前
+    {
+        NSInteger boot = readPending();
+        if (boot < 1) boot = readHomeOwnerStamp();
+        if (boot < 1) boot = readCurrentSlot();
+        la_setProxyActiveSlot(boot);
+        if (loadRemoteAccountsFromCache()) {
+            NSLog(@"[LineAccount] 启动已加载账号缓存 %lu 条", (unsigned long)g_remoteAccounts.count);
+        }
+    }
 
     NSLog(@"[LineAccount] ========================================");
     NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
     NSLog(@"[LineAccount] device uuid=%@", deviceClientUUID());
     NSLog(@"[LineAccount] config API=%@", LA_CONFIG_API_BASE);
+    NSLog(@"[LineAccount] proxyActiveSlot=%ld", (long)g_proxyActiveSlot);
     NSLog(@"[LineAccount] ========================================");
     [LINE_BUILD_ID writeToFile:swapStatePath(@".build") atomically:YES
                       encoding:NSUTF8StringEncoding error:nil];
