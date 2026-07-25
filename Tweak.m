@@ -16,6 +16,13 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <sys/stat.h>
+#import <sys/socket.h>
+#import <sys/time.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <netdb.h>
+#import <fcntl.h>
+#import <pthread.h>
 #import <unistd.h>
 #import <dirent.h>
 #import <errno.h>
@@ -28,9 +35,9 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"proxy-gone-frida-test v26"
-// ★ v26：dylib 内所有 NW 代理注入关闭，只用 Frida probe_proxyA 测代理。
-#define LA_DISABLE_ALL_PROXY_INJECT 1
+#define LINE_BUILD_ID @"proxy-c-relay v27"
+// ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（仅调试）
+#define LA_DISABLE_ALL_PROXY_INJECT 0
 // 稍后换域名只改这两处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 #define LA_CONFIG_HOST @"www.khpturuy.vip"   // 拉配置必须直连，不能走账号代理
@@ -1926,10 +1933,12 @@ static NSString *deviceClientUUID(void) {
 }
 
 static LARemoteAccount *accountForSlot(NSInteger slot) {
-    for (LARemoteAccount *a in g_remoteAccounts) {
-        if (a.slot == slot) return a;
+    @synchronized ([LARemoteAccount class]) {
+        for (LARemoteAccount *a in g_remoteAccounts) {
+            if (a.slot == slot) return a;
+        }
+        return nil;
     }
-    return nil;
 }
 
 static NSArray<LARemoteAccount *> *parseAccountsJSON(id root) {
@@ -1972,7 +1981,9 @@ static NSArray<LARemoteAccount *> *parseAccountsJSON(id root) {
 }
 
 static void applyRemoteAccounts(NSArray<LARemoteAccount *> *list) {
-    g_remoteAccounts = [list copy] ?: @[];
+    @synchronized ([LARemoteAccount class]) {
+        g_remoteAccounts = [list copy] ?: @[];
+    }
     la_invalidateProxyCache();
     // 只有 1 个账号时，选择页阶段也预先挂这个槽的代理（避免 legy 先直连）
     if (g_remoteAccounts.count == 1) {
@@ -3175,19 +3186,17 @@ static void hookAppDelegate(void) {
     });
 }
 
-#pragma mark - 每账号 HTTP 代理（方案 A：PAC + nw_connection_create）
+#pragma mark - 每账号 HTTP 代理（方案 C：本地 CONNECT 中继 + 改写端点）
 
-// Frida 已验证：HTTP PAC（PROXY host:port）+ set_username_and_password +
-// add_custom_proxy_config 可接管 legy/发消息。代理信息来自远程 JSON。
+// Frida probe_proxyC 已验证：改写 legy/uts → 127.0.0.1 本地中继，再 HTTP CONNECT
+// 上游代理。代理 host/port/user/pass 仍来自远程 JSON（按账号槽）。
+// 方案 A（nw PAC）已弃用：prohibit=0 会直连，=1 不稳定。
 
 typedef void *la_nw_object_t;
 typedef la_nw_object_t (*la_nw_connection_create_fn)(la_nw_object_t endpoint, la_nw_object_t parameters);
 
-static la_nw_connection_create_fn orig_nw_connection_create = NULL; // fishhook 回退用
+static la_nw_connection_create_fn orig_nw_connection_create = NULL;
 
-// inline-hook：入口跳到 hook；原函数走 mmap 跳板（前 16 字节复制 + 跳回 +16）。
-// v23 的「每次 unpatch+vm_protect」太重/易竞态 → 错端口和对端口都发不出。
-// 跳板仅在确认前 16 字节无 PC 相对指令时启用；否则回退 unpatch。
 #include <os/lock.h>
 #include <libkern/OSCacheControl.h>
 #if __has_feature(ptrauth_calls)
@@ -3199,126 +3208,334 @@ static void *g_nwCreateTramp = NULL;
 static uint8_t g_nwCreateSaved[16];
 static uint8_t g_nwCreatePatch[16];
 static BOOL g_nwCreateInlineReady = NO;
-static BOOL g_nwCreateUseUnpatch = NO; // YES=每次恢复入口；NO=走 trampoline
+static BOOL g_nwCreateUseUnpatch = NO;
 
-static la_nw_object_t (*p_nw_proxy_config_create_pac_script)(const char *) = NULL;
-static void (*p_nw_proxy_config_set_username_and_password)(la_nw_object_t, const char *, const char *) = NULL;
-static void (*p_nw_proxy_config_set_prohibit_direct)(la_nw_object_t, bool) = NULL;
-static void (*p_nw_parameters_add_custom_proxy_config)(la_nw_object_t, la_nw_object_t) = NULL;
-static void (*p_nw_parameters_set_effective_proxy_config)(la_nw_object_t, la_nw_object_t) = NULL;
-static void (*p_nw_parameters_set_prefer_no_proxy)(la_nw_object_t, bool) = NULL;
-static void (*p_nw_parameters_set_no_proxy)(la_nw_object_t, bool) = NULL;
-static void (*p_nw_parameters_clear_custom_proxy_configs)(la_nw_object_t) = NULL;
+static la_nw_object_t (*p_nw_endpoint_create_host)(const char *, const char *) = NULL;
 static const char *(*p_nw_endpoint_get_hostname)(la_nw_object_t) = NULL;
+static uint16_t (*p_nw_endpoint_get_port)(la_nw_object_t) = NULL;
+static BOOL g_endpointSPIReady = NO;
+static int g_proxyHookEnterLogLeft = 16;
 
-static la_nw_object_t g_proxyCfgBySlot[ACCOUNT_COUNT + 1] = {0};
-static BOOL g_proxySPIReady = NO;
-static int g_proxyHookEnterLogLeft = 8;
+typedef struct {
+    char host[256];
+    uint16_t port;
+    int32_t slot;
+} la_pending_dest_t;
 
-// ★ 选择页出现前 LINE 就会建 legy 连接。不能等 g_selectedSlot（点选后才有），
-//   否则前期直连、选完复用旧连接 → 改错端口也还能发。
+#define LA_PENDING_CAP 64
+static la_pending_dest_t g_pending[LA_PENDING_CAP];
+static int g_pending_r = 0, g_pending_w = 0, g_pending_n = 0;
+static pthread_mutex_t g_pending_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_relay_listen_fd = -1;
+static uint16_t g_relay_port = 0;
+static BOOL g_relay_started = NO;
+
 static void la_setProxyActiveSlot(NSInteger slot) {
     if (slot < 0) slot = 0;
     if (slot > ACCOUNT_COUNT) slot = 0;
     if (g_proxyActiveSlot == slot) return;
     g_proxyActiveSlot = slot;
-    NSLog(@"[LineAccount][Proxy] activeSlot -> %ld", (long)slot);
+    NSLog(@"[LineAccount][ProxyC] activeSlot -> %ld", (long)slot);
 }
 
+// 方案 C 无 PAC 对象缓存；远程 JSON 刷新后下次建连直接读 accountForSlot
 static void la_invalidateProxyCache(void) {
-    for (NSInteger i = 0; i <= ACCOUNT_COUNT; i++) {
-        g_proxyCfgBySlot[i] = NULL;
-    }
+    NSLog(@"[LineAccount][ProxyC] 远程账号已刷新，后续连接用新代理");
 }
 
-static BOOL loadProxySPI(void) {
-    if (g_proxySPIReady) return YES;
-#define LA_SYM(var, name) do { \
-    var = dlsym(RTLD_DEFAULT, name); \
-    if (!var) { NSLog(@"[LineAccount][Proxy] 缺符号 %s", name); return NO; } \
-} while (0)
-    LA_SYM(p_nw_proxy_config_create_pac_script, "nw_proxy_config_create_pac_script");
-    LA_SYM(p_nw_proxy_config_set_username_and_password, "nw_proxy_config_set_username_and_password");
-    LA_SYM(p_nw_proxy_config_set_prohibit_direct, "nw_proxy_config_set_prohibit_direct");
-    LA_SYM(p_nw_parameters_add_custom_proxy_config, "nw_parameters_add_custom_proxy_config");
-    p_nw_parameters_set_effective_proxy_config = dlsym(RTLD_DEFAULT, "nw_parameters_set_effective_proxy_config");
-    p_nw_parameters_set_prefer_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_prefer_no_proxy");
-    p_nw_parameters_set_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_no_proxy");
-    p_nw_parameters_clear_custom_proxy_configs = dlsym(RTLD_DEFAULT, "nw_parameters_clear_custom_proxy_configs");
+static BOOL la_proxyForceOff(void) {
+    NSString *p = [slotsRootPath() stringByAppendingPathComponent:@".proxy_off"];
+    return [[NSFileManager defaultManager] fileExistsAtPath:p];
+}
+
+static BOOL loadEndpointSPI(void) {
+    if (g_endpointSPIReady) return YES;
+    p_nw_endpoint_create_host = dlsym(RTLD_DEFAULT, "nw_endpoint_create_host");
     p_nw_endpoint_get_hostname = dlsym(RTLD_DEFAULT, "nw_endpoint_get_hostname");
-#undef LA_SYM
-    g_proxySPIReady = YES;
+    p_nw_endpoint_get_port = dlsym(RTLD_DEFAULT, "nw_endpoint_get_port");
+    if (!p_nw_endpoint_create_host || !p_nw_endpoint_get_hostname || !p_nw_endpoint_get_port) {
+        NSLog(@"[LineAccount][ProxyC] 缺 endpoint 符号 create=%p host=%p port=%p",
+              p_nw_endpoint_create_host, p_nw_endpoint_get_hostname, p_nw_endpoint_get_port);
+        return NO;
+    }
+    g_endpointSPIReady = YES;
     return YES;
 }
 
-static la_nw_object_t buildHTTPProxyConfigFromAccount(LARemoteAccount *acc) {
-    if (!acc || acc.proxyHost.length == 0 || acc.proxyPort.length == 0) return NULL;
-    if (!loadProxySPI()) return NULL;
-
-    const char *host = acc.proxyHost.UTF8String;
-    const char *port = acc.proxyPort.UTF8String;
-    // 默认 HTTP；若后台标明 socks5 则用 SOCKS5（需代理商支持）
-    BOOL socks = [acc.proxyType containsString:@"socks"];
-    char pac[512];
-    if (socks) {
-        snprintf(pac, sizeof(pac),
-                 "function FindProxyForURL(url, host){ return \"SOCKS5 %s:%s\"; }",
-                 host, port);
-    } else {
-        snprintf(pac, sizeof(pac),
-                 "function FindProxyForURL(url, host){ return \"PROXY %s:%s\"; }",
-                 host, port);
+static BOOL la_ascii_contains_ci(const char *hay, const char *needle) {
+    if (!hay || !needle || !needle[0]) return NO;
+    size_t nlen = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nlen) {
+            char a = p[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (!a || a != b) break;
+            i++;
+        }
+        if (i == nlen) return YES;
     }
-    la_nw_object_t cfg = p_nw_proxy_config_create_pac_script(pac);
-    if (!cfg) {
-        NSLog(@"[LineAccount][Proxy] create_pac_script 失败 %@:%@", acc.proxyHost, acc.proxyPort);
-        return NULL;
-    }
-    if (acc.proxyUser.length && acc.proxyPass.length) {
-        p_nw_proxy_config_set_username_and_password(cfg, acc.proxyUser.UTF8String, acc.proxyPass.UTF8String);
-    }
-    p_nw_proxy_config_set_prohibit_direct(cfg, true);
-    NSLog(@"[LineAccount][Proxy] 槽%ld %@ %@:%@ user=%@",
-          (long)acc.slot, socks ? @"SOCKS5" : @"HTTP",
-          acc.proxyHost, acc.proxyPort,
-          acc.proxyUser.length ? acc.proxyUser : @"(none)");
-    return cfg;
+    return NO;
 }
 
-static la_nw_object_t proxyConfigForSlot(NSInteger slot) {
-    if (slot < 1 || slot > ACCOUNT_COUNT) return NULL;
-    if (!g_proxyCfgBySlot[slot]) {
-        LARemoteAccount *acc = accountForSlot(slot);
-        g_proxyCfgBySlot[slot] = buildHTTPProxyConfigFromAccount(acc);
-    }
-    return g_proxyCfgBySlot[slot];
+static BOOL la_host_should_relay(const char *h) {
+    if (!h || !h[0]) return NO;
+    if (strstr(h, "khpturuy.vip") != NULL) return NO;
+    if (strcmp(h, "127.0.0.1") == 0 || strcmp(h, "localhost") == 0) return NO;
+    // 与 Frida 原型一致：聊天主链路
+    if (la_ascii_contains_ci(h, "legy")) return YES;
+    if (la_ascii_contains_ci(h, "uts-front")) return YES;
+    return NO;
 }
 
-static void applyProxyToParameters(la_nw_object_t parameters, la_nw_object_t cfg) {
-    if (!parameters || !cfg || !p_nw_parameters_add_custom_proxy_config) return;
-    if (p_nw_parameters_set_prefer_no_proxy) p_nw_parameters_set_prefer_no_proxy(parameters, false);
-    if (p_nw_parameters_set_no_proxy) p_nw_parameters_set_no_proxy(parameters, false);
-    if (p_nw_parameters_clear_custom_proxy_configs) p_nw_parameters_clear_custom_proxy_configs(parameters);
-    p_nw_parameters_add_custom_proxy_config(parameters, cfg);
-    if (p_nw_parameters_set_effective_proxy_config) {
-        p_nw_parameters_set_effective_proxy_config(parameters, cfg);
+static BOOL la_pending_push(const char *host, uint16_t port, NSInteger slot) {
+    if (!host || !host[0] || port == 0) return NO;
+    pthread_mutex_lock(&g_pending_mu);
+    if (g_pending_n >= LA_PENDING_CAP) {
+        pthread_mutex_unlock(&g_pending_mu);
+        NSLog(@"[LineAccount][ProxyC] pending 队列满，丢弃 %s:%u", host, port);
+        return NO;
     }
+    la_pending_dest_t *d = &g_pending[g_pending_w];
+    snprintf(d->host, sizeof(d->host), "%s", host);
+    d->port = port;
+    d->slot = (int32_t)slot;
+    g_pending_w = (g_pending_w + 1) % LA_PENDING_CAP;
+    g_pending_n++;
+    pthread_mutex_unlock(&g_pending_mu);
+    return YES;
+}
+
+static BOOL la_pending_pop(la_pending_dest_t *out) {
+    pthread_mutex_lock(&g_pending_mu);
+    if (g_pending_n <= 0) {
+        pthread_mutex_unlock(&g_pending_mu);
+        return NO;
+    }
+    *out = g_pending[g_pending_r];
+    g_pending_r = (g_pending_r + 1) % LA_PENDING_CAP;
+    g_pending_n--;
+    pthread_mutex_unlock(&g_pending_mu);
+    return YES;
+}
+
+static int la_send_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, p + off, len - off, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int la_tcp_connect_host(const char *host, int port, int timeout_sec) {
+    if (!host || port <= 0) return -1;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        struct timeval tv;
+        tv.tv_sec = timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+static int la_http_connect_tunnel(int upfd, const char *destHost, uint16_t destPort,
+                                  NSString *user, NSString *pass) {
+    NSMutableString *req = [NSMutableString stringWithFormat:
+                            @"CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n",
+                            destHost, destPort, destHost, destPort];
+    if (user.length > 0) {
+        NSString *token = [NSString stringWithFormat:@"%@:%@", user, pass ?: @""];
+        NSData *raw = [token dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *b64 = [raw base64EncodedStringWithOptions:0];
+        [req appendFormat:@"Proxy-Authorization: Basic %@\r\n", b64];
+    }
+    [req appendString:@"Proxy-Connection: Keep-Alive\r\nConnection: Keep-Alive\r\n\r\n"];
+    NSData *reqData = [req dataUsingEncoding:NSUTF8StringEncoding];
+    if (la_send_all(upfd, reqData.bytes, reqData.length) != 0) return -1;
+
+    char buf[2048];
+    size_t filled = 0;
+    while (filled + 1 < sizeof(buf)) {
+        ssize_t n = recv(upfd, buf + filled, sizeof(buf) - 1 - filled, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        filled += (size_t)n;
+        buf[filled] = 0;
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+    int code = 0;
+    if (sscanf(buf, "HTTP/%*s %d", &code) != 1) return -1;
+    return (code == 200) ? 0 : code;
+}
+
+static void la_pipe_one_way(int from, int to) {
+    char buf[16384];
+    while (1) {
+        ssize_t n = recv(from, buf, sizeof(buf), 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        if (la_send_all(to, buf, (size_t)n) != 0) break;
+    }
+    shutdown(from, SHUT_RD);
+    shutdown(to, SHUT_WR);
+}
+
+static void la_relay_handle_client(int clientFd) {
+    @autoreleasepool {
+        la_pending_dest_t dest;
+        if (!la_pending_pop(&dest)) {
+            NSLog(@"[LineAccount][ProxyC] accept 但 pending 空");
+            close(clientFd);
+            return;
+        }
+
+        // 拷贝代理字段，避免后台线程长时间持有 remote 对象
+        NSString *pHost = nil, *pPort = nil, *pUser = nil, *pPass = nil;
+        @synchronized ([LARemoteAccount class]) {
+            LARemoteAccount *acc = accountForSlot(dest.slot);
+            if (acc) {
+                pHost = [acc.proxyHost copy];
+                pPort = [acc.proxyPort copy];
+                pUser = [acc.proxyUser copy];
+                pPass = [acc.proxyPass copy];
+            }
+        }
+        if (pHost.length == 0 || pPort.length == 0) {
+            NSLog(@"[LineAccount][ProxyC] 槽%ld 无代理，关连接 %s:%u",
+                  (long)dest.slot, dest.host, dest.port);
+            close(clientFd);
+            return;
+        }
+
+        int upPort = pPort.intValue;
+        int upfd = la_tcp_connect_host(pHost.UTF8String, upPort, 12);
+        if (upfd < 0) {
+            NSLog(@"[LineAccount][ProxyC] 上游连失败 %@:%@ → %s:%u",
+                  pHost, pPort, dest.host, dest.port);
+            close(clientFd);
+            return;
+        }
+
+        int cret = la_http_connect_tunnel(upfd, dest.host, dest.port, pUser, pPass);
+        if (cret != 0) {
+            NSLog(@"[LineAccount][ProxyC] CONNECT 失败 %s:%u via %@:%@ code=%d",
+                  dest.host, dest.port, pHost, pPort, cret);
+            close(upfd);
+            close(clientFd);
+            return;
+        }
+
+        if (g_proxyHookEnterLogLeft > 0) {
+            g_proxyHookEnterLogLeft--;
+            NSLog(@"[LineAccount][ProxyC] TUNNEL OK slot=%ld %s:%u via %@:%@ (logleft=%d)",
+                  (long)dest.slot, dest.host, dest.port, pHost, pPort,
+                  g_proxyHookEnterLogLeft);
+        }
+
+        struct timeval tv0 = {0, 0};
+        setsockopt(upfd, SOL_SOCKET, SO_SNDTIMEO, &tv0, sizeof(tv0));
+        setsockopt(upfd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+        setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv0, sizeof(tv0));
+        setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+
+        dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
+        dispatch_group_t g = dispatch_group_create();
+        dispatch_group_async(g, q, ^{ la_pipe_one_way(clientFd, upfd); });
+        dispatch_group_async(g, q, ^{ la_pipe_one_way(upfd, clientFd); });
+        dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+        close(clientFd);
+        close(upfd);
+    }
+}
+
+static BOOL la_start_local_relay(void) {
+    if (g_relay_started && g_relay_port > 0) return YES;
+
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        NSLog(@"[LineAccount][ProxyC] socket 失败 errno=%d", errno);
+        return NO;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        NSLog(@"[LineAccount][ProxyC] bind 失败 errno=%d", errno);
+        close(fd);
+        return NO;
+    }
+    if (listen(fd, 128) != 0) {
+        NSLog(@"[LineAccount][ProxyC] listen 失败 errno=%d", errno);
+        close(fd);
+        return NO;
+    }
+    struct sockaddr_in bound;
+    socklen_t blen = sizeof(bound);
+    if (getsockname(fd, (struct sockaddr *)&bound, &blen) != 0) {
+        NSLog(@"[LineAccount][ProxyC] getsockname 失败 errno=%d", errno);
+        close(fd);
+        return NO;
+    }
+    g_relay_listen_fd = fd;
+    g_relay_port = ntohs(bound.sin_port);
+    g_relay_started = YES;
+    NSLog(@"[LineAccount][ProxyC] 本地中继 127.0.0.1:%u", g_relay_port);
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        while (g_relay_listen_fd >= 0) {
+            int cfd = accept(g_relay_listen_fd, NULL, NULL);
+            if (cfd < 0) {
+                if (errno == EINTR) continue;
+                usleep(50000);
+                continue;
+            }
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                la_relay_handle_client(cfd);
+            });
+        }
+    });
+    return YES;
 }
 
 static BOOL endpointIsConfigAPI(la_nw_object_t endpoint) {
     if (!endpoint || !p_nw_endpoint_get_hostname) return NO;
     const char *h = p_nw_endpoint_get_hostname(endpoint);
     if (!h || !h[0]) return NO;
-    // 用短后缀匹配：www.khpturuy.vip / khpturuy.vip / xxx.khpturuy.vip 都直连
-    // （注意：是 hostname 里包含 "khpturuy.vip"，不是反过来）
-    if (strstr(h, "khpturuy.vip") != NULL) return YES;
-    return NO;
-}
-
-static BOOL la_proxyForceOff(void) {
-    // Library/LineSlots/.proxy_off 存在则完全不注入代理（用于排查「发不出消息」）
-    NSString *p = [slotsRootPath() stringByAppendingPathComponent:@".proxy_off"];
-    return [[NSFileManager defaultManager] fileExistsAtPath:p];
+    return strstr(h, "khpturuy.vip") != NULL;
 }
 
 static BOOL arm64_insn_is_pcrel(uint32_t insn) {
@@ -3387,25 +3604,32 @@ static la_nw_object_t call_original_nw_connection_create(la_nw_object_t endpoint
 }
 
 static la_nw_object_t hooked_nw_connection_create(la_nw_object_t endpoint, la_nw_object_t parameters) {
-    NSInteger slot = g_selectedSlot >= 1 ? g_selectedSlot : g_proxyActiveSlot;
-    BOOL skipProxy = la_proxyForceOff() || endpointIsConfigAPI(endpoint);
-    if (slot >= 1 && parameters && !skipProxy) {
-        la_nw_object_t cfg = proxyConfigForSlot(slot);
-        if (cfg) {
-            applyProxyToParameters(parameters, cfg);
-            if (g_proxyHookEnterLogLeft > 0) {
-                g_proxyHookEnterLogLeft--;
-                NSLog(@"[LineAccount][Proxy] inject slot=%ld cfg=%p (剩余日志%d)",
-                      (long)slot, cfg, g_proxyHookEnterLogLeft);
+    // 方案 C：不注入 nw_proxy_config，把目标改写到本地中继
+    if (g_relay_port > 0 && endpoint && p_nw_endpoint_create_host &&
+        p_nw_endpoint_get_hostname && p_nw_endpoint_get_port &&
+        !la_proxyForceOff() && !endpointIsConfigAPI(endpoint)) {
+        NSInteger slot = g_selectedSlot >= 1 ? g_selectedSlot : g_proxyActiveSlot;
+        const char *host = p_nw_endpoint_get_hostname(endpoint);
+        uint16_t port = p_nw_endpoint_get_port(endpoint);
+        if (slot >= 1 && host && la_host_should_relay(host)) {
+            LARemoteAccount *acc = accountForSlot(slot);
+            if (acc && acc.proxyHost.length > 0 && acc.proxyPort.length > 0) {
+                if (port == 0) port = 443;
+                char pbuf[16];
+                snprintf(pbuf, sizeof(pbuf), "%u", (unsigned)g_relay_port);
+                la_nw_object_t nep = p_nw_endpoint_create_host("127.0.0.1", pbuf);
+                if (nep && la_pending_push(host, port, slot)) {
+                    if (g_proxyHookEnterLogLeft > 0) {
+                        g_proxyHookEnterLogLeft--;
+                        NSLog(@"[LineAccount][ProxyC] rewrite slot=%ld %s:%u -> 127.0.0.1:%u",
+                              (long)slot, host, port, (unsigned)g_relay_port);
+                    }
+                    endpoint = nep;
+                } else if (!nep) {
+                    NSLog(@"[LineAccount][ProxyC] create local endpoint 失败");
+                }
             }
-        } else if (g_proxyHookEnterLogLeft > 0) {
-            g_proxyHookEnterLogLeft--;
-            NSLog(@"[LineAccount][Proxy] skip slot=%ld 无cfg(配置未就绪?)", (long)slot);
         }
-    } else if (skipProxy && g_proxyHookEnterLogLeft > 0) {
-        g_proxyHookEnterLogLeft--;
-        NSLog(@"[LineAccount][Proxy] 直连（proxy_off=%d configAPI=%d）",
-              (int)la_proxyForceOff(), (int)endpointIsConfigAPI(endpoint));
     }
     return call_original_nw_connection_create(endpoint, parameters);
 }
@@ -3505,30 +3729,32 @@ static void la_writeProxyHookStatus(NSString *status) {
 
 static void installPerAccountProxyHooks(void) {
 #if LA_DISABLE_ALL_PROXY_INJECT
-    // ★ v26 调试：完全不装 nw hook、不读任何代理 IP（远程 JSON / 缓存均忽略）
-    la_writeProxyHookStatus(@"skipped-compile-off-v26");
-    NSLog(@"[LineAccount][Proxy] LA_DISABLE_ALL_PROXY_INJECT=1 → 不安装任何代理（用 Frida 测）");
+    la_writeProxyHookStatus(@"skipped-compile-off");
+    NSLog(@"[LineAccount][ProxyC] LA_DISABLE_ALL_PROXY_INJECT=1 → 不安装");
     return;
 #endif
-    // ★ .proxy_off 必须连入口 patch 都不装。
-    //   以前只在 hooked_* 里 skip 注入，但仍 LDR/BR patch create →
-    //   Frida 再 attach 变成双 hook → 全员 POSIX EINVAL(22)；Ctrl+C 卸 Frida 后直连通。
     if (la_proxyForceOff()) {
         la_writeProxyHookStatus(@"skipped-proxy_off");
-        NSLog(@"[LineAccount][Proxy] .proxy_off 存在 → 不安装任何 nw hook（纯直连）");
+        NSLog(@"[LineAccount][ProxyC] .proxy_off 存在 → 纯直连");
         return;
     }
-    if (!loadProxySPI()) {
-        la_writeProxyHookStatus(@"skipped-no-spi");
-        NSLog(@"[LineAccount][Proxy] SPI 不可用，跳过代理注入（直连）");
+    if (!loadEndpointSPI()) {
+        la_writeProxyHookStatus(@"skipped-no-endpoint-spi");
+        NSLog(@"[LineAccount][ProxyC] endpoint SPI 不可用");
+        return;
+    }
+    if (!la_start_local_relay()) {
+        la_writeProxyHookStatus(@"skipped-relay-listen-fail");
+        NSLog(@"[LineAccount][ProxyC] 本地中继启动失败");
         return;
     }
     if (install_nw_connection_inline_hook()) {
-        la_writeProxyHookStatus(g_nwCreateUseUnpatch ? @"installed-unpatch" : @"installed-trampoline");
-        NSLog(@"[LineAccount][Proxy] 使用 inline-hook，activeSlot=%ld", (long)g_proxyActiveSlot);
+        la_writeProxyHookStatus(g_nwCreateUseUnpatch ? @"installed-c-unpatch" : @"installed-c-trampoline");
+        NSLog(@"[LineAccount][ProxyC] inline-hook OK relay=127.0.0.1:%u activeSlot=%ld",
+              (unsigned)g_relay_port, (long)g_proxyActiveSlot);
         return;
     }
-    NSLog(@"[LineAccount][Proxy] inline-hook 失败，回退 fishhook（可能仍直连）");
+    NSLog(@"[LineAccount][ProxyC] inline-hook 失败，回退 fishhook");
     uint32_t imgCount = _dyld_image_count();
     for (uint32_t i = 0; i < imgCount; i++) {
         const struct mach_header *h = _dyld_get_image_header(i);
@@ -3539,7 +3765,8 @@ static void installPerAccountProxyHooks(void) {
     if (!orig_nw_connection_create) {
         orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
     }
-    NSLog(@"[LineAccount][Proxy] fishhook 已尝试 activeSlot=%ld", (long)g_proxyActiveSlot);
+    la_writeProxyHookStatus(@"installed-c-fishhook");
+    NSLog(@"[LineAccount][ProxyC] fishhook 已尝试 activeSlot=%ld", (long)g_proxyActiveSlot);
 }
 
 static bool image_needs_nw_proxy_rebind(const struct mach_header *header) {
@@ -3645,12 +3872,7 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
-#if LA_DISABLE_ALL_PROXY_INJECT
-    NSLog(@"[LineAccount][Proxy] ★ v26 已关闭 dylib 代理注入（installPerAccountProxyHooks 跳过）");
-    la_writeProxyHookStatus(@"skipped-compile-off-v26");
-#else
     installPerAccountProxyHooks();
-#endif
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
