@@ -28,7 +28,9 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"proxy-off-skip-hook v25b"
+#define LINE_BUILD_ID @"proxy-gone-frida-test v26"
+// ★ v26：dylib 内所有 NW 代理注入关闭，只用 Frida probe_proxyA 测代理。
+#define LA_DISABLE_ALL_PROXY_INJECT 1
 // 稍后换域名只改这两处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 #define LA_CONFIG_HOST @"www.khpturuy.vip"   // 拉配置必须直连，不能走账号代理
@@ -3502,6 +3504,12 @@ static void la_writeProxyHookStatus(NSString *status) {
 }
 
 static void installPerAccountProxyHooks(void) {
+#if LA_DISABLE_ALL_PROXY_INJECT
+    // ★ v26 调试：完全不装 nw hook、不读任何代理 IP（远程 JSON / 缓存均忽略）
+    la_writeProxyHookStatus(@"skipped-compile-off-v26");
+    NSLog(@"[LineAccount][Proxy] LA_DISABLE_ALL_PROXY_INJECT=1 → 不安装任何代理（用 Frida 测）");
+    return;
+#endif
     // ★ .proxy_off 必须连入口 patch 都不装。
     //   以前只在 hooked_* 里 skip 注入，但仍 LDR/BR patch create →
     //   Frida 再 attach 变成双 hook → 全员 POSIX EINVAL(22)；Ctrl+C 卸 Frida 后直连通。
@@ -3637,7 +3645,12 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
+#if LA_DISABLE_ALL_PROXY_INJECT
+    NSLog(@"[LineAccount][Proxy] ★ v26 已关闭 dylib 代理注入（installPerAccountProxyHooks 跳过）");
+    la_writeProxyHookStatus(@"skipped-compile-off-v26");
+#else
     installPerAccountProxyHooks();
+#endif
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
