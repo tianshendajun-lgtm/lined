@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"remote-accounts+boot-proxy-slot+http-proxy v18"
+#define LINE_BUILD_ID @"remote-accounts+inline-hook-nw+http-proxy v19"
 // 稍后换域名只改这一处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 
@@ -3296,11 +3296,104 @@ static la_nw_object_t hooked_nw_connection_create(la_nw_object_t endpoint, la_nw
             NSLog(@"[LineAccount][Proxy] skip slot=%ld 无cfg(配置未就绪?)", (long)slot);
         }
     }
+    // orig 必须是 trampoline；绝不能 dlsym（会再次进 hook → 死循环）
+    if (!orig_nw_connection_create) return NULL;
+    return orig_nw_connection_create(endpoint, parameters);
+}
+
+#if __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#endif
+
+static bool image_needs_nw_proxy_rebind(const struct mach_header *header);
+static void rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t slide);
+static void _rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t slide);
+
+// ★ fishhook 改不了 CFNetwork→libnetwork 的共享缓存调用（GOT 无/不可写）。
+//   Frida 能挂是因为改了函数入口。这里同样对 nw_connection_create 做 arm64 入口跳板。
+static BOOL install_nw_connection_inline_hook(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "nw_connection_create");
+    if (!sym) {
+        NSLog(@"[LineAccount][Proxy] dlsym nw_connection_create 失败");
+        return NO;
+    }
+#if __has_feature(ptrauth_calls)
+    void *target = ptrauth_strip(sym, ptrauth_key_function_pointer);
+    void *hookAddr = ptrauth_strip((void *)&hooked_nw_connection_create, ptrauth_key_function_pointer);
+#else
+    void *target = sym;
+    void *hookAddr = (void *)&hooked_nw_connection_create;
+#endif
+
+    size_t page = (size_t)getpagesize();
+    uintptr_t pageStart = ((uintptr_t)target) & ~(page - 1);
+
+    // 跳板：原前 16 字节 + 跳回 target+16
+    void *tramp = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (tramp == MAP_FAILED) {
+        NSLog(@"[LineAccount][Proxy] mmap trampoline 失败");
+        return NO;
+    }
+    memcpy(tramp, target, 16);
+    uint32_t *t = (uint32_t *)((uint8_t *)tramp + 16);
+    t[0] = 0x58000050; // LDR X16, #8
+    t[1] = 0xD61F0200; // BR X16
+    *(uint64_t *)(t + 2) = (uint64_t)((uint8_t *)target + 16);
+    if (mprotect(tramp, page, PROT_READ | PROT_EXEC) != 0) {
+        // 再试 RWX
+        if (mprotect(tramp, page, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            NSLog(@"[LineAccount][Proxy] mprotect tramp 失败 errno=%d", errno);
+            munmap(tramp, page);
+            return NO;
+        }
+    }
+
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)pageStart, (vm_size_t)page,
+                                  false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        NSLog(@"[LineAccount][Proxy] vm_protect target 失败 kr=%d", kr);
+        munmap(tramp, page);
+        return NO;
+    }
+    uint32_t patch[4];
+    patch[0] = 0x58000050; // LDR X16, #8
+    patch[1] = 0xD61F0200; // BR X16
+    *(uint64_t *)(patch + 2) = (uint64_t)hookAddr;
+    memcpy(target, patch, 16);
+    vm_protect(mach_task_self(), (vm_address_t)pageStart, (vm_size_t)page,
+               false, VM_PROT_READ | VM_PROT_EXECUTE);
+
+#if __has_feature(ptrauth_calls)
+    orig_nw_connection_create = (la_nw_connection_create_fn)ptrauth_sign_unauthenticated(
+        tramp, ptrauth_key_function_pointer, 0);
+#else
+    orig_nw_connection_create = (la_nw_connection_create_fn)tramp;
+#endif
+    NSLog(@"[LineAccount][Proxy] inline-hook OK target=%p hook=%p tramp=%p", target, hookAddr, tramp);
+    return YES;
+}
+
+static void installPerAccountProxyHooks(void) {
+    if (!loadProxySPI()) {
+        NSLog(@"[LineAccount][Proxy] SPI 不可用，跳过代理注入（直连）");
+        return;
+    }
+    if (install_nw_connection_inline_hook()) {
+        NSLog(@"[LineAccount][Proxy] 使用 inline-hook，activeSlot=%ld", (long)g_proxyActiveSlot);
+        return;
+    }
+    NSLog(@"[LineAccount][Proxy] inline-hook 失败，回退 fishhook（可能仍直连）");
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!image_needs_nw_proxy_rebind(h)) continue;
+        rebind_nw_proxy_for_image(h, _dyld_get_image_vmaddr_slide(i));
+    }
+    _dyld_register_func_for_add_image(_rebind_nw_proxy_for_image);
     if (!orig_nw_connection_create) {
         orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
     }
-    if (!orig_nw_connection_create) return NULL;
-    return orig_nw_connection_create(endpoint, parameters);
+    NSLog(@"[LineAccount][Proxy] fishhook 已尝试 activeSlot=%ld", (long)g_proxyActiveSlot);
 }
 
 static bool image_needs_nw_proxy_rebind(const struct mach_header *header) {
@@ -3364,31 +3457,6 @@ static void rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t
 
 static void _rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t slide) {
     rebind_nw_proxy_for_image(header, slide);
-}
-
-static void installPerAccountProxyHooks(void) {
-    if (!loadProxySPI()) {
-        NSLog(@"[LineAccount][Proxy] SPI 不可用，跳过代理注入（直连）");
-        return;
-    }
-    if (!orig_nw_connection_create) {
-        orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
-    }
-    uint32_t imgCount = _dyld_image_count();
-    int rebound = 0;
-    for (uint32_t i = 0; i < imgCount; i++) {
-        const struct mach_header *h = _dyld_get_image_header(i);
-        if (!image_needs_nw_proxy_rebind(h)) continue;
-        const char *name = _dyld_get_image_name(i);
-        rebind_nw_proxy_for_image(h, _dyld_get_image_vmaddr_slide(i));
-        rebound++;
-        if (name && (strstr(name, "CFNetwork") || strstr(name, "libswiftNetwork") || strstr(name, "Network.framework"))) {
-            NSLog(@"[LineAccount][Proxy] rebind target: %s", name);
-        }
-    }
-    _dyld_register_func_for_add_image(_rebind_nw_proxy_for_image);
-    NSLog(@"[LineAccount][Proxy] nw_connection_create hooked images~%d activeSlot=%ld",
-          rebound, (long)g_proxyActiveSlot);
 }
 
 __attribute__((constructor))
