@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"proxy-trampoline-icache v24"
+#define LINE_BUILD_ID @"proxy-off-skip-hook v25"
 // 稍后换域名只改这两处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 #define LA_CONFIG_HOST @"www.khpturuy.vip"   // 拉配置必须直连，不能走账号代理
@@ -3494,6 +3494,13 @@ static BOOL install_nw_connection_inline_hook(void) {
 }
 
 static void installPerAccountProxyHooks(void) {
+    // ★ .proxy_off 必须连入口 patch 都不装。
+    //   以前只在 hooked_* 里 skip 注入，但仍 LDR/BR patch create →
+    //   Frida 再 attach 变成双 hook → 全员 POSIX EINVAL(22)；Ctrl+C 卸 Frida 后直连通。
+    if (la_proxyForceOff()) {
+        NSLog(@"[LineAccount][Proxy] .proxy_off 存在 → 不安装任何 nw hook（纯直连）");
+        return;
+    }
     if (!loadProxySPI()) {
         NSLog(@"[LineAccount][Proxy] SPI 不可用，跳过代理注入（直连）");
         return;
