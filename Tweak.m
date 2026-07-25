@@ -2138,6 +2138,19 @@ static void writeCurrentSlot(NSInteger slot) {
         writeToFile:swapStatePath(@".current") atomically:YES
            encoding:NSUTF8StringEncoding error:nil];
 }
+// ★ v15：.pending = 用户「上次选择的目标槽」。开机构造函数据此在「任何账号线程起来前」把
+//   Home 摆成目标账号；切到不同账号只写 pending 然后重启，绝不 live-swap（不破坏会话、不污染）。
+static NSInteger readPending(void) {
+    NSString *s = [NSString stringWithContentsOfFile:swapStatePath(@".pending")
+                                            encoding:NSUTF8StringEncoding error:nil];
+    return s ? s.integerValue : 0;
+}
+static void writePending(NSInteger slot) {
+    mkdirp(slotsRootPath());
+    [[NSString stringWithFormat:@"%ld", (long)slot]
+        writeToFile:swapStatePath(@".pending") atomically:YES
+           encoding:NSUTF8StringEncoding error:nil];
+}
 static void writeJournal(NSInteger from, NSInteger to, NSString *phase) {
     mkdirp(slotsRootPath());
     [[NSString stringWithFormat:@"%ld,%ld,%@", (long)from, (long)to, phase]
@@ -2524,16 +2537,49 @@ static void eagerAdoptAtBoot(void) {
 //   之后选账号只需 fill(swapToSlot 命中 from(0)!=to → 只 fill)，全程不存在「活账号被搬」的窗口。
 //   注：v12 曾因「重开同号往返破坏会话」而移除本函数，但那实为 v13 才修的 keychain 可同步项
 //   丢失所致；三层修复后往返是无损的(rename 进出、内容不变)，同号重开可安全还原。
-static void eagerDrainAtBoot(void) {
+// ★ v15：开机对账——在选择页出现前、任何账号线程起来之前，把 Home 摆成「上次选择的目标槽」。
+//   - 若 pending==owner(或无 pending)：原样保留 Home(=v13 行为，会话不坏)，只校正 .current。
+//   - 若 pending!=owner：此刻没有任何账号被加载，安全地 drain 旧号 + fill 目标 → Home 成为目标账号。
+//   关键：LINE 真正运行时，Home 从启动那一刻就是完整、一致的目标账号 → 不会「无法正常处理」；
+//   且交换只发生在这里(无线程)→ 活线程绝不会把旧账号写回来污染。切不同账号靠「写 pending + 重启」。
+static void reconcileTargetAtBoot(void) {
     NSInteger owner = readHomeOwnerStamp();
     if (owner < 1) owner = readCurrentSlot();
-    if (owner >= 1) {
-        NSLog(@"[LineAccount] 开机 eager-drain：把 Home(归属 slot %ld) 三层清空到槽，选择页前先白板", (long)owner);
-        drainHomeAllLayers(owner);   // 文件 + keychain + 偏好 → 槽；并 writeCurrentSlot(0)
+    NSInteger pending = readPending();
+
+    if (pending >= 1 && pending != owner) {
+        NSLog(@"[LineAccount] 开机换号：Home(owner %ld) -> 目标 slot %ld（线程未起，安全搬运）",
+              (long)owner, (long)pending);
+        if (owner >= 1) drainHomeAllLayers(owner);   // 旧号三层搬回它的槽，Home 归零
+        fillHomeAllLayers(pending);                  // 目标三层进 Home，current=stamp=pending
     } else {
-        NSLog(@"[LineAccount] 开机 eager-drain：Home 无归属(全新)，无需清空");
-        writeCurrentSlot(0);
+        NSInteger cur = readCurrentSlot();
+        if (owner >= 1 && cur != owner) writeCurrentSlot(owner);   // 认领：校正 .current
+        NSLog(@"[LineAccount] 开机对账：Home owner = slot %ld，原样保留(会话完好)", (long)(owner >= 1 ? owner : 0));
     }
+}
+
+// ★ v15：切到「不同账号」时，不做 live 交换(会破坏会话+污染)。写好 pending 后结束进程，
+//   用户重开时 reconcileTargetAtBoot() 会在任何账号线程起来前把 Home 换成目标账号。
+static void restartForAccountSwitch(NSInteger to) {
+    NSLog(@"[LineAccount] 切到不同账号 slot %ld：写 pending 后重启（避免 live-swap 破坏会话/污染）", (long)to);
+    writePending(to);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (pickerWindow) {
+                for (UIView *v in [pickerWindow.subviews copy]) [v removeFromSuperview];
+                UILabel *tip = [[UILabel alloc] initWithFrame:pickerWindow.bounds];
+                tip.numberOfLines = 0;
+                tip.textAlignment = NSTextAlignmentCenter;
+                tip.textColor = [UIColor whiteColor];
+                tip.font = [UIFont boldSystemFontOfSize:20];
+                tip.text = @"正在切换账号…\n请重新打开 LINE";
+                [pickerWindow addSubview:tip];
+            }
+        } @catch (__unused NSException *e) {}
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ exit(0); });
+    });
 }
 
 static void enterAccountSlot(NSInteger slot) {
@@ -2547,10 +2593,21 @@ static void enterAccountSlot(NSInteger slot) {
     meta[@"selectedSlot"] = @(slot);
     saveMeta(meta);
 
-    g_selectedSlot = slot;   // Keychain 前缀 + NSUserDefaults suite 按此隔离
-    NSLog(@"[LineAccount] selected slot %ld — 容器交换 + 放行", (long)slot);
+    // ★ v15：判断 Home 当前归属。切到「不同账号」绝不 live-swap（会破坏会话 + 活线程污染）；
+    //   而是写 pending 后重启，交给下次开机 reconcileTargetAtBoot() 在无线程时把 Home 换成目标。
+    NSInteger owner = readHomeOwnerStamp();
+    if (owner < 1) owner = readCurrentSlot();
+    if (owner >= 1 && owner != slot) {
+        writePending(slot);
+        restartForAccountSwitch(slot);   // 弹提示 → exit(0)；不放行 LINE
+        return;
+    }
 
-    // ★ 核心：把该账号数据搬进真实 Home（此时 didFinishLaunching/scene 仍被拦，Home 无写句柄，安全）
+    g_selectedSlot = slot;   // Keychain 前缀 + NSUserDefaults suite 按此隔离
+    writePending(slot);      // 记住本次选择，供下次开机对账
+    NSLog(@"[LineAccount] selected slot %ld（owner=%ld）— 同号/全新，直接放行", (long)slot, (long)owner);
+
+    // ★ 同号(owner==slot)或全新(owner<1)：Home 已是目标账号或为空，只需 fill(同号=no-op)，不存在活账号被搬。
     swapToSlot(slot);
 
     // 崩溃防护（App Group 目录也已就绪）
@@ -2832,10 +2889,9 @@ static void line_account_init(void) {
 
     // ★ 若上次「容器交换」被中途杀死，先自愈（把 Home 恢复到一致状态）
     recoverSwapJournalIfAny();
-    // ★ v14：开机 eager-drain——在选择页出现前、任何账号被加载进内存之前，把 Home 三层清空到归属槽。
-    //   这样 swapToSlot 只会 fill、绝不会在「旧账号线程还活着」时 drain 活账号 → 根治切换污染。
-    //   （v12 的「只认领不搬运」会让切账号时活线程把旧数据写回 Home，实测已证实是污染源。）
-    eagerDrainAtBoot();
+    // ★ v15：开机对账——把 Home 摆成「上次选择的目标槽」(无线程时搬)，之后 LINE 全程只见一个一致账号。
+    //   既不像 v12「只认领」那样切换时污染，也不像 v14「eager-drain 清空」那样破坏会话。
+    reconcileTargetAtBoot();
 
     NSLog(@"[LineAccount] ========================================");
     NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
