@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"3layer-swap(file+kc+prefs)+eager-drain+owner-stamp v9"
+#define LINE_BUILD_ID @"3layer-swap+eager-drain+owner-stamp+copy-fallback v10"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2109,6 +2109,7 @@ static NSArray<NSString *> *swapRelItemsUnder(NSString *base) {
         @"Library", @"SystemData", @"tmp",
         @".com.apple.mobile_container_manager.metadata.plist",
         @".used", @".current", @".journal", @"meta.plist",
+        @".build", @".bundleprefs.plist",   // ★ 我们自己的元数据/偏好存储，绝不能进文件交换集
     ]];
     for (NSString *name in listChildrenPOSIX(base)) {
         if ([skipTop containsObject:name]) continue;
@@ -2184,7 +2185,17 @@ static BOOL moveOne(NSString *src, NSString *dst) {
     // 文件：dst 需不存在
     removePathPOSIX(dst);
     if (rename([src fileSystemRepresentation], [dst fileSystemRepresentation]) == 0) return YES;
-    NSLog(@"[LineAccount] SWAP rename FAIL errno=%d %@ -> %@", errno, src, dst);
+    int e1 = errno;
+    // rename 失败(可能 EXDEV/EPERM/保护类不匹配)：退化为「复制+删源」，保证文件一定搬过去、数据不丢。
+    NSError *cerr = nil;
+    if ([[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:&cerr]) {
+        removePathPOSIX(src);
+        NSLog([NSString stringWithFormat:@"[LineAccount] SWAP rename→copy 退化 OK (errno=%d) %@ -> %@",
+               e1, src, dst]);
+        return YES;
+    }
+    NSLog([NSString stringWithFormat:@"[LineAccount] SWAP move FAIL errno=%d copyErr=%@ %@ -> %@",
+           e1, cerr.localizedDescription ?: @"?", src, dst]);
     return NO;
 }
 
