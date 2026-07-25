@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"3layer-swap+eager-drain+owner-stamp+copy-fallback v10"
+#define LINE_BUILD_ID @"3layer-swap+group-prefs+eager-drain+owner-stamp v11"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2109,7 +2109,7 @@ static NSArray<NSString *> *swapRelItemsUnder(NSString *base) {
         @"Library", @"SystemData", @"tmp",
         @".com.apple.mobile_container_manager.metadata.plist",
         @".used", @".current", @".journal", @"meta.plist",
-        @".build", @".bundleprefs.plist",   // ★ 我们自己的元数据/偏好存储，绝不能进文件交换集
+        @".build", @".bundleprefs.plist", @".groupprefs.plist",   // ★ 我们自己的元数据/偏好存储，绝不能进文件交换集
     ]];
     for (NSString *name in listChildrenPOSIX(base)) {
         if ([skipTop containsObject:name]) continue;
@@ -2329,15 +2329,21 @@ static void fillKeychainFromSlot(NSInteger slot) { keychainSwap(slot, NO); }
 // 既不在 Home 文件交换集里、也不是删文件能清（cfprefsd 有内存缓存）。故用 CFPreferences API
 // 把整个共享域「读出→存进槽→从共享域删除」(drain)、「从槽读出→写回共享域」(fill)。
 // 走 CFPreferences API，cfprefsd 缓存一致；激活槽全程用原生共享域(=纯净重签版行为)。
-static NSString *slotPrefsPath(NSInteger slot) {
+static NSString *slotPrefsPath(NSInteger slot) {        // bundle 域(<bundleid>.plist)
     return [slotHomePath(slot) stringByAppendingPathComponent:@".bundleprefs.plist"];
 }
+static NSString *slotGroupPrefsPath(NSInteger slot) {   // App Group 域(group.com.linecorp.line)
+    return [slotHomePath(slot) stringByAppendingPathComponent:@".groupprefs.plist"];
+}
 
-static void drainPrefsToSlot(NSInteger slot) {
-    if (slot < 1) return;
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    if (bid.length == 0) return;
-    CFStringRef app = (__bridge CFStringRef)bid;
+// ★ v11：App Group 偏好域(group.com.linecorp.line)也要按槽交换。
+//   LINE 的 mid / 推送 / 设备注册 / 会话身份都写在这个域里，由 cfprefsd 存共享 group 容器，
+//   既不在文件交换集、也不是 bundle 域 → v10 之前从没被交换 → 永远停在「最后登录的账号」。
+//   于是回到另一账号时：凭证=A、group域身份=B → 服务端拒连 → 「网络连接发生错误 / 无法正常处理」。
+#define LINE_GROUP_ID CFSTR("group.com.linecorp.line")
+
+// 通用：把某个偏好域整体「读出→存文件→从该域清空」
+static int drainDomainToPath(CFStringRef app, NSString *path) {
     CFArrayRef keys = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     NSMutableDictionary *store = [NSMutableDictionary dictionary];
     int n = 0;
@@ -2347,29 +2353,20 @@ static void drainPrefsToSlot(NSInteger slot) {
             CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
             if (!k) continue;
             CFPropertyListRef v = CFPreferencesCopyValue(k, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-            if (v) {
-                store[(__bridge NSString *)k] = (__bridge id)v;
-                CFRelease(v);
-            }
-            // 从共享域删除该 key（写 NULL）
-            CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            if (v) { store[(__bridge NSString *)k] = (__bridge id)v; CFRelease(v); }
+            CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost); // 从域删除
             n++;
         }
         CFRelease(keys);
     }
-    mkdirp(slotHomePath(slot));
-    if (store.count) [store writeToFile:slotPrefsPath(slot) atomically:YES];
-    else removePathPOSIX(slotPrefsPath(slot));   // 空账号：清掉旧的，避免残留
+    if (store.count) [store writeToFile:path atomically:YES];
+    else removePathPOSIX(path);   // 空账号：清掉旧的，避免残留
     CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-    NSLog(@"[LineAccount] PREF drained bundle域 -> slot %ld (%d keys)", (long)slot, n);
+    return n;
 }
 
-static void fillPrefsFromSlot(NSInteger slot) {
-    if (slot < 1) return;
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    if (bid.length == 0) return;
-    CFStringRef app = (__bridge CFStringRef)bid;
-    // 先确保共享域是空的（eager drain 后应已空；这里再兜底清一遍，防止串号）
+// 通用：先清空该域(兜底防串号)，再把文件里的键值写回该域
+static int fillDomainFromPath(CFStringRef app, NSString *path) {
     CFArrayRef ex = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     if (ex) {
         CFIndex c = CFArrayGetCount(ex);
@@ -2379,7 +2376,7 @@ static void fillPrefsFromSlot(NSInteger slot) {
         }
         CFRelease(ex);
     }
-    NSDictionary *store = [NSDictionary dictionaryWithContentsOfFile:slotPrefsPath(slot)];
+    NSDictionary *store = [NSDictionary dictionaryWithContentsOfFile:path];
     int n = 0;
     for (NSString *k in store) {
         CFPreferencesSetValue((__bridge CFStringRef)k, (__bridge CFPropertyListRef)store[k],
@@ -2387,7 +2384,26 @@ static void fillPrefsFromSlot(NSInteger slot) {
         n++;
     }
     CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-    NSLog(@"[LineAccount] PREF filled slot %ld -> bundle域 (%d keys)", (long)slot, n);
+    return n;
+}
+
+static void drainPrefsToSlot(NSInteger slot) {
+    if (slot < 1) return;
+    mkdirp(slotHomePath(slot));
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    int nb = 0, ng = 0;
+    if (bid.length) nb = drainDomainToPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
+    ng = drainDomainToPath(LINE_GROUP_ID, slotGroupPrefsPath(slot));   // ★ group 域
+    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, group %d keys)", (long)slot, nb, ng);
+}
+
+static void fillPrefsFromSlot(NSInteger slot) {
+    if (slot < 1) return;
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    int nb = 0, ng = 0;
+    if (bid.length) nb = fillDomainFromPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
+    ng = fillDomainFromPath(LINE_GROUP_ID, slotGroupPrefsPath(slot));  // ★ group 域
+    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, group %d keys)", (long)slot, nb, ng);
 }
 
 #pragma mark - Home 归属章（跟着数据走的 owner 标记，交叉校验 .current）
