@@ -25,10 +25,12 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
 
-#define ACCOUNT_COUNT 4
+#define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"3layer-swap+constructor-reconcile+per-slot-http-proxy v16"
+#define LINE_BUILD_ID @"remote-accounts+dynamic-picker+http-proxy v17"
+// 稍后换域名只改这一处
+#define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api.php"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -1842,11 +1844,206 @@ static void installBGTaskCrashGuards(void) {
     NSLog(@"[LineAccount] hooked -[BGTaskScheduler register...] -> no-op (avoid late-register abort)");
 }
 
+#pragma mark - 远程账号配置（设备 uuid → 后台 JSON）
+
+@interface LARemoteAccount : NSObject
+@property(nonatomic, assign) NSInteger slot;
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, copy) NSString *proxyHost;
+@property(nonatomic, copy) NSString *proxyPort;
+@property(nonatomic, copy) NSString *proxyUser;
+@property(nonatomic, copy) NSString *proxyPass;
+@property(nonatomic, copy) NSString *proxyType; // http / socks5，默认 http
+@end
+@implementation LARemoteAccount
+@end
+
+static NSArray<LARemoteAccount *> *g_remoteAccounts = nil;
+static NSString *g_remoteFetchError = nil;
+static BOOL g_remoteFetchDone = NO;
+
+static NSString *remoteConfigCachePath(void) {
+    return [slotsRootPath() stringByAppendingPathComponent:@".remote_accounts.json"];
+}
+
+static NSString *kcReadDeviceId(void) {
+    NSDictionary *q = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"LineAccount.DeviceId",
+        (__bridge id)kSecAttrAccount: @"client",
+        (__bridge id)kSecReturnData: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne,
+    };
+    CFTypeRef out = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &out) != errSecSuccess || !out) return nil;
+    NSData *data = CFBridgingRelease(out);
+    if (data.length == 0) return nil;
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+static void kcWriteDeviceId(NSString *value) {
+    if (value.length == 0) return;
+    NSDictionary *del = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"LineAccount.DeviceId",
+        (__bridge id)kSecAttrAccount: @"client",
+    };
+    SecItemDelete((__bridge CFDictionaryRef)del);
+    NSDictionary *add = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"LineAccount.DeviceId",
+        (__bridge id)kSecAttrAccount: @"client",
+        (__bridge id)kSecValueData: [value dataUsingEncoding:NSUTF8StringEncoding],
+        (__bridge id)kSecAttrAccessible: (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+    };
+    SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+}
+
+// uuid = NSUUID + 首次启动时间戳（持久化在 Keychain）
+static NSString *deviceClientUUID(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *existing = kcReadDeviceId();
+        if (existing.length > 0) {
+            cached = existing;
+        } else {
+            NSString *u = [[NSUUID UUID] UUIDString];
+            long long ts = (long long)[[NSDate date] timeIntervalSince1970];
+            cached = [NSString stringWithFormat:@"%@_%lld", u, ts];
+            kcWriteDeviceId(cached);
+            NSLog(@"[LineAccount] 新设备 uuid=%@", cached);
+        }
+    });
+    return cached;
+}
+
+static LARemoteAccount *accountForSlot(NSInteger slot) {
+    for (LARemoteAccount *a in g_remoteAccounts) {
+        if (a.slot == slot) return a;
+    }
+    return nil;
+}
+
+static NSArray<LARemoteAccount *> *parseAccountsJSON(id root) {
+    NSArray *arr = nil;
+    if ([root isKindOfClass:[NSDictionary class]]) {
+        id a = root[@"accounts"] ?: root[@"data"] ?: root[@"list"];
+        if ([a isKindOfClass:[NSArray class]]) arr = a;
+    } else if ([root isKindOfClass:[NSArray class]]) {
+        arr = (NSArray *)root;
+    }
+    if (arr.count == 0) return @[];
+
+    NSMutableArray *out = [NSMutableArray array];
+    for (id item in arr) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *d = (NSDictionary *)item;
+        LARemoteAccount *acc = [LARemoteAccount new];
+        acc.slot = [d[@"slot"] integerValue];
+        if (acc.slot < 1) acc.slot = [d[@"id"] integerValue];
+        if (acc.slot < 1 || acc.slot > ACCOUNT_COUNT) continue;
+        acc.name = [NSString stringWithFormat:@"%@", d[@"name"] ?: d[@"title"] ?: [NSString stringWithFormat:@"账号%ld", (long)acc.slot]];
+        id proxy = d[@"proxy"];
+        NSDictionary *p = [proxy isKindOfClass:[NSDictionary class]] ? proxy : d;
+        acc.proxyHost = [NSString stringWithFormat:@"%@", p[@"host"] ?: p[@"ip"] ?: @""];
+        acc.proxyPort = [NSString stringWithFormat:@"%@", p[@"port"] ?: @""];
+        acc.proxyUser = [NSString stringWithFormat:@"%@", p[@"user"] ?: p[@"username"] ?: @""];
+        acc.proxyPass = [NSString stringWithFormat:@"%@", p[@"pass"] ?: p[@"password"] ?: @""];
+        acc.proxyType = [[NSString stringWithFormat:@"%@", p[@"type"] ?: @"http"] lowercaseString];
+        if (acc.proxyHost.length == 0 || acc.proxyPort.length == 0) {
+            // 允许无代理（直连），仍显示账号
+            acc.proxyHost = nil;
+            acc.proxyPort = nil;
+        }
+        [out addObject:acc];
+    }
+    [out sortUsingComparator:^NSComparisonResult(LARemoteAccount *a, LARemoteAccount *b) {
+        return a.slot < b.slot ? NSOrderedAscending : (a.slot > b.slot ? NSOrderedDescending : NSOrderedSame);
+    }];
+    return out;
+}
+
+static void la_invalidateProxyCache(void); // 定义在代理段
+
+static void applyRemoteAccounts(NSArray<LARemoteAccount *> *list) {
+    g_remoteAccounts = [list copy] ?: @[];
+    la_invalidateProxyCache();
+    NSLog(@"[LineAccount] 远程账号 %lu 个", (unsigned long)g_remoteAccounts.count);
+}
+
+static BOOL loadRemoteAccountsFromCache(void) {
+    NSData *data = [NSData dataWithContentsOfFile:remoteConfigCachePath()];
+    if (data.length == 0) return NO;
+    id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSArray *list = parseAccountsJSON(root);
+    if (list.count == 0) return NO;
+    applyRemoteAccounts(list);
+    return YES;
+}
+
+static void saveRemoteAccountsCache(NSData *data) {
+    if (data.length == 0) return;
+    mkdirp(slotsRootPath());
+    [data writeToFile:remoteConfigCachePath() atomically:YES];
+}
+
+// 异步拉取；completion 在主线程。失败时尽量用缓存。
+static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
+    NSString *uuid = deviceClientUUID() ?: @"unknown";
+    NSString *urlStr = [NSString stringWithFormat:@"%@?uuid=%@",
+                        LA_CONFIG_API_BASE,
+                        [uuid stringByAddingPercentEncodingWithAllowedCharacters:
+                         [NSCharacterSet URLQueryAllowedCharacterSet]]];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    NSLog(@"[LineAccount] 拉取配置 %@", urlStr);
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    cfg.timeoutIntervalForRequest = 12;
+    cfg.connectionProxyDictionary = @{}; // 拉配置本身绝不走代理
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    [[session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+        void (^done)(BOOL, NSString *) = ^(BOOL ok, NSString *err) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                g_remoteFetchDone = YES;
+                g_remoteFetchError = err;
+                if (completion) completion(ok, err);
+            });
+        };
+        if (error || data.length == 0) {
+            NSString *msg = error.localizedDescription ?: @"空响应";
+            NSLog(@"[LineAccount] 拉取失败: %@", msg);
+            if (loadRemoteAccountsFromCache()) {
+                done(YES, [NSString stringWithFormat:@"网络失败，已用缓存(%@)", msg]);
+            } else {
+                done(NO, msg);
+            }
+            return;
+        }
+        id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray *list = parseAccountsJSON(root);
+        if (list.count == 0) {
+            NSLog(@"[LineAccount] JSON 无账号: %@", [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+            if (loadRemoteAccountsFromCache()) {
+                done(YES, @"远端无账号，已用缓存");
+            } else {
+                done(NO, @"远端未返回账号");
+            }
+            return;
+        }
+        saveRemoteAccountsCache(data);
+        applyRemoteAccounts(list);
+        done(YES, nil);
+    }] resume];
+}
+
 #pragma mark - 账号选择 UI
 
 static void enterAccountSlot(NSInteger slot);
 
 @interface LineAccountPickerController : UIViewController
+@property(nonatomic, strong) UIStackView *stack;
+@property(nonatomic, strong) UILabel *statusLabel;
 @end
 
 @implementation LineAccountPickerController
@@ -1866,7 +2063,7 @@ static void enterAccountSlot(NSInteger slot);
     [self.view addSubview:title];
 
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectZero];
-    sub.text = @"点选后直接进入该账号；换号请完全退出 LINE 后重新打开";
+    sub.text = @"点选进入；长按可看代理 IP";
     sub.textColor = [UIColor colorWithWhite:1 alpha:0.85];
     sub.font = [UIFont systemFontOfSize:14];
     sub.textAlignment = NSTextAlignmentCenter;
@@ -1874,34 +2071,20 @@ static void enterAccountSlot(NSInteger slot);
     sub.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:sub];
 
-    UIStackView *stack = [[UIStackView alloc] init];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 14;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:stack];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.statusLabel.text = @"正在拉取账号配置…";
+    self.statusLabel.textColor = [UIColor colorWithWhite:1 alpha:0.9];
+    self.statusLabel.font = [UIFont systemFontOfSize:13];
+    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    self.statusLabel.numberOfLines = 3;
+    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.statusLabel];
 
-    for (NSInteger i = 1; i <= ACCOUNT_COUNT; i++) {
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        NSString *flag = [slotHomePath(i) stringByAppendingPathComponent:@".used"];
-        NSString *prefs = [slotHomePath(i) stringByAppendingPathComponent:@"Library/Preferences"];
-        NSArray *prefItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prefs error:nil];
-        NSString *ps = [slotHomePath(i) stringByAppendingPathComponent:@"Library/Application Support/PrivateStore"];
-        NSArray *psItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:ps error:nil];
-        BOOL hasData = [[NSFileManager defaultManager] fileExistsAtPath:flag] ||
-                       prefItems.count > 0 || psItems.count > 0;
-        NSString *mark = hasData ? @"已有数据" : @"新建容器";
-        [btn setTitle:[NSString stringWithFormat:@"账号 %ld  ·  %@", (long)i, mark]
-             forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        [btn setTitleColor:[UIColor colorWithRed:0.06 green:0.45 blue:0.25 alpha:1.0]
-                  forState:UIControlStateNormal];
-        btn.backgroundColor = UIColor.whiteColor;
-        btn.layer.cornerRadius = 12;
-        btn.tag = i;
-        btn.contentEdgeInsets = UIEdgeInsetsMake(16, 20, 16, 20);
-        [btn addTarget:self action:@selector(onSelect:) forControlEvents:UIControlEventTouchUpInside];
-        [stack addArrangedSubview:btn];
-    }
+    self.stack = [[UIStackView alloc] init];
+    self.stack.axis = UILayoutConstraintAxisVertical;
+    self.stack.spacing = 14;
+    self.stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.stack];
 
     [NSLayoutConstraint activateConstraints:@[
         [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:48],
@@ -1910,14 +2093,92 @@ static void enterAccountSlot(NSInteger slot);
         [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:8],
         [sub.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
         [sub.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
-        [stack.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:20],
-        [stack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:32],
-        [stack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-32],
+        [self.statusLabel.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:12],
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
+        [self.statusLabel.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
+        [self.stack.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
+        [self.stack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:32],
+        [self.stack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-32],
     ]];
+
+    // 先尝试缓存秒开，再联网刷新
+    if (loadRemoteAccountsFromCache()) {
+        [self rebuildButtons];
+        self.statusLabel.text = @"已加载缓存，正在刷新…";
+    }
+    __weak typeof(self) weakSelf = self;
+    fetchRemoteAccounts(^(BOOL ok, NSString *err) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        if (ok) {
+            [self rebuildButtons];
+            self.statusLabel.text = err.length ? err : [NSString stringWithFormat:@"共 %lu 个账号", (unsigned long)g_remoteAccounts.count];
+        } else {
+            self.statusLabel.text = [NSString stringWithFormat:@"配置失败：%@\n请检查网络后重开 LINE", err ?: @"未知错误"];
+            if (g_remoteAccounts.count == 0) [self rebuildButtons]; // 空
+        }
+    });
+}
+
+- (void)rebuildButtons {
+    for (UIView *v in [self.stack.arrangedSubviews copy]) {
+        [self.stack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    for (LARemoteAccount *acc in g_remoteAccounts) {
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+        NSString *flag = [slotHomePath(acc.slot) stringByAppendingPathComponent:@".used"];
+        BOOL hasData = [[NSFileManager defaultManager] fileExistsAtPath:flag];
+        // 只显示：显示名 + 槽位（+ 有无本地数据标记）
+        NSString *title = [NSString stringWithFormat:@"%@  ·  槽 %ld%@",
+                           acc.name, (long)acc.slot, hasData ? @"  ·  已有数据" : @""];
+        [btn setTitle:title forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        [btn setTitleColor:[UIColor colorWithRed:0.06 green:0.45 blue:0.25 alpha:1.0]
+                  forState:UIControlStateNormal];
+        btn.backgroundColor = UIColor.whiteColor;
+        btn.layer.cornerRadius = 12;
+        btn.tag = acc.slot;
+        btn.contentEdgeInsets = UIEdgeInsetsMake(16, 20, 16, 20);
+        [btn addTarget:self action:@selector(onSelect:) forControlEvents:UIControlEventTouchUpInside];
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+                                            initWithTarget:self action:@selector(onLongPress:)];
+        lp.minimumPressDuration = 0.45;
+        [btn addGestureRecognizer:lp];
+        [self.stack addArrangedSubview:btn];
+    }
+    if (g_remoteAccounts.count == 0) {
+        UILabel *empty = [[UILabel alloc] init];
+        empty.text = @"暂无账号";
+        empty.textColor = UIColor.whiteColor;
+        empty.textAlignment = NSTextAlignmentCenter;
+        [self.stack addArrangedSubview:empty];
+    }
 }
 
 - (void)onSelect:(UIButton *)sender {
     enterAccountSlot(sender.tag);
+}
+
+- (void)onLongPress:(UILongPressGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateBegan) return;
+    NSInteger slot = gr.view.tag;
+    LARemoteAccount *acc = accountForSlot(slot);
+    if (!acc) return;
+    NSString *ipInfo;
+    if (acc.proxyHost.length) {
+        ipInfo = [NSString stringWithFormat:@"代理 IP：%@:%@\n类型：%@\n账号：%@",
+                  acc.proxyHost, acc.proxyPort,
+                  acc.proxyType.length ? acc.proxyType : @"http",
+                  acc.proxyUser.length ? acc.proxyUser : @"(无)"];
+    } else {
+        ipInfo = @"未配置代理（直连）";
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:acc.name
+                                                                   message:ipInfo
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 @end
@@ -2584,6 +2845,11 @@ static void restartForAccountSwitch(NSInteger to) {
 
 static void enterAccountSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
+    // 必须是后台下发的账号
+    if (!accountForSlot(slot)) {
+        NSLog(@"[LineAccount] slot %ld 不在远程配置中，忽略", (long)slot);
+        return;
+    }
 
     mkdirp(slotHomePath(slot));
     [[NSData data] writeToFile:[slotHomePath(slot) stringByAppendingPathComponent:@".used"] atomically:YES];
@@ -2885,10 +3151,7 @@ static void hookAppDelegate(void) {
 #pragma mark - 每账号 HTTP 代理（方案 A：PAC + nw_connection_create）
 
 // Frida 已验证：HTTP PAC（PROXY host:port）+ set_username_and_password +
-// add_custom_proxy_config 可接管 legy/发消息。SOCKS5 对本代理商不通。
-//
-// 注意：nw_connection_create 主要由 CFNetwork/libswiftNetwork 调用，必须对系统库
-// 的 GOT 做 fishhook（现有 app-local 过滤罩不住）。
+// add_custom_proxy_config 可接管 legy/发消息。代理信息来自远程 JSON。
 
 typedef void *la_nw_object_t;
 typedef la_nw_object_t (*la_nw_connection_create_fn)(la_nw_object_t endpoint, la_nw_object_t parameters);
@@ -2904,24 +3167,14 @@ static void (*p_nw_parameters_set_prefer_no_proxy)(la_nw_object_t, bool) = NULL;
 static void (*p_nw_parameters_set_no_proxy)(la_nw_object_t, bool) = NULL;
 static void (*p_nw_parameters_clear_custom_proxy_configs)(la_nw_object_t) = NULL;
 
-// 账号1 / 账号2 固定代理（HTTP + 账号密码）。槽 3/4 未配置 = 直连。
-typedef struct {
-    const char *host;
-    const char *port;
-    const char *user;
-    const char *pass;
-} LAProxySpec;
-
-static const LAProxySpec kSlotProxies[ACCOUNT_COUNT + 1] = {
-    { NULL, NULL, NULL, NULL }, // 0 不用
-    { "198.65.14.81",  "35457", "eORXXVf2Qlxq", "1ZZVtxwHC5XK" }, // 账号1
-    { "198.64.75.251", "45359", "C4wZsgr6SToY", "VQopgvT9MB" }, // 账号2
-    { NULL, NULL, NULL, NULL }, // 账号3
-    { NULL, NULL, NULL, NULL }, // 账号4
-};
-
 static la_nw_object_t g_proxyCfgBySlot[ACCOUNT_COUNT + 1] = {0};
 static BOOL g_proxySPIReady = NO;
+
+static void la_invalidateProxyCache(void) {
+    for (NSInteger i = 0; i <= ACCOUNT_COUNT; i++) {
+        g_proxyCfgBySlot[i] = NULL; // nw 对象由系统管理引用；置空即可下次重建
+    }
+}
 
 static BOOL loadProxySPI(void) {
     if (g_proxySPIReady) return YES;
@@ -2933,7 +3186,6 @@ static BOOL loadProxySPI(void) {
     LA_SYM(p_nw_proxy_config_set_username_and_password, "nw_proxy_config_set_username_and_password");
     LA_SYM(p_nw_proxy_config_set_prohibit_direct, "nw_proxy_config_set_prohibit_direct");
     LA_SYM(p_nw_parameters_add_custom_proxy_config, "nw_parameters_add_custom_proxy_config");
-    // 以下两个可选
     p_nw_parameters_set_effective_proxy_config = dlsym(RTLD_DEFAULT, "nw_parameters_set_effective_proxy_config");
     p_nw_parameters_set_prefer_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_prefer_no_proxy");
     p_nw_parameters_set_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_no_proxy");
@@ -2943,34 +3195,45 @@ static BOOL loadProxySPI(void) {
     return YES;
 }
 
-static la_nw_object_t buildHTTPProxyConfig(const LAProxySpec *spec) {
-    if (!spec || !spec->host || !spec->port) return NULL;
+static la_nw_object_t buildHTTPProxyConfigFromAccount(LARemoteAccount *acc) {
+    if (!acc || acc.proxyHost.length == 0 || acc.proxyPort.length == 0) return NULL;
     if (!loadProxySPI()) return NULL;
 
-    // PAC: HTTP CONNECT（Frida 实证对本代理商有效；SOCKS5 不通）
+    const char *host = acc.proxyHost.UTF8String;
+    const char *port = acc.proxyPort.UTF8String;
+    // 默认 HTTP；若后台标明 socks5 则用 SOCKS5（需代理商支持）
+    BOOL socks = [acc.proxyType containsString:@"socks"];
     char pac[512];
-    snprintf(pac, sizeof(pac),
-             "function FindProxyForURL(url, host){ return \"PROXY %s:%s\"; }",
-             spec->host, spec->port);
+    if (socks) {
+        snprintf(pac, sizeof(pac),
+                 "function FindProxyForURL(url, host){ return \"SOCKS5 %s:%s\"; }",
+                 host, port);
+    } else {
+        snprintf(pac, sizeof(pac),
+                 "function FindProxyForURL(url, host){ return \"PROXY %s:%s\"; }",
+                 host, port);
+    }
     la_nw_object_t cfg = p_nw_proxy_config_create_pac_script(pac);
     if (!cfg) {
-        NSLog(@"[LineAccount][Proxy] create_pac_script 失败 %s:%s", spec->host, spec->port);
+        NSLog(@"[LineAccount][Proxy] create_pac_script 失败 %@:%@", acc.proxyHost, acc.proxyPort);
         return NULL;
     }
-    if (spec->user && spec->pass) {
-        p_nw_proxy_config_set_username_and_password(cfg, spec->user, spec->pass);
+    if (acc.proxyUser.length && acc.proxyPass.length) {
+        p_nw_proxy_config_set_username_and_password(cfg, acc.proxyUser.UTF8String, acc.proxyPass.UTF8String);
     }
     p_nw_proxy_config_set_prohibit_direct(cfg, true);
-    NSLog(@"[LineAccount][Proxy] HTTP PAC 就绪 %s:%s user=%s",
-          spec->host, spec->port, spec->user ? spec->user : "(none)");
+    NSLog(@"[LineAccount][Proxy] 槽%ld %@ %@:%@ user=%@",
+          (long)acc.slot, socks ? @"SOCKS5" : @"HTTP",
+          acc.proxyHost, acc.proxyPort,
+          acc.proxyUser.length ? acc.proxyUser : @"(none)");
     return cfg;
 }
 
 static la_nw_object_t proxyConfigForSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return NULL;
-    if (!kSlotProxies[slot].host) return NULL;
     if (!g_proxyCfgBySlot[slot]) {
-        g_proxyCfgBySlot[slot] = buildHTTPProxyConfig(&kSlotProxies[slot]);
+        LARemoteAccount *acc = accountForSlot(slot);
+        g_proxyCfgBySlot[slot] = buildHTTPProxyConfigFromAccount(acc);
     }
     return g_proxyCfgBySlot[slot];
 }
@@ -2998,7 +3261,6 @@ static la_nw_object_t hooked_nw_connection_create(la_nw_object_t endpoint, la_nw
     return orig_nw_connection_create(endpoint, parameters);
 }
 
-// 允许对 CFNetwork / Network 等系统库 GOT 重绑定（nw_connection_create 的调用方在这里）
 static bool image_needs_nw_proxy_rebind(const struct mach_header *header) {
     Dl_info info;
     if (dladdr(header, &info) == 0 || !info.dli_fname) return false;
@@ -3007,7 +3269,7 @@ static bool image_needs_nw_proxy_rebind(const struct mach_header *header) {
     if (strstr(p, "CFNetwork")) return true;
     if (strstr(p, "libswiftNetwork")) return true;
     if (strstr(p, "/Network.framework/")) return true;
-    if (strstr(p, ".app/")) return true; // 主二进制 / 私有 framework 也覆盖
+    if (strstr(p, ".app/")) return true;
     return false;
 }
 
@@ -3067,10 +3329,6 @@ static void installPerAccountProxyHooks(void) {
         NSLog(@"[LineAccount][Proxy] SPI 不可用，跳过代理注入（直连）");
         return;
     }
-    // 预建账号1/2 配置
-    (void)proxyConfigForSlot(1);
-    (void)proxyConfigForSlot(2);
-
     if (!orig_nw_connection_create) {
         orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
     }
@@ -3079,31 +3337,26 @@ static void installPerAccountProxyHooks(void) {
         rebind_nw_proxy_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
     }
     _dyld_register_func_for_add_image(_rebind_nw_proxy_for_image);
-    NSLog(@"[LineAccount][Proxy] nw_connection_create hooked（槽1/2=HTTP代理，3/4=直连）");
+    NSLog(@"[LineAccount][Proxy] nw_connection_create hooked（代理来自远程 JSON）");
 }
 
 __attribute__((constructor))
 static void line_account_init(void) {
     (void)realHomePath();
     mkdirp(slotsRootPath());
+    (void)deviceClientUUID(); // 尽早落盘设备码
 
-    // ★ 若上次「容器交换」被中途杀死，先自愈（把 Home 恢复到一致状态）
     recoverSwapJournalIfAny();
-    // ★ v15：开机对账——把 Home 摆成「上次选择的目标槽」(无线程时搬)，之后 LINE 全程只见一个一致账号。
-    //   既不像 v12「只认领」那样切换时污染，也不像 v14「eager-drain 清空」那样破坏会话。
     reconcileTargetAtBoot();
 
     NSLog(@"[LineAccount] ========================================");
     NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
-    NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
-    NSLog(@"[LineAccount] slot1/2 HTTP proxy enabled");
+    NSLog(@"[LineAccount] device uuid=%@", deviceClientUUID());
+    NSLog(@"[LineAccount] config API=%@", LA_CONFIG_API_BASE);
     NSLog(@"[LineAccount] ========================================");
-    // ★ 版本落地文件：时序无关，probe/人工都能直接读，确认设备上到底跑哪版 dylib
     [LINE_BUILD_ID writeToFile:swapStatePath(@".build") atomically:YES
                       encoding:NSUTF8StringEncoding error:nil];
 
-    // 每次冷启动都从头来：拦住 LINE、弹选择页；选中后当场激活隔离并放行。
-    // 杀进程重开 = 新的冷启动 = 再次弹选择页。不记忆上次选择。
     g_needPicker = YES;
     g_blockLINEUI = YES;
     g_selectedSlot = -1;
@@ -3114,12 +3367,7 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
-    // ★ 三层交换模型：偏好隔离改由 prefsSwap(切槽时搬共享 bundle 域)完成，
-    //   不再运行时重定向。以下两套 hook 会与 prefsSwap 抢夺同一份共享域 → 停用，
-    //   让激活槽全程用 LINE 原生存储(=纯净重签版行为)，隔离完全靠切槽搬三层。
-    // installUserDefaultsIsolation();   // 停用：standardUserDefaults→suite / initWithSuiteName 重定向
-    // installPrefsRedirect();           // 停用：CFPreferences 12 函数按槽 fishhook 重定向
-    installPerAccountProxyHooks();       // ★ v16：每账号 HTTP 代理（1/2）
+    installPerAccountProxyHooks();
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
