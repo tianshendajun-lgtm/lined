@@ -30,7 +30,7 @@
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
 #define LINE_BUILD_ID @"remote-accounts+dynamic-picker+http-proxy v17"
 // 稍后换域名只改这一处
-#define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api.php"
+#define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2020,10 +2020,22 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
             }
             return;
         }
+        // 落盘原始响应，方便 Frida/电脑直接看服务器到底回了啥
+        {
+            mkdirp(slotsRootPath());
+            NSString *dumpPath = [slotsRootPath() stringByAppendingPathComponent:@".remote_last_response.txt"];
+            NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+                          ?: [NSString stringWithFormat:@"<binary %lu bytes>", (unsigned long)data.length];
+            [body writeToFile:dumpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            NSLog(@"[LineAccount] 配置响应 %lu 字节 头: %@",
+                  (unsigned long)data.length,
+                  body.length > 200 ? [body substringToIndex:200] : body);
+        }
         id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         NSArray *list = parseAccountsJSON(root);
         if (list.count == 0) {
-            NSLog(@"[LineAccount] JSON 无账号: %@", [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+            NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+            NSLog(@"[LineAccount] JSON 无账号(解析失败或空列表) body=%@", body);
             if (loadRemoteAccountsFromCache()) {
                 done(YES, @"远端无账号，已用缓存");
             } else {
