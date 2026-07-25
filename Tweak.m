@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"3layer-swap+group-prefs+eager-drain+owner-stamp v11"
+#define LINE_BUILD_ID @"3layer-swap+group-prefs+adopt-no-drain(same-slot=zero-move) v12"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2461,7 +2461,7 @@ static void swapToSlot(NSInteger to) {
         return;
     }
     NSLog(@"[LineAccount] SWAP %ld -> %ld begin", (long)from, (long)to);
-    if (from >= 1) drainHomeAllLayers(from);   // 正常已被 eager drain 清空(from=0)，这里兜底
+    if (from >= 1) drainHomeAllLayers(from);   // 切到不同账号：先把旧号三层数据搬回它的槽
     fillHomeAllLayers(to);
     NSLog(@"[LineAccount] SWAP %ld -> %ld done", (long)from, (long)to);
 }
@@ -2492,20 +2492,21 @@ static void recoverSwapJournalIfAny(void) {
     NSLog(@"[LineAccount] SWAP 自愈完成");
 }
 
-// 开机 eager drain：认出上一个 active 槽(归属章优先/.current 兜底)，把三层全搬回它的槽，
-// 让选择页出现时 Home/keychain/共享偏好域三者都是干净白板。
-static void eagerDrainAtBoot(void) {
+// ★ v12：不再开机 eager-drain。旧做法每次冷启动先把 Home 三层全清空搬进槽，
+//   导致「重开同一个账号」也白白经历 Home→槽→Home 一整趟往返，破坏了 LINE 的会话恢复
+//   （表现：第一次登录能聊/能发，第二次重启选同号就"无法正常处理/发不出"）。
+//   改为「认领」：Home 里本来就放着上一个 active 账号的数据，只用归属章校正 .current。
+//   这样重开同号时 swapToSlot 命中 from==to → 零搬运（完全等价纯净重签版重启）；
+//   只有真正切到不同账号时，swapToSlot 才 drain 旧号 + fill 新号。
+static void eagerAdoptAtBoot(void) {
     NSInteger stamp = readHomeOwnerStamp();
     NSInteger cur   = readCurrentSlot();
-    NSInteger owner = (stamp >= 1) ? stamp : cur;
-    if (stamp >= 1 && cur >= 1 && stamp != cur)
-        NSLog(@"[LineAccount] ⚠ 归属章(%ld)与.current(%ld)不一致，以归属章为准", (long)stamp, (long)cur);
-    if (owner >= 1) {
-        NSLog(@"[LineAccount] 开机 eager drain：上一个 active = slot %ld", (long)owner);
-        drainHomeAllLayers(owner);
+    if (stamp >= 1 && stamp != cur) {
+        NSLog(@"[LineAccount] 开机认领：以归属章 slot %ld 校正 .current(%ld)", (long)stamp, (long)cur);
+        writeCurrentSlot(stamp);   // 相信 Home 里实际数据的归属章
     } else {
-        NSLog(@"[LineAccount] 开机 eager drain：无上一个 active（Home 应已空）");
-        writeCurrentSlot(0);
+        NSLog(@"[LineAccount] 开机认领：Home owner = slot %ld（数据原样保留，不搬运）",
+              (long)(cur >= 1 ? cur : stamp));
     }
 }
 
@@ -2805,9 +2806,9 @@ static void line_account_init(void) {
 
     // ★ 若上次「容器交换」被中途杀死，先自愈（把 Home 恢复到一致状态）
     recoverSwapJournalIfAny();
-    // ★ 开机 eager drain：把上一个 active 账号的三层数据(文件+keychain+偏好)全搬回它的槽，
-    //   让选择页出现时 Home/keychain/共享偏好域都是干净白板 → 任何账号点进去都不沾上一号残留。
-    eagerDrainAtBoot();
+    // ★ v12：开机只「认领」不搬运——Home 保留上一个 active 账号的数据，重开同号零搬运。
+    //   （旧的 eagerDrainAtBoot 往返会破坏会话恢复，已废弃。切不同账号时 swapToSlot 才真正搬。）
+    eagerAdoptAtBoot();
 
     NSLog(@"[LineAccount] ========================================");
     NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
