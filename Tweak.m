@@ -1,7 +1,7 @@
 /*
  * LINE 多账号容器 Dylib
  * 启动时显示账号选择页，每个账号使用独立沙盒 + Keychain 前缀
- *当前版本可以隔离成功
+ *
  * 编译方式与 HookDylib 相同：
  *   clang -arch arm64 -shared -o LineAccount.dylib \
  *     -framework Foundation -framework UIKit -framework Security \
@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"3layer-swap+kc-sync-fix+eager-drain-at-boot(fix live-thread pollution) v14"
+#define LINE_BUILD_ID @"3layer-swap+constructor-reconcile+per-slot-http-proxy v16"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2882,6 +2882,206 @@ static void hookAppDelegate(void) {
     });
 }
 
+#pragma mark - 每账号 HTTP 代理（方案 A：PAC + nw_connection_create）
+
+// Frida 已验证：HTTP PAC（PROXY host:port）+ set_username_and_password +
+// add_custom_proxy_config 可接管 legy/发消息。SOCKS5 对本代理商不通。
+//
+// 注意：nw_connection_create 主要由 CFNetwork/libswiftNetwork 调用，必须对系统库
+// 的 GOT 做 fishhook（现有 app-local 过滤罩不住）。
+
+typedef void *la_nw_object_t;
+typedef la_nw_object_t (*la_nw_connection_create_fn)(la_nw_object_t endpoint, la_nw_object_t parameters);
+
+static la_nw_connection_create_fn orig_nw_connection_create = NULL;
+
+static la_nw_object_t (*p_nw_proxy_config_create_pac_script)(const char *) = NULL;
+static void (*p_nw_proxy_config_set_username_and_password)(la_nw_object_t, const char *, const char *) = NULL;
+static void (*p_nw_proxy_config_set_prohibit_direct)(la_nw_object_t, bool) = NULL;
+static void (*p_nw_parameters_add_custom_proxy_config)(la_nw_object_t, la_nw_object_t) = NULL;
+static void (*p_nw_parameters_set_effective_proxy_config)(la_nw_object_t, la_nw_object_t) = NULL;
+static void (*p_nw_parameters_set_prefer_no_proxy)(la_nw_object_t, bool) = NULL;
+static void (*p_nw_parameters_set_no_proxy)(la_nw_object_t, bool) = NULL;
+static void (*p_nw_parameters_clear_custom_proxy_configs)(la_nw_object_t) = NULL;
+
+// 账号1 / 账号2 固定代理（HTTP + 账号密码）。槽 3/4 未配置 = 直连。
+typedef struct {
+    const char *host;
+    const char *port;
+    const char *user;
+    const char *pass;
+} LAProxySpec;
+
+static const LAProxySpec kSlotProxies[ACCOUNT_COUNT + 1] = {
+    { NULL, NULL, NULL, NULL }, // 0 不用
+    { "198.65.14.81",  "35457", "eORXXVf2Qlxq", "1ZZVtxwHC5XK" }, // 账号1
+    { "198.64.75.251", "45359", "C4wZsgr6SToY", "VQopgvT9MB" }, // 账号2
+    { NULL, NULL, NULL, NULL }, // 账号3
+    { NULL, NULL, NULL, NULL }, // 账号4
+};
+
+static la_nw_object_t g_proxyCfgBySlot[ACCOUNT_COUNT + 1] = {0};
+static BOOL g_proxySPIReady = NO;
+
+static BOOL loadProxySPI(void) {
+    if (g_proxySPIReady) return YES;
+#define LA_SYM(var, name) do { \
+    var = dlsym(RTLD_DEFAULT, name); \
+    if (!var) { NSLog(@"[LineAccount][Proxy] 缺符号 %s", name); return NO; } \
+} while (0)
+    LA_SYM(p_nw_proxy_config_create_pac_script, "nw_proxy_config_create_pac_script");
+    LA_SYM(p_nw_proxy_config_set_username_and_password, "nw_proxy_config_set_username_and_password");
+    LA_SYM(p_nw_proxy_config_set_prohibit_direct, "nw_proxy_config_set_prohibit_direct");
+    LA_SYM(p_nw_parameters_add_custom_proxy_config, "nw_parameters_add_custom_proxy_config");
+    // 以下两个可选
+    p_nw_parameters_set_effective_proxy_config = dlsym(RTLD_DEFAULT, "nw_parameters_set_effective_proxy_config");
+    p_nw_parameters_set_prefer_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_prefer_no_proxy");
+    p_nw_parameters_set_no_proxy = dlsym(RTLD_DEFAULT, "nw_parameters_set_no_proxy");
+    p_nw_parameters_clear_custom_proxy_configs = dlsym(RTLD_DEFAULT, "nw_parameters_clear_custom_proxy_configs");
+#undef LA_SYM
+    g_proxySPIReady = YES;
+    return YES;
+}
+
+static la_nw_object_t buildHTTPProxyConfig(const LAProxySpec *spec) {
+    if (!spec || !spec->host || !spec->port) return NULL;
+    if (!loadProxySPI()) return NULL;
+
+    // PAC: HTTP CONNECT（Frida 实证对本代理商有效；SOCKS5 不通）
+    char pac[512];
+    snprintf(pac, sizeof(pac),
+             "function FindProxyForURL(url, host){ return \"PROXY %s:%s\"; }",
+             spec->host, spec->port);
+    la_nw_object_t cfg = p_nw_proxy_config_create_pac_script(pac);
+    if (!cfg) {
+        NSLog(@"[LineAccount][Proxy] create_pac_script 失败 %s:%s", spec->host, spec->port);
+        return NULL;
+    }
+    if (spec->user && spec->pass) {
+        p_nw_proxy_config_set_username_and_password(cfg, spec->user, spec->pass);
+    }
+    p_nw_proxy_config_set_prohibit_direct(cfg, true);
+    NSLog(@"[LineAccount][Proxy] HTTP PAC 就绪 %s:%s user=%s",
+          spec->host, spec->port, spec->user ? spec->user : "(none)");
+    return cfg;
+}
+
+static la_nw_object_t proxyConfigForSlot(NSInteger slot) {
+    if (slot < 1 || slot > ACCOUNT_COUNT) return NULL;
+    if (!kSlotProxies[slot].host) return NULL;
+    if (!g_proxyCfgBySlot[slot]) {
+        g_proxyCfgBySlot[slot] = buildHTTPProxyConfig(&kSlotProxies[slot]);
+    }
+    return g_proxyCfgBySlot[slot];
+}
+
+static void applyProxyToParameters(la_nw_object_t parameters, la_nw_object_t cfg) {
+    if (!parameters || !cfg || !p_nw_parameters_add_custom_proxy_config) return;
+    if (p_nw_parameters_set_prefer_no_proxy) p_nw_parameters_set_prefer_no_proxy(parameters, false);
+    if (p_nw_parameters_set_no_proxy) p_nw_parameters_set_no_proxy(parameters, false);
+    if (p_nw_parameters_clear_custom_proxy_configs) p_nw_parameters_clear_custom_proxy_configs(parameters);
+    p_nw_parameters_add_custom_proxy_config(parameters, cfg);
+    if (p_nw_parameters_set_effective_proxy_config) {
+        p_nw_parameters_set_effective_proxy_config(parameters, cfg);
+    }
+}
+
+static la_nw_object_t hooked_nw_connection_create(la_nw_object_t endpoint, la_nw_object_t parameters) {
+    if (g_selectedSlot >= 1 && parameters) {
+        la_nw_object_t cfg = proxyConfigForSlot(g_selectedSlot);
+        if (cfg) applyProxyToParameters(parameters, cfg);
+    }
+    if (!orig_nw_connection_create) {
+        orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
+    }
+    if (!orig_nw_connection_create) return NULL;
+    return orig_nw_connection_create(endpoint, parameters);
+}
+
+// 允许对 CFNetwork / Network 等系统库 GOT 重绑定（nw_connection_create 的调用方在这里）
+static bool image_needs_nw_proxy_rebind(const struct mach_header *header) {
+    Dl_info info;
+    if (dladdr(header, &info) == 0 || !info.dli_fname) return false;
+    const char *p = info.dli_fname;
+    if (strstr(p, "LineAccount.dylib")) return false;
+    if (strstr(p, "CFNetwork")) return true;
+    if (strstr(p, "libswiftNetwork")) return true;
+    if (strstr(p, "/Network.framework/")) return true;
+    if (strstr(p, ".app/")) return true; // 主二进制 / 私有 framework 也覆盖
+    return false;
+}
+
+static void rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t slide) {
+    if (!image_needs_nw_proxy_rebind(header)) return;
+
+    segment_command_t *curSeg = NULL;
+    segment_command_t *linkedit = NULL;
+    struct symtab_command *symtabCmd = NULL;
+    struct dysymtab_command *dysymCmd = NULL;
+
+    uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint32_t i = 0; i < header->ncmds; i++, cur += curSeg->cmdsize) {
+        curSeg = (segment_command_t *)cur;
+        if (curSeg->cmd == LC_SEGMENT_CMD) {
+            if (strcmp(curSeg->segname, SEG_LINKEDIT) == 0) linkedit = curSeg;
+        } else if (curSeg->cmd == LC_SYMTAB) {
+            symtabCmd = (struct symtab_command *)curSeg;
+        } else if (curSeg->cmd == LC_DYSYMTAB) {
+            dysymCmd = (struct dysymtab_command *)curSeg;
+        }
+    }
+    if (!symtabCmd || !dysymCmd || !linkedit || !dysymCmd->nindirectsyms) return;
+
+    uintptr_t linkeditBase = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+    nlist_t *symtab = (nlist_t *)(linkeditBase + symtabCmd->symoff);
+    char *strtab = (char *)(linkeditBase + symtabCmd->stroff);
+    uint32_t *indirect = (uint32_t *)(linkeditBase + dysymCmd->indirectsymoff);
+
+    struct rebinding reb = {
+        "nw_connection_create",
+        (void *)hooked_nw_connection_create,
+        (void **)&orig_nw_connection_create
+    };
+
+    cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint32_t i = 0; i < header->ncmds; i++, cur += curSeg->cmdsize) {
+        curSeg = (segment_command_t *)cur;
+        if (curSeg->cmd != LC_SEGMENT_CMD) continue;
+        section_t *sects = (section_t *)(cur + sizeof(segment_command_t));
+        for (uint32_t j = 0; j < curSeg->nsects; j++) {
+            section_t *sect = &sects[j];
+            if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
+                (sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
+                perform_rebinding_with_section(&reb, 1, sect, slide, symtab, strtab, indirect);
+            }
+        }
+    }
+}
+
+static void _rebind_nw_proxy_for_image(const struct mach_header *header, intptr_t slide) {
+    rebind_nw_proxy_for_image(header, slide);
+}
+
+static void installPerAccountProxyHooks(void) {
+    if (!loadProxySPI()) {
+        NSLog(@"[LineAccount][Proxy] SPI 不可用，跳过代理注入（直连）");
+        return;
+    }
+    // 预建账号1/2 配置
+    (void)proxyConfigForSlot(1);
+    (void)proxyConfigForSlot(2);
+
+    if (!orig_nw_connection_create) {
+        orig_nw_connection_create = (la_nw_connection_create_fn)dlsym(RTLD_DEFAULT, "nw_connection_create");
+    }
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        rebind_nw_proxy_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+    }
+    _dyld_register_func_for_add_image(_rebind_nw_proxy_for_image);
+    NSLog(@"[LineAccount][Proxy] nw_connection_create hooked（槽1/2=HTTP代理，3/4=直连）");
+}
+
 __attribute__((constructor))
 static void line_account_init(void) {
     (void)realHomePath();
@@ -2896,6 +3096,7 @@ static void line_account_init(void) {
     NSLog(@"[LineAccount] ========================================");
     NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
     NSLog(@"[LineAccount] multi-account: 每次冷启动都弹选择页 → 选中进入该账号（容器交换隔离）");
+    NSLog(@"[LineAccount] slot1/2 HTTP proxy enabled");
     NSLog(@"[LineAccount] ========================================");
     // ★ 版本落地文件：时序无关，probe/人工都能直接读，确认设备上到底跑哪版 dylib
     [LINE_BUILD_ID writeToFile:swapStatePath(@".build") atomically:YES
@@ -2918,6 +3119,7 @@ static void line_account_init(void) {
     //   让激活槽全程用 LINE 原生存储(=纯净重签版行为)，隔离完全靠切槽搬三层。
     // installUserDefaultsIsolation();   // 停用：standardUserDefaults→suite / initWithSuiteName 重定向
     // installPrefsRedirect();           // 停用：CFPreferences 12 函数按槽 fishhook 重定向
+    installPerAccountProxyHooks();       // ★ v16：每账号 HTTP 代理（1/2）
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
