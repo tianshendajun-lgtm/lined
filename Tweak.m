@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"3layer-swap+group-prefs+adopt-no-drain(same-slot=zero-move) v12"
+#define LINE_BUILD_ID @"3layer-swap+kc-rename-SynchronizableAny(fix cte/e2ee leak) v13"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2275,6 +2275,10 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
     NSMutableDictionary *query = [@{
         (__bridge id)kSecClass:       (__bridge id)klass,
         (__bridge id)kSecAttrAccount: oldAcct,
+        // ★ 关键：改名/删除查询也必须带 SynchronizableAny，否则默认只匹配「不可同步」项，
+        //   LINE 的 cte-<mid>(频道令牌)/部分 e2ee 是可同步的 → 匹配不到 → errSecItemNotFound
+        //   被当成功 → 实际没搬走，残留在 Home → 下个账号带着它登录 → 看得到别人的群/聊天。
+        (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
     } mutableCopy];
     if (svce.length > 0) query[(__bridge id)kSecAttrService] = svce;
 
