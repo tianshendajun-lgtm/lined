@@ -28,7 +28,7 @@
 #define ACCOUNT_COUNT 4
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"suiteName-redirect+eperm-childmove v8"
+#define LINE_BUILD_ID @"3layer-swap(file+kc+prefs)+eager-drain+owner-stamp v9"
 
 static NSInteger g_selectedSlot = -1;   // 0=临时, 1..4=账号
 static BOOL g_pickerShown = NO;
@@ -2236,10 +2236,14 @@ static SecItemDelete_t kcDelete(void) {
 }
 
 static NSArray *kcAllItems(CFTypeRef klass) {
+    // ★ 关键：默认查询只返回「不可同步」项，会漏掉 kSecAttrSynchronizable=YES 的凭证
+    //   （LINE 的部分 e2ee/auth 凭证是可同步的）→ 枚举为空 → 停放 changed=0 → 账号被清。
+    //   必须显式 kSecAttrSynchronizableAny 才能拿全。
     NSDictionary *q = @{
-        (__bridge id)kSecClass:            (__bridge id)klass,
-        (__bridge id)kSecMatchLimit:       (__bridge id)kSecMatchLimitAll,
-        (__bridge id)kSecReturnAttributes: (__bridge id)kCFBooleanTrue,
+        (__bridge id)kSecClass:             (__bridge id)klass,
+        (__bridge id)kSecMatchLimit:        (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes:  (__bridge id)kCFBooleanTrue,
+        (__bridge id)kSecAttrSynchronizable:(__bridge id)kSecAttrSynchronizableAny,
     };
     SecItemCopyMatching_t f = kcCopy();
     if (!f) return @[];
@@ -2308,7 +2312,120 @@ static void keychainSwap(NSInteger slot, BOOL addPrefix) {
 static void drainKeychainToSlot(NSInteger slot)  { keychainSwap(slot, YES); }
 static void fillKeychainFromSlot(NSInteger slot) { keychainSwap(slot, NO); }
 
-// 切换到目标槽：先把上一个账号的实时数据搬回它的槽，再把目标槽数据搬进 Home。
+#pragma mark - 偏好域交换（第③层：把 cfprefsd 共享 bundle 域按槽搬进/搬出，堵 mid 泄漏）
+
+// mid 等登录态实际写在 cfprefsd 管理的共享 bundle 域(Library/Preferences/<bundleid>.plist)，
+// 既不在 Home 文件交换集里、也不是删文件能清（cfprefsd 有内存缓存）。故用 CFPreferences API
+// 把整个共享域「读出→存进槽→从共享域删除」(drain)、「从槽读出→写回共享域」(fill)。
+// 走 CFPreferences API，cfprefsd 缓存一致；激活槽全程用原生共享域(=纯净重签版行为)。
+static NSString *slotPrefsPath(NSInteger slot) {
+    return [slotHomePath(slot) stringByAppendingPathComponent:@".bundleprefs.plist"];
+}
+
+static void drainPrefsToSlot(NSInteger slot) {
+    if (slot < 1) return;
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (bid.length == 0) return;
+    CFStringRef app = (__bridge CFStringRef)bid;
+    CFArrayRef keys = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    NSMutableDictionary *store = [NSMutableDictionary dictionary];
+    int n = 0;
+    if (keys) {
+        CFIndex cnt = CFArrayGetCount(keys);
+        for (CFIndex i = 0; i < cnt; i++) {
+            CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
+            if (!k) continue;
+            CFPropertyListRef v = CFPreferencesCopyValue(k, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            if (v) {
+                store[(__bridge NSString *)k] = (__bridge id)v;
+                CFRelease(v);
+            }
+            // 从共享域删除该 key（写 NULL）
+            CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            n++;
+        }
+        CFRelease(keys);
+    }
+    mkdirp(slotHomePath(slot));
+    if (store.count) [store writeToFile:slotPrefsPath(slot) atomically:YES];
+    else removePathPOSIX(slotPrefsPath(slot));   // 空账号：清掉旧的，避免残留
+    CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    NSLog(@"[LineAccount] PREF drained bundle域 -> slot %ld (%d keys)", (long)slot, n);
+}
+
+static void fillPrefsFromSlot(NSInteger slot) {
+    if (slot < 1) return;
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (bid.length == 0) return;
+    CFStringRef app = (__bridge CFStringRef)bid;
+    // 先确保共享域是空的（eager drain 后应已空；这里再兜底清一遍，防止串号）
+    CFArrayRef ex = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (ex) {
+        CFIndex c = CFArrayGetCount(ex);
+        for (CFIndex i = 0; i < c; i++) {
+            CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(ex, i);
+            if (k) CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        }
+        CFRelease(ex);
+    }
+    NSDictionary *store = [NSDictionary dictionaryWithContentsOfFile:slotPrefsPath(slot)];
+    int n = 0;
+    for (NSString *k in store) {
+        CFPreferencesSetValue((__bridge CFStringRef)k, (__bridge CFPropertyListRef)store[k],
+                              app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        n++;
+    }
+    CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    NSLog(@"[LineAccount] PREF filled slot %ld -> bundle域 (%d keys)", (long)slot, n);
+}
+
+#pragma mark - Home 归属章（跟着数据走的 owner 标记，交叉校验 .current）
+
+// 盖在 Application Support 内（属于交换集）→ drain 时随数据搬进槽、fill 时随数据搬回 Home。
+// 开机时读 Home 里的归属章即知「Home 现在到底属于哪个槽」，比外部 .current 更不易失配。
+static NSString *homeOwnerStampPath(void) {
+    return [[realHomePath() stringByAppendingPathComponent:@"Library/Application Support"]
+            stringByAppendingPathComponent:@".line_owner_slot"];
+}
+static void writeHomeOwnerStamp(NSInteger slot) {
+    mkdirp([homeOwnerStampPath() stringByDeletingLastPathComponent]);
+    [[NSString stringWithFormat:@"%ld", (long)slot]
+        writeToFile:homeOwnerStampPath() atomically:YES
+           encoding:NSUTF8StringEncoding error:nil];
+}
+static NSInteger readHomeOwnerStamp(void) {
+    NSString *s = [NSString stringWithContentsOfFile:homeOwnerStampPath()
+                                            encoding:NSUTF8StringEncoding error:nil];
+    return s ? s.integerValue : 0;
+}
+
+// 把「上一个 active 槽」的三层数据(文件+keychain+偏好)全部搬回它的槽，Home/keychain/共享偏好域归零。
+// owner：优先用 Home 归属章(跟着数据走，最准)，退回 .current。
+static void drainHomeAllLayers(NSInteger owner) {
+    if (owner < 1) return;
+    NSLog(@"[LineAccount] DRAIN-ALL 清空 Home -> slot %ld（文件+keychain+偏好）", (long)owner);
+    writeJournal(owner, 0, @"drain");
+    drainPrefsToSlot(owner);            // ③ 先搬偏好(mid)——它在共享域，独立于文件
+    drainHomeToSlot(owner);             // ① 文件
+    drainKeychainToSlot(owner);         // ② keychain
+    writeCurrentSlot(0);
+    clearJournal();
+}
+
+// 把「目标槽」的三层数据搬回 Home/keychain/共享偏好域，成为激活账号。
+static void fillHomeAllLayers(NSInteger to) {
+    if (to < 1) return;
+    NSLog(@"[LineAccount] FILL-ALL slot %ld -> Home（文件+keychain+偏好）", (long)to);
+    writeJournal(0, to, @"fill");
+    fillHomeFromSlot(to);               // ① 文件
+    fillKeychainFromSlot(to);           // ② keychain
+    fillPrefsFromSlot(to);              // ③ 偏好(mid)
+    writeHomeOwnerStamp(to);            // 盖归属章：Home 现在属于 to
+    writeCurrentSlot(to);
+    clearJournal();
+}
+
+// 切换到目标槽：先把上一个账号搬回它的槽(若 eager drain 已做则 from=0 跳过)，再把目标槽搬进 Home。
 static void swapToSlot(NSInteger to) {
     if (to < 1 || to > ACCOUNT_COUNT) return;
     NSInteger from = readCurrentSlot();
@@ -2317,17 +2434,8 @@ static void swapToSlot(NSInteger to) {
         return;
     }
     NSLog(@"[LineAccount] SWAP %ld -> %ld begin", (long)from, (long)to);
-    writeJournal(from, to, @"drain");
-    if (from >= 1) {
-        drainHomeToSlot(from);
-        drainKeychainToSlot(from);       // 上一号的凭证 → line.slot.from.*（停放）
-    }
-    writeCurrentSlot(0);                 // Home 已清空（数据在各槽），中间安全静止点
-    writeJournal(from, to, @"fill");
-    fillHomeFromSlot(to);
-    fillKeychainFromSlot(to);            // 目标槽凭证 → 去前缀，成为 LINE 原生激活凭证
-    writeCurrentSlot(to);
-    clearJournal();
+    if (from >= 1) drainHomeAllLayers(from);   // 正常已被 eager drain 清空(from=0)，这里兜底
+    fillHomeAllLayers(to);
     NSLog(@"[LineAccount] SWAP %ld -> %ld done", (long)from, (long)to);
 }
 
@@ -2344,15 +2452,34 @@ static void recoverSwapJournalIfAny(void) {
     NSLog(@"[LineAccount] SWAP 检测到中断的交换 from=%ld to=%ld phase=%@ — 自愈中",
           (long)from, (long)to, phase);
     if ([phase isEqualToString:@"drain"]) {
-        if (from >= 1) { drainHomeToSlot(from); drainKeychainToSlot(from); }
+        if (from >= 1) { drainPrefsToSlot(from); drainHomeToSlot(from); drainKeychainToSlot(from); }
         writeCurrentSlot(0);             // 停在「Home 空、数据在槽」，交给选择页重新决定
     } else { // fill
         fillHomeFromSlot(to);
         fillKeychainFromSlot(to);
+        fillPrefsFromSlot(to);
+        writeHomeOwnerStamp(to);
         writeCurrentSlot(to);
     }
     clearJournal();
     NSLog(@"[LineAccount] SWAP 自愈完成");
+}
+
+// 开机 eager drain：认出上一个 active 槽(归属章优先/.current 兜底)，把三层全搬回它的槽，
+// 让选择页出现时 Home/keychain/共享偏好域三者都是干净白板。
+static void eagerDrainAtBoot(void) {
+    NSInteger stamp = readHomeOwnerStamp();
+    NSInteger cur   = readCurrentSlot();
+    NSInteger owner = (stamp >= 1) ? stamp : cur;
+    if (stamp >= 1 && cur >= 1 && stamp != cur)
+        NSLog(@"[LineAccount] ⚠ 归属章(%ld)与.current(%ld)不一致，以归属章为准", (long)stamp, (long)cur);
+    if (owner >= 1) {
+        NSLog(@"[LineAccount] 开机 eager drain：上一个 active = slot %ld", (long)owner);
+        drainHomeAllLayers(owner);
+    } else {
+        NSLog(@"[LineAccount] 开机 eager drain：无上一个 active（Home 应已空）");
+        writeCurrentSlot(0);
+    }
 }
 
 static void enterAccountSlot(NSInteger slot) {
@@ -2649,8 +2776,11 @@ static void line_account_init(void) {
     (void)realHomePath();
     mkdirp(slotsRootPath());
 
-    // ★ 若上次「容器交换」被中途杀死，先自愈（把 Home 恢复到一致状态），再弹选择页
+    // ★ 若上次「容器交换」被中途杀死，先自愈（把 Home 恢复到一致状态）
     recoverSwapJournalIfAny();
+    // ★ 开机 eager drain：把上一个 active 账号的三层数据(文件+keychain+偏好)全搬回它的槽，
+    //   让选择页出现时 Home/keychain/共享偏好域都是干净白板 → 任何账号点进去都不沾上一号残留。
+    eagerDrainAtBoot();
 
     NSLog(@"[LineAccount] ========================================");
     NSLog(@"[LineAccount] BUILD=%@", LINE_BUILD_ID);
@@ -2672,8 +2802,11 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
-    installUserDefaultsIsolation();
-    installPrefsRedirect();          // ★ CFPreferences 按槽重定向：堵 mid 泄漏到共享 bundle 域
+    // ★ 三层交换模型：偏好隔离改由 prefsSwap(切槽时搬共享 bundle 域)完成，
+    //   不再运行时重定向。以下两套 hook 会与 prefsSwap 抢夺同一份共享域 → 停用，
+    //   让激活槽全程用 LINE 原生存储(=纯净重签版行为)，隔离完全靠切槽搬三层。
+    // installUserDefaultsIsolation();   // 停用：standardUserDefaults→suite / initWithSuiteName 重定向
+    // installPrefsRedirect();           // 停用：CFPreferences 12 函数按槽 fishhook 重定向
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
