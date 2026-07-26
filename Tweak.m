@@ -32,7 +32,7 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
 
-#define ACCOUNT_COUNT 16
+#define ACCOUNT_COUNT 100
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
 #define LINE_BUILD_ID @"got-swift-b v28"
@@ -1978,9 +1978,7 @@ static NSArray<LARemoteAccount *> *parseAccountsJSON(id root) {
         }
         [out addObject:acc];
     }
-    [out sortUsingComparator:^NSComparisonResult(LARemoteAccount *a, LARemoteAccount *b) {
-        return a.slot < b.slot ? NSOrderedAscending : (a.slot > b.slot ? NSOrderedDescending : NSOrderedSame);
-    }];
+    // 不在此重排：保持后端 PHP 返回的顺序（后端已按需排好）
     return out;
 }
 
