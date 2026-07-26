@@ -35,9 +35,13 @@
 #define ACCOUNT_COUNT 16
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"proxy-c-relay v27"
+#define LINE_BUILD_ID @"got-swift-b v28"
 // ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（仅调试）
 #define LA_DISABLE_ALL_PROXY_INJECT 0
+// ★ v28：方案 B（GOT 重绑 Swift NWConnection.init → 本地中继）。1=用 B（26 安全，不写 __TEXT）
+#define LA_USE_SCHEME_B 1
+// LINE 导入的 Swift 符号：NWConnection.__allocating_init(to:using:)
+#define LA_NWCONN_INIT_SYM "$s7Network12NWConnectionC2to5usingAcA10NWEndpointO_AA12NWParametersCtcfc"
 // 稍后换域名只改这两处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 #define LA_CONFIG_HOST @"www.khpturuy.vip"   // 拉配置必须直连，不能走账号代理
@@ -3320,6 +3324,35 @@ static BOOL la_pending_pop(la_pending_dest_t *out) {
     return YES;
 }
 
+#pragma mark - 方案 B：Swift 钩子回调的 C 接口（LineProxyHook-Bridging.h）
+
+// 该 host 是否要走本地中继（legy / uts-front）
+bool la_host_should_relay_c(const char *host) {
+    return la_host_should_relay(host) ? true : false;
+}
+
+// 登记真实目标到中继待处理队列
+bool la_pending_push_c(const char *host, uint16_t port, int32_t slot) {
+    return la_pending_push(host, port, (NSInteger)slot) ? true : false;
+}
+
+// 当前账号槽（选中优先，否则 activeSlot）
+int32_t la_current_slot_c(void) {
+    NSInteger s = (g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot;
+    if (s < 0) s = 0;
+    return (int32_t)s;
+}
+
+// 本地中继监听端口（0 = 未就绪）
+uint16_t la_relay_port_c(void) {
+    return g_relay_port;
+}
+
+// 是否强制关闭代理（.proxy_off 存在）
+bool la_proxy_off_c(void) {
+    return la_proxyForceOff() ? true : false;
+}
+
 static int la_send_all(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     size_t off = 0;
@@ -3727,6 +3760,29 @@ static void la_writeProxyHookStatus(NSString *status) {
     NSLog(@"[LineAccount][Proxy] hook_status=%@", status);
 }
 
+// Swift 侧（LineProxyHook.swift, @_cdecl）返回替身函数指针
+extern void *la_get_nwconn_hook(void);
+static void *g_origNWConnInit = NULL;
+
+// 方案 B：把 LINE 的 GOT 槽 NWConnection.init(to:using:) 改指向 Swift 替身。
+// 只改数据页（__got/__la_symbol_ptr），不写任何 __TEXT → iOS 26 不 CSM 崩。
+static BOOL install_nwconn_got_hook(void) {
+    void *hook = la_get_nwconn_hook();
+    if (!hook) {
+        NSLog(@"[LineAccount][ProxyB] Swift 替身指针为空");
+        return NO;
+    }
+    struct rebinding reb = {
+        LA_NWCONN_INIT_SYM,
+        hook,
+        &g_origNWConnInit,
+    };
+    rebind_symbols(&reb, 1);
+    NSLog(@"[LineAccount][ProxyB] GOT 重绑 NWConnection.init hook=%p orig=%p",
+          hook, g_origNWConnInit);
+    return YES;
+}
+
 static void installPerAccountProxyHooks(void) {
 #if LA_DISABLE_ALL_PROXY_INJECT
     la_writeProxyHookStatus(@"skipped-compile-off");
@@ -3738,6 +3794,23 @@ static void installPerAccountProxyHooks(void) {
         NSLog(@"[LineAccount][ProxyC] .proxy_off 存在 → 纯直连");
         return;
     }
+#if LA_USE_SCHEME_B
+    // 方案 B：只起中继 + 改 LINE 自己的 GOT 槽，不 inline 任何系统库
+    if (!la_start_local_relay()) {
+        la_writeProxyHookStatus(@"skipped-relay-listen-fail");
+        NSLog(@"[LineAccount][ProxyB] 本地中继启动失败");
+        return;
+    }
+    if (install_nwconn_got_hook()) {
+        la_writeProxyHookStatus(@"installed-b-got-swift");
+        NSLog(@"[LineAccount][ProxyB] OK relay=127.0.0.1:%u activeSlot=%ld",
+              (unsigned)g_relay_port, (long)g_proxyActiveSlot);
+        return;
+    }
+    la_writeProxyHookStatus(@"fail-b-got");
+    NSLog(@"[LineAccount][ProxyB] GOT 重绑失败");
+    return;
+#endif
     if (!loadEndpointSPI()) {
         la_writeProxyHookStatus(@"skipped-no-endpoint-spi");
         NSLog(@"[LineAccount][ProxyC] endpoint SPI 不可用");
