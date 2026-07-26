@@ -2079,6 +2079,7 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
 static void enterAccountSlot(NSInteger slot);
 
 @interface LineAccountPickerController : UIViewController
+@property(nonatomic, strong) UIScrollView *scroll;
 @property(nonatomic, strong) UIStackView *stack;
 @property(nonatomic, strong) UILabel *statusLabel;
 @end
@@ -2117,11 +2118,21 @@ static void enterAccountSlot(NSInteger slot);
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.statusLabel];
 
+    // 账号多时需要滚动：stack 放进 scrollView，而不是直接钉在 view 上
+    self.scroll = [[UIScrollView alloc] init];
+    self.scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    self.scroll.showsVerticalScrollIndicator = YES;
+    self.scroll.alwaysBounceVertical = YES;
+    if (@available(iOS 11.0, *)) {
+        self.scroll.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    }
+    [self.view addSubview:self.scroll];
+
     self.stack = [[UIStackView alloc] init];
     self.stack.axis = UILayoutConstraintAxisVertical;
     self.stack.spacing = 14;
     self.stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:self.stack];
+    [self.scroll addSubview:self.stack];
 
     [NSLayoutConstraint activateConstraints:@[
         [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:48],
@@ -2133,9 +2144,20 @@ static void enterAccountSlot(NSInteger slot);
         [self.statusLabel.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:12],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
         [self.statusLabel.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
-        [self.stack.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
-        [self.stack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:32],
-        [self.stack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-32],
+
+        // scrollView：从状态标签下方一直到屏幕底部
+        [self.scroll.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
+        [self.scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.scroll.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-16],
+
+        // stack 钉在 scroll 的 content 区（决定 contentSize）
+        [self.stack.topAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.topAnchor constant:4],
+        [self.stack.bottomAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.bottomAnchor constant:-4],
+        [self.stack.leadingAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.leadingAnchor constant:32],
+        [self.stack.trailingAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.trailingAnchor constant:-32],
+        // 锁定宽度 = 可视宽度 - 64，保证只纵向滚动
+        [self.stack.widthAnchor constraintEqualToAnchor:self.scroll.frameLayoutGuide.widthAnchor constant:-64],
     ]];
 
     // 网络优先：先等拉取；失败再落缓存。不在这里抢先用缓存填列表（避免看起来像缓存优先）
