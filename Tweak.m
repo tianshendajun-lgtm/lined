@@ -2683,6 +2683,10 @@ static void keychainSwap(NSInteger slot, BOOL addPrefix) {
             NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
             if (acct.length == 0) continue;   // 只处理有 account 的项
 
+            // ★ 我们自己的记账项(如 LineAccount.DeviceId=设备 UUID)不是 LINE 的登录凭证，
+            //   绝不能参与按槽搬家/改名，否则会被搬进旧槽找不回 → 每次切槽 UUID 都变。
+            if (svce.length > 0 && [svce hasPrefix:@"LineAccount."]) continue;
+
             if (addPrefix) {
                 if (kcHasAnySlotPrefix(acct)) continue;         // 已带任意槽前缀 → 不是激活项，跳过
                 if (kcRenameAccount(klass, acct, svce, [prefix stringByAppendingString:acct])) changed++;
