@@ -2075,11 +2075,15 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
 #pragma mark - 账号选择 UI
 
 static void enterAccountSlot(NSInteger slot);
+static NSInteger readCurrentSlot(void);
+static NSInteger readPending(void);
 
 @interface LineAccountPickerController : UIViewController
 @property(nonatomic, strong) UIScrollView *scroll;
 @property(nonatomic, strong) UIStackView *stack;
 @property(nonatomic, strong) UILabel *statusLabel;
+@property(nonatomic, weak)   UIButton *lastSelectedButton; // 上次选的号（红底+居中）
+@property(nonatomic, assign) BOOL didCenterOnLast;         // 只自动居中一次
 @end
 
 @implementation LineAccountPickerController
@@ -2181,23 +2185,55 @@ static void enterAccountSlot(NSInteger slot);
     });
 }
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (self.didCenterOnLast) return;
+    UIButton *b = self.lastSelectedButton;
+    if (!b || !self.scroll) return;
+    [self.scroll layoutIfNeeded];
+    CGFloat visible = self.scroll.bounds.size.height;
+    CGFloat content = self.scroll.contentSize.height;
+    if (visible <= 0 || content <= 0) return;   // 布局还没就绪，下一轮再试
+    CGRect f = [b convertRect:b.bounds toView:self.scroll];
+    CGFloat maxOff = MAX(0, content - visible);
+    CGFloat target = CGRectGetMidY(f) - visible / 2.0;   // 让按钮中心落在可视区中间
+    target = MAX(0, MIN(target, maxOff));
+    [self.scroll setContentOffset:CGPointMake(0, target) animated:NO];
+    self.didCenterOnLast = YES;
+}
+
 - (void)rebuildButtons {
     for (UIView *v in [self.stack.arrangedSubviews copy]) {
         [self.stack removeArrangedSubview:v];
         [v removeFromSuperview];
     }
+    self.lastSelectedButton = nil;
+    self.didCenterOnLast = NO;
+    // 上次选择的槽（.pending 每次选号都会写；兜底用 .current）
+    NSInteger lastSlot = readPending();
+    if (lastSlot < 1) lastSlot = readCurrentSlot();
     for (LARemoteAccount *acc in g_remoteAccounts) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         NSString *flag = [slotHomePath(acc.slot) stringByAppendingPathComponent:@".used"];
         BOOL hasData = [[NSFileManager defaultManager] fileExistsAtPath:flag];
+        BOOL isLast = (acc.slot == lastSlot);
         // 只显示：显示名 + 槽位（+ 有无本地数据标记）
-        NSString *title = [NSString stringWithFormat:@"%@  ·  槽 %ld%@",
-                           acc.name, (long)acc.slot, hasData ? @"  ·  已有数据" : @""];
+        NSString *title = [NSString stringWithFormat:@"%@  ·  槽 %ld%@%@",
+                           acc.name, (long)acc.slot,
+                           hasData ? @"  ·  已有数据" : @"",
+                           isLast ? @"  ·  上次" : @""];
         [btn setTitle:title forState:UIControlStateNormal];
         btn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        [btn setTitleColor:[UIColor colorWithRed:0.06 green:0.45 blue:0.25 alpha:1.0]
-                  forState:UIControlStateNormal];
-        btn.backgroundColor = UIColor.whiteColor;
+        if (isLast) {
+            // 上次选的号：红底白字
+            [btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+            btn.backgroundColor = [UIColor colorWithRed:0.85 green:0.16 blue:0.16 alpha:1.0];
+            self.lastSelectedButton = btn;
+        } else {
+            [btn setTitleColor:[UIColor colorWithRed:0.06 green:0.45 blue:0.25 alpha:1.0]
+                      forState:UIControlStateNormal];
+            btn.backgroundColor = UIColor.whiteColor;
+        }
         btn.layer.cornerRadius = 12;
         btn.tag = acc.slot;
         btn.contentEdgeInsets = UIEdgeInsetsMake(16, 20, 16, 20);
