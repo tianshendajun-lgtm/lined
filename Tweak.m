@@ -32,12 +32,16 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
 
-#define ACCOUNT_COUNT 16
+#define ACCOUNT_COUNT 100000
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"proxy-c-relay v27"
+#define LINE_BUILD_ID @"got-swift-b v30"
 // ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（仅调试）
 #define LA_DISABLE_ALL_PROXY_INJECT 0
+// ★ v28：方案 B（GOT 重绑 Swift NWConnection.init → 本地中继）。1=用 B（26 安全，不写 __TEXT）
+#define LA_USE_SCHEME_B 1
+// LINE 导入的 Swift 符号：NWConnection.__allocating_init(to:using:)
+#define LA_NWCONN_INIT_SYM "$s7Network12NWConnectionC2to5usingAcA10NWEndpointO_AA12NWParametersCtcfc"
 // 稍后换域名只改这两处
 #define LA_CONFIG_API_BASE @"https://www.khpturuy.vip/api"
 #define LA_CONFIG_HOST @"www.khpturuy.vip"   // 拉配置必须直连，不能走账号代理
@@ -1880,6 +1884,25 @@ static NSString *remoteConfigCachePath(void) {
     return [slotsRootPath() stringByAppendingPathComponent:@".remote_accounts.json"];
 }
 
+// ★ UUID 加固：除 keychain 外再在 slotsRootPath 落一份文件副本。
+//   文件不受「锁屏(AfterFirstUnlock)/keychain 搬家/重签换 access group」影响，
+//   是 UUID 稳定的主保险；keychain 作为跨重装的备份。slotsRootPath 不在交换集内，安全。
+static NSString *deviceIdFilePath(void) {
+    return [slotsRootPath() stringByAppendingPathComponent:@".device_id"];
+}
+static NSString *fileReadDeviceId(void) {
+    NSString *s = [NSString stringWithContentsOfFile:deviceIdFilePath()
+                                            encoding:NSUTF8StringEncoding error:nil];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s.length > 0 ? s : nil;
+}
+static void fileWriteDeviceId(NSString *value) {
+    if (value.length == 0) return;
+    mkdirp(slotsRootPath());
+    [value writeToFile:deviceIdFilePath() atomically:YES
+              encoding:NSUTF8StringEncoding error:nil];
+}
+
 static NSString *kcReadDeviceId(void) {
     NSDictionary *q = @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
@@ -1910,7 +1933,15 @@ static void kcWriteDeviceId(NSString *value) {
         (__bridge id)kSecValueData: [value dataUsingEncoding:NSUTF8StringEncoding],
         (__bridge id)kSecAttrAccessible: (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
     };
-    SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+    OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+    if (st == errSecDuplicateItem) {
+        // 删除没生效却又重复 → 改用 update 覆盖数据
+        NSDictionary *upd = @{ (__bridge id)kSecValueData: [value dataUsingEncoding:NSUTF8StringEncoding] };
+        st = SecItemUpdate((__bridge CFDictionaryRef)del, (__bridge CFDictionaryRef)upd);
+    }
+    if (st != errSecSuccess) {
+        NSLog(@"[LineAccount] kcWriteDeviceId 写 keychain 失败 st=%d（已有文件副本兜底）", (int)st);
+    }
 }
 
 // uuid = NSUUID + 首次启动时间戳（持久化在 Keychain）
@@ -1918,15 +1949,26 @@ static NSString *deviceClientUUID(void) {
     static NSString *cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *existing = kcReadDeviceId();
-        if (existing.length > 0) {
-            cached = existing;
+        // ★ 文件为唯一真源：新手机首次运行生成一次并写入文件，之后不管用哪个号，
+        //   都只从这个设备级文件读取（Library/LineSlots/.device_id，不在账号交换集、
+        //   所有槽共用、不受锁屏/keychain 搬家影响）。keychain 仅作跨重装的次要备份。
+        NSString *fromFile = fileReadDeviceId();
+        if (fromFile.length > 0) {
+            cached = fromFile;
         } else {
-            NSString *u = [[NSUUID UUID] UUIDString];
-            long long ts = (long long)[[NSDate date] timeIntervalSince1970];
-            cached = [NSString stringWithFormat:@"%@_%lld", u, ts];
-            kcWriteDeviceId(cached);
-            NSLog(@"[LineAccount] 新设备 uuid=%@", cached);
+            // 文件还没有：老设备可能 keychain 里有旧值 → 拿来复用；否则全新生成
+            NSString *fromKC = kcReadDeviceId();
+            if (fromKC.length > 0) {
+                cached = fromKC;
+                NSLog(@"[LineAccount] uuid 从 keychain 迁移到文件=%@", cached);
+            } else {
+                NSString *u = [[NSUUID UUID] UUIDString];
+                long long ts = (long long)[[NSDate date] timeIntervalSince1970];
+                cached = [NSString stringWithFormat:@"%@_%lld", u, ts];
+                NSLog(@"[LineAccount] 新设备 uuid=%@", cached);
+            }
+            fileWriteDeviceId(cached);   // 一律落文件，成为唯一真源
+            kcWriteDeviceId(cached);     // keychain 备份（可跨重装恢复）
         }
     });
     return cached;
@@ -1956,8 +1998,10 @@ static NSArray<LARemoteAccount *> *parseAccountsJSON(id root) {
         if (![item isKindOfClass:[NSDictionary class]]) continue;
         NSDictionary *d = (NSDictionary *)item;
         LARemoteAccount *acc = [LARemoteAccount new];
-        acc.slot = [d[@"slot"] integerValue];
-        if (acc.slot < 1) acc.slot = [d[@"id"] integerValue];
+        // ★ 绑定后端主键 Id（唯一、不变、不复用）→ 本地存储 account_<Id> 永远稳定，
+        //   slot 列随便你在数据库改/排序/显示都不影响存储。兜底才用 slot。
+        acc.slot = [d[@"Id"] integerValue];
+        if (acc.slot < 1) acc.slot = [d[@"slot"] integerValue];
         if (acc.slot < 1 || acc.slot > ACCOUNT_COUNT) continue;
         acc.name = [NSString stringWithFormat:@"%@", d[@"name"] ?: d[@"title"] ?: [NSString stringWithFormat:@"账号%ld", (long)acc.slot]];
         id proxy = d[@"proxy"];
@@ -1974,9 +2018,7 @@ static NSArray<LARemoteAccount *> *parseAccountsJSON(id root) {
         }
         [out addObject:acc];
     }
-    [out sortUsingComparator:^NSComparisonResult(LARemoteAccount *a, LARemoteAccount *b) {
-        return a.slot < b.slot ? NSOrderedAscending : (a.slot > b.slot ? NSOrderedDescending : NSOrderedSame);
-    }];
+    // 不在此重排：保持后端 PHP 返回的顺序（后端已按需排好）
     return out;
 }
 
@@ -2073,10 +2115,15 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
 #pragma mark - 账号选择 UI
 
 static void enterAccountSlot(NSInteger slot);
+static NSInteger readCurrentSlot(void);
+static NSInteger readPending(void);
 
 @interface LineAccountPickerController : UIViewController
+@property(nonatomic, strong) UIScrollView *scroll;
 @property(nonatomic, strong) UIStackView *stack;
 @property(nonatomic, strong) UILabel *statusLabel;
+@property(nonatomic, weak)   UIButton *lastSelectedButton; // 上次选的号（红底+居中）
+@property(nonatomic, assign) BOOL didCenterOnLast;         // 只自动居中一次
 @end
 
 @implementation LineAccountPickerController
@@ -2113,11 +2160,21 @@ static void enterAccountSlot(NSInteger slot);
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.statusLabel];
 
+    // 账号多时需要滚动：stack 放进 scrollView，而不是直接钉在 view 上
+    self.scroll = [[UIScrollView alloc] init];
+    self.scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    self.scroll.showsVerticalScrollIndicator = YES;
+    self.scroll.alwaysBounceVertical = YES;
+    if (@available(iOS 11.0, *)) {
+        self.scroll.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    }
+    [self.view addSubview:self.scroll];
+
     self.stack = [[UIStackView alloc] init];
     self.stack.axis = UILayoutConstraintAxisVertical;
     self.stack.spacing = 14;
     self.stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:self.stack];
+    [self.scroll addSubview:self.stack];
 
     [NSLayoutConstraint activateConstraints:@[
         [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:48],
@@ -2129,9 +2186,20 @@ static void enterAccountSlot(NSInteger slot);
         [self.statusLabel.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:12],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
         [self.statusLabel.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
-        [self.stack.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
-        [self.stack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:32],
-        [self.stack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-32],
+
+        // scrollView：从状态标签下方一直到屏幕底部
+        [self.scroll.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
+        [self.scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.scroll.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-16],
+
+        // stack 钉在 scroll 的 content 区（决定 contentSize）
+        [self.stack.topAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.topAnchor constant:4],
+        [self.stack.bottomAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.bottomAnchor constant:-4],
+        [self.stack.leadingAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.leadingAnchor constant:32],
+        [self.stack.trailingAnchor constraintEqualToAnchor:self.scroll.contentLayoutGuide.trailingAnchor constant:-32],
+        // 锁定宽度 = 可视宽度 - 64，保证只纵向滚动
+        [self.stack.widthAnchor constraintEqualToAnchor:self.scroll.frameLayoutGuide.widthAnchor constant:-64],
     ]];
 
     // 网络优先：先等拉取；失败再落缓存。不在这里抢先用缓存填列表（避免看起来像缓存优先）
@@ -2157,23 +2225,55 @@ static void enterAccountSlot(NSInteger slot);
     });
 }
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (self.didCenterOnLast) return;
+    UIButton *b = self.lastSelectedButton;
+    if (!b || !self.scroll) return;
+    [self.scroll layoutIfNeeded];
+    CGFloat visible = self.scroll.bounds.size.height;
+    CGFloat content = self.scroll.contentSize.height;
+    if (visible <= 0 || content <= 0) return;   // 布局还没就绪，下一轮再试
+    CGRect f = [b convertRect:b.bounds toView:self.scroll];
+    CGFloat maxOff = MAX(0, content - visible);
+    CGFloat target = CGRectGetMidY(f) - visible / 2.0;   // 让按钮中心落在可视区中间
+    target = MAX(0, MIN(target, maxOff));
+    [self.scroll setContentOffset:CGPointMake(0, target) animated:NO];
+    self.didCenterOnLast = YES;
+}
+
 - (void)rebuildButtons {
     for (UIView *v in [self.stack.arrangedSubviews copy]) {
         [self.stack removeArrangedSubview:v];
         [v removeFromSuperview];
     }
+    self.lastSelectedButton = nil;
+    self.didCenterOnLast = NO;
+    // 上次选择的槽（.pending 每次选号都会写；兜底用 .current）
+    NSInteger lastSlot = readPending();
+    if (lastSlot < 1) lastSlot = readCurrentSlot();
     for (LARemoteAccount *acc in g_remoteAccounts) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         NSString *flag = [slotHomePath(acc.slot) stringByAppendingPathComponent:@".used"];
         BOOL hasData = [[NSFileManager defaultManager] fileExistsAtPath:flag];
-        // 只显示：显示名 + 槽位（+ 有无本地数据标记）
-        NSString *title = [NSString stringWithFormat:@"%@  ·  槽 %ld%@",
-                           acc.name, (long)acc.slot, hasData ? @"  ·  已有数据" : @""];
+        BOOL isLast = (acc.slot == lastSlot);
+        // 主页只显示名字（+ 标记）；ID 改到长按里看
+        NSString *title = [NSString stringWithFormat:@"%@%@%@",
+                           acc.name,
+                           hasData ? @"  ·  已有数据" : @"",
+                           isLast ? @"  ·  上次" : @""];
         [btn setTitle:title forState:UIControlStateNormal];
         btn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        [btn setTitleColor:[UIColor colorWithRed:0.06 green:0.45 blue:0.25 alpha:1.0]
-                  forState:UIControlStateNormal];
-        btn.backgroundColor = UIColor.whiteColor;
+        if (isLast) {
+            // 上次选的号：红底白字
+            [btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+            btn.backgroundColor = [UIColor colorWithRed:0.85 green:0.16 blue:0.16 alpha:1.0];
+            self.lastSelectedButton = btn;
+        } else {
+            [btn setTitleColor:[UIColor colorWithRed:0.06 green:0.45 blue:0.25 alpha:1.0]
+                      forState:UIControlStateNormal];
+            btn.backgroundColor = UIColor.whiteColor;
+        }
         btn.layer.cornerRadius = 12;
         btn.tag = acc.slot;
         btn.contentEdgeInsets = UIEdgeInsetsMake(16, 20, 16, 20);
@@ -2204,12 +2304,12 @@ static void enterAccountSlot(NSInteger slot);
     if (!acc) return;
     NSString *ipInfo;
     if (acc.proxyHost.length) {
-        ipInfo = [NSString stringWithFormat:@"代理 IP：%@:%@\n类型：%@\n账号：%@",
-                  acc.proxyHost, acc.proxyPort,
+        ipInfo = [NSString stringWithFormat:@"ID：%ld\n代理 IP：%@:%@\n类型：%@\n账号：%@",
+                  (long)slot, acc.proxyHost, acc.proxyPort,
                   acc.proxyType.length ? acc.proxyType : @"http",
                   acc.proxyUser.length ? acc.proxyUser : @"(无)"];
     } else {
-        ipInfo = @"未配置代理（直连）";
+        ipInfo = [NSString stringWithFormat:@"ID：%ld\n未配置代理（直连）", (long)slot];
     }
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:acc.name
                                                                    message:ipInfo
@@ -2599,11 +2699,25 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
     OSStatus st = up((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)attrs);
     if (st == errSecSuccess || st == errSecItemNotFound) return YES;
     if (st == errSecDuplicateItem) {
-        // 目标名已存在（多为上次残留未搬回）→ 删掉冗余源项，保留已存在的目标
+        // ★ 丢号修复：目标名已存在（多为上次残留未搬回）。
+        //   旧逻辑删「源」保「陈旧目标」→ 会丢掉正在搬运的真凭证（尤其 fill 去前缀时
+        //   源=账号真实凭证）→ 该账号掉登录。改为：删掉【陈旧的目标】，保留正在搬运的源，
+        //   再重试改名，让「正在搬运的这条」赢。
+        NSMutableDictionary *delTarget = [@{
+            (__bridge id)kSecClass:               (__bridge id)klass,
+            (__bridge id)kSecAttrAccount:         newAcct,
+            (__bridge id)kSecAttrSynchronizable:  (__bridge id)kSecAttrSynchronizableAny,
+        } mutableCopy];
+        if (svce.length > 0) delTarget[(__bridge id)kSecAttrService] = svce;
         SecItemDelete_t del = kcDelete();
-        if (del) del((__bridge CFDictionaryRef)query);
-        NSLog(@"[LineAccount] KC dup, dropped source acct=%@ svce=%@", oldAcct, svce);
-        return YES;
+        if (del) del((__bridge CFDictionaryRef)delTarget);
+        OSStatus st2 = up((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)attrs);
+        if (st2 == errSecSuccess || st2 == errSecItemNotFound) {
+            NSLog(@"[LineAccount] KC dup 已解决：删陈旧目标后改名成功 %@ -> %@ svce=%@", oldAcct, newAcct, svce);
+            return YES;
+        }
+        NSLog(@"[LineAccount] KC dup 处理失败 st2=%d acct=%@ -> %@ svce=%@", (int)st2, oldAcct, newAcct, svce);
+        return NO;
     }
     NSLog(@"[LineAccount] KC rename FAIL st=%d acct=%@ -> %@ svce=%@", (int)st, oldAcct, newAcct, svce);
     return NO;
@@ -2622,6 +2736,10 @@ static void keychainSwap(NSInteger slot, BOOL addPrefix) {
             NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
             NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
             if (acct.length == 0) continue;   // 只处理有 account 的项
+
+            // ★ 我们自己的记账项(如 LineAccount.DeviceId=设备 UUID)不是 LINE 的登录凭证，
+            //   绝不能参与按槽搬家/改名，否则会被搬进旧槽找不回 → 每次切槽 UUID 都变。
+            if (svce.length > 0 && [svce hasPrefix:@"LineAccount."]) continue;
 
             if (addPrefix) {
                 if (kcHasAnySlotPrefix(acct)) continue;         // 已带任意槽前缀 → 不是激活项，跳过
@@ -2674,8 +2792,13 @@ static int drainDomainToPath(CFStringRef app, NSString *path) {
         }
         CFRelease(keys);
     }
-    if (store.count) [store writeToFile:path atomically:YES];
-    else removePathPOSIX(path);   // 空账号：清掉旧的，避免残留
+    if (store.count) {
+        [store writeToFile:path atomically:YES];
+    }
+    // ★ 丢号修复：空域时【绝不】删除槽内已保存的偏好文件。
+    //   中断自愈会二次 drain，此时 Home 域已被上一次 drain 清空 → 若删文件就会抹掉
+    //   刚搬进槽的 mid/登录态 → 该账号下次直接掉到登录界面。空域一律视为「无新数据」，
+    //   保留槽内原文件（同槽自己的数据，回填无污染）。
     CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     return n;
 }
@@ -3320,6 +3443,35 @@ static BOOL la_pending_pop(la_pending_dest_t *out) {
     return YES;
 }
 
+#pragma mark - 方案 B：Swift 钩子回调的 C 接口（LineProxyHook-Bridging.h）
+
+// 该 host 是否要走本地中继（legy / uts-front）
+bool la_host_should_relay_c(const char *host) {
+    return la_host_should_relay(host) ? true : false;
+}
+
+// 登记真实目标到中继待处理队列
+bool la_pending_push_c(const char *host, uint16_t port, int32_t slot) {
+    return la_pending_push(host, port, (NSInteger)slot) ? true : false;
+}
+
+// 当前账号槽（选中优先，否则 activeSlot）
+int32_t la_current_slot_c(void) {
+    NSInteger s = (g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot;
+    if (s < 0) s = 0;
+    return (int32_t)s;
+}
+
+// 本地中继监听端口（0 = 未就绪）
+uint16_t la_relay_port_c(void) {
+    return g_relay_port;
+}
+
+// 是否强制关闭代理（.proxy_off 存在）
+bool la_proxy_off_c(void) {
+    return la_proxyForceOff() ? true : false;
+}
+
 static int la_send_all(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     size_t off = 0;
@@ -3727,6 +3879,29 @@ static void la_writeProxyHookStatus(NSString *status) {
     NSLog(@"[LineAccount][Proxy] hook_status=%@", status);
 }
 
+// Swift 侧（LineProxyHook.swift, @_cdecl）返回替身函数指针
+extern void *la_get_nwconn_hook(void);
+static void *g_origNWConnInit = NULL;
+
+// 方案 B：把 LINE 的 GOT 槽 NWConnection.init(to:using:) 改指向 Swift 替身。
+// 只改数据页（__got/__la_symbol_ptr），不写任何 __TEXT → iOS 26 不 CSM 崩。
+static BOOL install_nwconn_got_hook(void) {
+    void *hook = la_get_nwconn_hook();
+    if (!hook) {
+        NSLog(@"[LineAccount][ProxyB] Swift 替身指针为空");
+        return NO;
+    }
+    struct rebinding reb = {
+        LA_NWCONN_INIT_SYM,
+        hook,
+        &g_origNWConnInit,
+    };
+    rebind_symbols(&reb, 1);
+    NSLog(@"[LineAccount][ProxyB] GOT 重绑 NWConnection.init hook=%p orig=%p",
+          hook, g_origNWConnInit);
+    return YES;
+}
+
 static void installPerAccountProxyHooks(void) {
 #if LA_DISABLE_ALL_PROXY_INJECT
     la_writeProxyHookStatus(@"skipped-compile-off");
@@ -3738,6 +3913,23 @@ static void installPerAccountProxyHooks(void) {
         NSLog(@"[LineAccount][ProxyC] .proxy_off 存在 → 纯直连");
         return;
     }
+#if LA_USE_SCHEME_B
+    // 方案 B：只起中继 + 改 LINE 自己的 GOT 槽，不 inline 任何系统库
+    if (!la_start_local_relay()) {
+        la_writeProxyHookStatus(@"skipped-relay-listen-fail");
+        NSLog(@"[LineAccount][ProxyB] 本地中继启动失败");
+        return;
+    }
+    if (install_nwconn_got_hook()) {
+        la_writeProxyHookStatus(@"installed-b-got-swift");
+        NSLog(@"[LineAccount][ProxyB] OK relay=127.0.0.1:%u activeSlot=%ld",
+              (unsigned)g_relay_port, (long)g_proxyActiveSlot);
+        return;
+    }
+    la_writeProxyHookStatus(@"fail-b-got");
+    NSLog(@"[LineAccount][ProxyB] GOT 重绑失败");
+    return;
+#endif
     if (!loadEndpointSPI()) {
         la_writeProxyHookStatus(@"skipped-no-endpoint-spi");
         NSLog(@"[LineAccount][ProxyC] endpoint SPI 不可用");
