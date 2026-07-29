@@ -35,7 +35,7 @@
 #define ACCOUNT_COUNT 100000
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"got-swift-b v30"
+#define LINE_BUILD_ID @"got-swift-b v31"
 // ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（仅调试）
 #define LA_DISABLE_ALL_PROXY_INJECT 0
 // ★ v28：方案 B（GOT 重绑 Swift NWConnection.init → 本地中继）。1=用 B（26 安全，不写 __TEXT）
@@ -2115,6 +2115,7 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
 #pragma mark - 账号选择 UI
 
 static void enterAccountSlot(NSInteger slot);
+static void clearAccountSlot(NSInteger slot);
 static NSInteger readCurrentSlot(void);
 static NSInteger readPending(void);
 
@@ -2314,7 +2315,34 @@ static NSInteger readPending(void);
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:acc.name
                                                                    message:ipInfo
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    // 清空此账号：点了先弹二次确认（确认 / 取消），确认后才真正删除
+    [alert addAction:[UIAlertAction actionWithTitle:@"清空此账号数据"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a1) {
+        __strong typeof(weakSelf) sself = weakSelf;
+        if (!sself) return;
+        UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清空？"
+            message:[NSString stringWithFormat:
+                     @"将删除「%@」(ID:%ld) 在本机的全部本地数据（登录态/聊天/凭证），不可恢复。清空后需重新登录。",
+                     acc.name, (long)slot]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"确认清空"
+                                                    style:UIAlertActionStyleDestructive
+                                                  handler:^(UIAlertAction *a2) {
+            clearAccountSlot(slot);
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:@"已清空"
+                message:@"该账号本地数据已删除，请重新打开 LINE。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"重开" style:UIAlertActionStyleDefault
+                                                   handler:^(UIAlertAction *a3) { exit(0); }]];
+            __strong typeof(weakSelf) s2 = weakSelf;
+            [s2 presentViewController:done animated:YES completion:nil];
+        }]];
+        [sself presentViewController:confirm animated:YES completion:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -3001,6 +3029,97 @@ static void restartForAccountSwitch(NSInteger to) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ exit(0); });
     });
+}
+
+// —— 清空某账号本地数据（三层：文件 / keychain / 偏好）——
+// 删除某槽停放的 keychain（account 以 line.slot.<slot>. 开头）
+static void wipeSlotKeychain(NSInteger slot) {
+    NSString *prefix = slotKeyPrefix(slot);   // line.slot.N.
+    CFTypeRef classes[] = { kSecClassGenericPassword, kSecClassInternetPassword };
+    SecItemDelete_t del = kcDelete();
+    if (!del) return;
+    for (int ci = 0; ci < 2; ci++) {
+        for (NSDictionary *it in kcAllItems(classes[ci])) {
+            id acctObj = it[(__bridge id)kSecAttrAccount];
+            id svceObj = it[(__bridge id)kSecAttrService];
+            NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
+            NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
+            if (![acct hasPrefix:prefix]) continue;
+            NSMutableDictionary *q = [@{
+                (__bridge id)kSecClass:              (__bridge id)classes[ci],
+                (__bridge id)kSecAttrAccount:        acct,
+                (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
+            } mutableCopy];
+            if (svce.length > 0) q[(__bridge id)kSecAttrService] = svce;
+            del((__bridge CFDictionaryRef)q);
+        }
+    }
+}
+
+// 删除当前激活(Home)的 keychain：无前缀且非我们自己的记账项(LineAccount.*，保住 DeviceId)
+static void wipeActiveKeychain(void) {
+    CFTypeRef classes[] = { kSecClassGenericPassword, kSecClassInternetPassword };
+    SecItemDelete_t del = kcDelete();
+    if (!del) return;
+    for (int ci = 0; ci < 2; ci++) {
+        for (NSDictionary *it in kcAllItems(classes[ci])) {
+            id acctObj = it[(__bridge id)kSecAttrAccount];
+            id svceObj = it[(__bridge id)kSecAttrService];
+            NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
+            NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
+            if (acct.length == 0) continue;
+            if ([acct hasPrefix:@"line.slot."]) continue;                       // 其他槽停放的，不动
+            if (svce.length > 0 && [svce hasPrefix:@"LineAccount."]) continue;  // DeviceId 等自家项，保留
+            NSMutableDictionary *q = [@{
+                (__bridge id)kSecClass:              (__bridge id)classes[ci],
+                (__bridge id)kSecAttrAccount:        acct,
+                (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
+            } mutableCopy];
+            if (svce.length > 0) q[(__bridge id)kSecAttrService] = svce;
+            del((__bridge CFDictionaryRef)q);
+        }
+    }
+}
+
+// 清空一个偏好域（把所有键置 NULL）
+static void clearPrefDomain(CFStringRef app) {
+    CFArrayRef keys = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (keys) {
+        CFIndex c = CFArrayGetCount(keys);
+        for (CFIndex i = 0; i < c; i++) {
+            CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
+            if (k) CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        }
+        CFRelease(keys);
+    }
+    CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+}
+
+static void clearAccountSlot(NSInteger slot) {
+    if (slot < 1) return;
+    NSInteger owner = readHomeOwnerStamp();
+    if (owner < 1) owner = readCurrentSlot();
+    BOOL activeInHome = (owner == slot);
+
+    // 若该号当前正占着 Home（活账号）→ 先把 Home 三层清掉，等于本地登出
+    if (activeInHome) {
+        for (NSString *rel in swapRelItemsUnder(realHomePath())) {
+            removePathPOSIX(homeRel(rel));
+        }
+        wipeActiveKeychain();
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if (bid.length) clearPrefDomain((__bridge CFStringRef)bid);
+        clearPrefDomain(LINE_GROUP_ID);
+        writeCurrentSlot(0);
+    }
+
+    // 删该槽存储三层
+    removePathPOSIX(slotHomePath(slot));         // ① 文件（含 .used/归属章等）
+    wipeSlotKeychain(slot);                       // ② keychain line.slot.<slot>.*
+    removePathPOSIX(slotPrefsPath(slot));         // ③ 偏好（bundle 域）
+    removePathPOSIX(slotGroupPrefsPath(slot));    // ③ 偏好（group 域）
+
+    NSLog(@"[LineAccount] 已清空账号 slot %ld（activeInHome=%d）", (long)slot, activeInHome);
 }
 
 static void enterAccountSlot(NSInteger slot) {
