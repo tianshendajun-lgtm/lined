@@ -3844,17 +3844,20 @@ static BOOL laNetQuiet(void) {
     }
     return cached == 1;
 }
-// 安静模式下是否应丢弃这行（高频网络类）。保留：[sw]/[boot]/[kc]、含“已装”的一次性横幅、代理错误行。
+// 安静模式=白名单：只留启动分隔[boot]、换号决策/搬运条数[sw]、以及错误/失败行。
+// 其余全部丢弃——包括 [kc] 逐条 dump、[dbg] 目录探针、[url]/[grp]/[dns]/[connect]/[proxy]
+// 网络行、每次启动重复的「已装」横幅（[boot] 已能证明 dylib 注入成功，无需再刷）。
+// 想看网络流量或完整诊断：建 slotsRoot/.netlog 文件即可全量放开。
 static BOOL laShouldDropWhenQuiet(NSString *line) {
-    if ([line hasPrefix:@"[sw]"] || [line hasPrefix:@"[boot]"] || [line hasPrefix:@"[kc]"] || [line hasPrefix:@"[dbg]"]) return NO;
-    if ([line rangeOfString:@"已装"].location != NSNotFound) return NO;      // 一次性安装横幅
-    if ([line rangeOfString:@"失败"].location != NSNotFound) return NO;      // 错误保留
-    if ([line rangeOfString:@"连不上"].location != NSNotFound) return NO;    // 错误保留
-    if ([line rangeOfString:@"无代理"].location != NSNotFound) return NO;    // 异常保留
-    if ([line hasPrefix:@"[url]"]  || [line hasPrefix:@"[grp]"] ||
-        [line hasPrefix:@"[dns]"]  || [line hasPrefix:@"[connect]"] ||
-        [line hasPrefix:@"[proxy]"]) return YES;                            // 高频网络行 → 丢
-    return NO;
+    // 先保留错误类（无论前缀）
+    if ([line rangeOfString:@"FAIL"].location   != NSNotFound) return NO;
+    if ([line rangeOfString:@"失败"].location   != NSNotFound) return NO;
+    if ([line rangeOfString:@"连不上"].location != NSNotFound) return NO;
+    if ([line rangeOfString:@"无代理"].location != NSNotFound) return NO;
+    // 只放行这两类重点行
+    if ([line hasPrefix:@"[boot]"]) return NO;
+    if ([line hasPrefix:@"[sw]"])   return NO;
+    return YES;   // 其余一律丢
 }
 
 static void la_flog(NSString *line) {
@@ -5010,7 +5013,7 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
-    la_dump_keychain_once();   // ★ 诊断：把当前 Keychain 布局打进日志，定位 KakaoTalk 密钥所在 service/access group
+    if (!laNetQuiet()) la_dump_keychain_once();   // 诊断项：仅在建了 .netlog 的全量模式下才逐条 dump keychain
     installPerAccountProxyHooks();
     installURLSessionRecon();          // ★ KakaoTalk：NSURLSession 层侦察，记录所有请求 URL
     installURLSessionProxyInjection(); // ★ KakaoTalk：全量 HTTP 代理注入（connectionProxyDictionary）
@@ -5019,7 +5022,7 @@ static void line_account_init(void) {
     installBGTaskCrashGuards();
     hookAppDelegate();
 
-    la_boot_db_probe();   // ★ 诊断：Home 内 DB vs 真实共享容器残留 DB，定位新号污染源
+    if (!laNetQuiet()) la_boot_db_probe();   // 诊断项：仅在建了 .netlog 的全量模式下才跑 DB 探针
 
     // ★ 不在此处提前弹选择页：此刻场景/窗口尚未建立，绑不到 UIWindowScene 会黑屏。
     //   改由 hooked_didFinishLaunching / hooked_sceneWillConnect 在场景就绪后覆盖显示。
