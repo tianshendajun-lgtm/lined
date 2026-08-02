@@ -2799,6 +2799,7 @@ static void drainHomeToSlot(NSInteger slot) {
         moveOne(homeRel(rel), slotRel(slot, rel));
     }
     NSLog(@"[LineAccount] SWAP drained Home -> slot %ld (%lu items)", (long)slot, (unsigned long)items.count);
+    la_flog([NSString stringWithFormat:@"[sw] 文件 drained Home→slot %ld (%lu项)", (long)slot, (unsigned long)items.count]);
 }
 // 把 slot 里的账号数据搬回 Home（幂等，可重复执行）。枚举槽内现有内容为准。
 static void fillHomeFromSlot(NSInteger slot) {
@@ -2811,6 +2812,7 @@ static void fillHomeFromSlot(NSInteger slot) {
     mkdirp(homeRel(@"Library/Application Support"));
     mkdirp(homeRel(@"Documents"));
     NSLog(@"[LineAccount] SWAP filled slot %ld -> Home (%lu items)", (long)slot, (unsigned long)items.count);
+    la_flog([NSString stringWithFormat:@"[sw] 文件 filled slot %ld→Home (%lu项)", (long)slot, (unsigned long)items.count]);
 }
 
 #pragma mark - Keychain 交换（激活槽用原生无前缀凭证；非激活槽存 line.slot.N.*）
@@ -2931,6 +2933,8 @@ static void keychainSwap(NSInteger slot, BOOL addPrefix) {
         }
     }
     NSLog(@"[LineAccount] KC swap slot %ld addPrefix=%d changed=%d", (long)slot, addPrefix, changed);
+    la_flog([NSString stringWithFormat:@"[sw] KC %@ slot %ld changed=%d",
+             addPrefix ? @"drain(加前缀)" : @"fill(去前缀)", (long)slot, changed]);
 }
 
 static void drainKeychainToSlot(NSInteger slot)  { keychainSwap(slot, YES); }
@@ -3080,6 +3084,8 @@ static void drainPrefsToSlot(NSInteger slot) {
     }
     NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, %lu group域 共 %d keys)",
           (long)slot, nb, (unsigned long)domains.count, ng);
+    la_flog([NSString stringWithFormat:@"[sw] PREF drained→slot %ld: bundle %d键, %lu个group域共 %d键",
+             (long)slot, nb, (unsigned long)domains.count, ng]);
 }
 
 static void fillPrefsFromSlot(NSInteger slot) {
@@ -3093,6 +3099,8 @@ static void fillPrefsFromSlot(NSInteger slot) {
     }
     NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, %lu group域 共 %d keys)",
           (long)slot, nb, (unsigned long)domains.count, ng);
+    la_flog([NSString stringWithFormat:@"[sw] PREF filled slot %ld→Home: bundle %d键, %lu个group域共 %d键",
+             (long)slot, nb, (unsigned long)domains.count, ng]);
 }
 
 #pragma mark - Home 归属章（跟着数据走的 owner 标记，交叉校验 .current）
@@ -3222,12 +3230,14 @@ static void reconcileTargetAtBoot(void) {
     if (pending >= 1 && pending != owner) {
         NSLog(@"[LineAccount] 开机换号：Home(owner %ld) -> 目标 slot %ld（线程未起，安全搬运）",
               (long)owner, (long)pending);
+        la_flog([NSString stringWithFormat:@"[sw] 开机换号 owner=%ld -> slot=%ld（安全搬运）", (long)owner, (long)pending]);
         if (owner >= 1) drainHomeAllLayers(owner);   // 旧号三层搬回它的槽，Home 归零
         fillHomeAllLayers(pending);                  // 目标三层进 Home，current=stamp=pending
     } else {
         NSInteger cur = readCurrentSlot();
         if (owner >= 1 && cur != owner) writeCurrentSlot(owner);   // 认领：校正 .current
         NSLog(@"[LineAccount] 开机对账：Home owner = slot %ld，原样保留(会话完好)", (long)(owner >= 1 ? owner : 0));
+        la_flog([NSString stringWithFormat:@"[sw] 开机对账 owner=%ld pending=%ld → 原样保留(不搬)", (long)owner, (long)pending]);
     }
 }
 
@@ -3368,10 +3378,12 @@ static void enterAccountSlot(NSInteger slot) {
     NSInteger owner = readHomeOwnerStamp();
     if (owner < 1) owner = readCurrentSlot();
     if (owner >= 1 && owner != slot) {
+        la_flog([NSString stringWithFormat:@"[sw] 选号 slot=%ld，但 Home owner=%ld → 写 pending 重启换号", (long)slot, (long)owner]);
         writePending(slot);
         restartForAccountSwitch(slot);   // 弹提示 → exit(0)；不放行 LINE
         return;
     }
+    la_flog([NSString stringWithFormat:@"[sw] 选号 slot=%ld owner=%ld → 同号/全新，直接放行(不重启)", (long)slot, (long)owner]);
 
     g_selectedSlot = slot;   // Keychain 前缀 + NSUserDefaults suite 按此隔离
     la_setProxyActiveSlot(slot); // 代理槽与选中账号对齐
