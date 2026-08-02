@@ -5120,12 +5120,9 @@ static void line_account_init(void) {
                       encoding:NSUTF8StringEncoding error:nil];
 
     g_needPicker = YES;
-    // ★ 借鉴 LINE 原解法：开机即挡住 KakaoTalk 原生窗口(makeKeyAndVisible→hidden=YES)，
-    //   让「先闪当前登入账号页面」彻底消失——第一帧起只显示选择页；选完号 resumeLINELaunch
-    //   会置 NO + promoteMainWindowOnce 把真窗口显示回来。
-    //   注意：隐藏窗口不打断 Factory/DI(DI 在 didFinishLaunching 里照常注册)，也不触发
-    //   willResignActive(那是进后台才有)，故无当初「延迟建场景」方案的 fatalError 风险。
-    g_blockLINEUI = YES;
+    // ★ 回退遮挡：KakaoTalk 不隐藏原生窗口，选择页只作高层覆盖。
+    //   代价=启动会先闪一下当前账号再出选择页(纯观感)；数据隔离由偏好/keychain 层保证，不受影响。
+    g_blockLINEUI = NO;
     g_selectedSlot = -1;
     g_launchResumed = NO;
     g_launchDeferred = NO;
