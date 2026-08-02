@@ -4371,6 +4371,66 @@ static void installURLSessionRecon(void) {
     la_flog(@"[url] NSURLSession 侦察已装（记录每个请求 URL）");
 }
 
+// ★ KakaoTalk 全量 HTTP 代理：交换 NSURLSession 建会话方法，给 configuration 注入
+//   connectionProxyDictionary（HTTP+HTTPS，含账号密码）。因为 KakaoTalk 全走 NSURLSession/NW
+//   （含 talk-pilsner 的 LOCO 长连接），这样一次性把所有流量导向当前账号的代理出口。
+static LARemoteAccount *la_currentProxyAccount(void) {
+    NSInteger slot = (g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot;
+    if (slot < 1) return nil;
+    return accountForSlot(slot);
+}
+
+static void la_applyProxyToConfig(NSURLSessionConfiguration *cfg) {
+    if (!cfg) return;
+    if (la_proxyForceOff()) return;                 // .proxy_off 存在 → 纯直连
+    LARemoteAccount *acc = la_currentProxyAccount();
+    if (!acc || acc.proxyHost.length == 0 || acc.proxyPort.length == 0) return;
+    NSInteger port = acc.proxyPort.integerValue;
+    if (port <= 0) return;
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    // HTTP
+    d[@"HTTPEnable"] = @YES;
+    d[@"HTTPProxy"]  = acc.proxyHost;
+    d[@"HTTPPort"]   = @(port);
+    // HTTPS（含 talk-pilsner 聊天长连接）
+    d[@"HTTPSEnable"] = @YES;
+    d[@"HTTPSProxy"]  = acc.proxyHost;
+    d[@"HTTPSPort"]   = @(port);
+    // 认证（节点需要账号密码时）
+    if (acc.proxyUser.length) {
+        d[@"kCFProxyUsernameKey"] = acc.proxyUser;
+        d[@"kCFProxyPasswordKey"] = acc.proxyPass ?: @"";
+    }
+    cfg.connectionProxyDictionary = d;
+
+    if (g_connLogLeft > 0) {
+        g_connLogLeft--;
+        la_flog([NSString stringWithFormat:@"[proxy] 会话→代理 %@:%ld auth=%@ slot=%ld",
+                 acc.proxyHost, (long)port, acc.proxyUser.length ? @"1" : @"0",
+                 (long)((g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot)]);
+    }
+}
+
+static void installURLSessionProxyInjection(void) {
+    Class cls = [NSURLSession class];
+    { SEL sel = @selector(sessionWithConfiguration:);
+      Method m = class_getClassMethod(cls, sel);
+      if (m) { IMP o = method_getImplementation(m);
+        id b = ^id(id me, NSURLSessionConfiguration *cfg){
+            la_applyProxyToConfig(cfg);
+            return ((id(*)(id,SEL,id))o)(me, sel, cfg); };
+        method_setImplementation(m, imp_implementationWithBlock(b)); } }
+    { SEL sel = @selector(sessionWithConfiguration:delegate:delegateQueue:);
+      Method m = class_getClassMethod(cls, sel);
+      if (m) { IMP o = method_getImplementation(m);
+        id b = ^id(id me, NSURLSessionConfiguration *cfg, id del, id q){
+            la_applyProxyToConfig(cfg);
+            return ((id(*)(id,SEL,id,id,id))o)(me, sel, cfg, del, q); };
+        method_setImplementation(m, imp_implementationWithBlock(b)); } }
+    la_flog(@"[proxy] NSURLSession 全量 HTTP 代理注入已装");
+}
+
 // 方案 B：把 LINE 的 GOT 槽 NWConnection.init(to:using:) 改指向 Swift 替身。
 // 只改数据页（__got/__la_symbol_ptr），不写任何 __TEXT → iOS 26 不 CSM 崩。
 static BOOL install_nwconn_got_hook(void) {
@@ -4554,7 +4614,8 @@ static void line_account_init(void) {
     installRuntimeHooks();
     installKeychainHooks();
     installPerAccountProxyHooks();
-    installURLSessionRecon();   // ★ KakaoTalk：NSURLSession 层侦察，记录所有请求 URL
+    installURLSessionRecon();          // ★ KakaoTalk：NSURLSession 层侦察，记录所有请求 URL
+    installURLSessionProxyInjection(); // ★ KakaoTalk：全量 HTTP 代理注入（connectionProxyDictionary）
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
