@@ -2147,19 +2147,25 @@ static void laAppendLogLine(NSString *rec) {
     }
 }
 
-// 汇总当前所有日志文本；内存为空时回退读沙盒里的 proxy.log
+// 汇总日志文本。★ 优先读持久化的 proxy.log（跨重启存活），这样 KakaoTalk 迁移 forceQuit+relaunch
+//   后仍能看到上一次启动切号时的 [sw] 记录；内存缓冲只在磁盘读不到时兜底。
 static NSString *laRecentLogText(void) {
     NSMutableString *s = [NSMutableString string];
-    @synchronized([LALogViewController class]) {
-        for (NSString *l in g_laLogLines) [s appendString:l];
+    NSString *cpath = [slotsRootPath() stringByAppendingPathComponent:@"proxy.log"];
+    NSString *disk = [NSString stringWithContentsOfFile:cpath encoding:NSUTF8StringEncoding error:nil];
+    if (disk.length) {
+        // 只保留尾部 ~240KB，避免查看器卡（历史很长时看最近的即可）
+        const NSUInteger kMax = 240 * 1024;
+        if (disk.length > kMax) disk = [disk substringFromIndex:disk.length - kMax];
+        [s appendString:disk];
     }
     if (s.length == 0) {
-        NSString *cpath = [slotsRootPath() stringByAppendingPathComponent:@"proxy.log"];
-        NSString *disk = [NSString stringWithContentsOfFile:cpath encoding:NSUTF8StringEncoding error:nil];
-        if (disk.length) [s appendString:disk];
+        @synchronized([LALogViewController class]) {
+            for (NSString *l in g_laLogLines) [s appendString:l];
+        }
     }
     if (s.length == 0) {
-        [s appendString:@"（暂无日志）\n\n等 KakaoTalk 在后台联网 / 登录后，\n这里会实时出现 [connect] / [nwconn] 连接记录。\n点右上角「刷新」更新。\n"];
+        [s appendString:@"（暂无日志）\n\n等 KakaoTalk 在后台联网 / 登录后，\n这里会实时出现记录。\n点右上角「刷新」更新。\n"];
     }
     return s;
 }
@@ -4769,6 +4775,9 @@ static void line_account_init(void) {
     (void)realHomePath();
     mkdirp(slotsRootPath());
     (void)deviceClientUUID();
+
+    la_flog([NSString stringWithFormat:@"[boot] ===== 启动 pid=%d owner=%ld pending=%ld current=%ld =====",
+             getpid(), (long)readHomeOwnerStamp(), (long)readPending(), (long)readCurrentSlot()]);
 
     recoverSwapJournalIfAny();
     reconcileTargetAtBoot();
