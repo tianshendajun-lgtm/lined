@@ -5019,12 +5019,13 @@ static void la_boot_db_probe(void) {
         //   拿到域名后加进 remapAppID 改道 + drain/fill 列表即可（就是 LINE 治 mid 泄漏的原样做法）。
         {
             NSString *prefsDir = [realHomePath() stringByAppendingPathComponent:@"Library/Preferences"];
-            NSString *bidNow = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-            NSArray<NSString *> *grps = la_groupDomainsToSwap();
+            // ★ 判定改用真实搬运集 la_allHomeAppPrefDomains()(= 非 com.apple.* 全量)，
+            //   与 drain/fill 完全一致；否则会把已搬的域误标 ★未搬。
+            NSArray<NSString *> *covSet = la_allHomeAppPrefDomains();
             for (NSString *name in listChildrenPOSIX(prefsDir)) {
                 if (![name hasSuffix:@".plist"]) continue;
                 NSString *dom = [name substringToIndex:name.length - 6]; // 去 .plist
-                BOOL covered = [dom isEqualToString:bidNow] || [grps containsObject:dom];
+                BOOL covered = [covSet containsObject:dom];
                 struct stat st;
                 long long sz = (lstat([[prefsDir stringByAppendingPathComponent:name] fileSystemRepresentation], &st) == 0)
                                ? (long long)st.st_size : -1;
@@ -5080,7 +5081,12 @@ static void line_account_init(void) {
                       encoding:NSUTF8StringEncoding error:nil];
 
     g_needPicker = YES;
-    g_blockLINEUI = NO;   // ★ KakaoTalk：不隐藏原生窗口，选择页只作高层覆盖，避免打断场景/DI
+    // ★ 借鉴 LINE 原解法：开机即挡住 KakaoTalk 原生窗口(makeKeyAndVisible→hidden=YES)，
+    //   让「先闪当前登入账号页面」彻底消失——第一帧起只显示选择页；选完号 resumeLINELaunch
+    //   会置 NO + promoteMainWindowOnce 把真窗口显示回来。
+    //   注意：隐藏窗口不打断 Factory/DI(DI 在 didFinishLaunching 里照常注册)，也不触发
+    //   willResignActive(那是进后台才有)，故无当初「延迟建场景」方案的 fatalError 风险。
+    g_blockLINEUI = YES;
     g_selectedSlot = -1;
     g_launchResumed = NO;
     g_launchDeferred = NO;
