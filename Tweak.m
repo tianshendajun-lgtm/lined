@@ -3791,7 +3791,7 @@ static BOOL laNetQuiet(void) {
 }
 // 安静模式下是否应丢弃这行（高频网络类）。保留：[sw]/[boot]/[kc]、含“已装”的一次性横幅、代理错误行。
 static BOOL laShouldDropWhenQuiet(NSString *line) {
-    if ([line hasPrefix:@"[sw]"] || [line hasPrefix:@"[boot]"] || [line hasPrefix:@"[kc]"]) return NO;
+    if ([line hasPrefix:@"[sw]"] || [line hasPrefix:@"[boot]"] || [line hasPrefix:@"[kc]"] || [line hasPrefix:@"[dbg]"]) return NO;
     if ([line rangeOfString:@"已装"].location != NSNotFound) return NO;      // 一次性安装横幅
     if ([line rangeOfString:@"失败"].location != NSNotFound) return NO;      // 错误保留
     if ([line rangeOfString:@"连不上"].location != NSNotFound) return NO;    // 错误保留
@@ -4820,6 +4820,47 @@ static void _rebind_nw_proxy_for_image(const struct mach_header *header, intptr_
     rebind_nw_proxy_for_image(header, slide);
 }
 
+// 递归收集某目录下的所有 *.sqlite/*.db/*.store（诊断用，限深防卡）
+static void la_collect_sqlite(NSString *dir, NSMutableArray *out, int depth) {
+    if (depth > 6 || dir.length == 0 || out.count > 60) return;
+    for (NSString *name in listChildrenPOSIX(dir)) {
+        NSString *p = [dir stringByAppendingPathComponent:name];
+        if (posixIsDir(p)) { la_collect_sqlite(p, out, depth + 1); }
+        else if ([name hasSuffix:@".sqlite"] || [name hasSuffix:@".db"] || [name hasSuffix:@".store"]) {
+            struct stat st; long long sz = (lstat([p fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
+            [out addObject:[NSString stringWithFormat:@"%@(%lldB)", name, sz]];
+        }
+    }
+}
+
+// ★ 诊断：开机(reconcile 后)同时探测「Home 内 DB」与「真实 App Group 共享容器内残留 DB」，
+//   定位新号被污染/完整性校验失败的真正数据源。新号本应两处都干净；若真实共享容器有旧 DB，
+//   说明重定向没盖住它(扩展进程写的 / 某路径绕过 hook) → 那才是弹「完全关闭重启」的元凶。
+static void la_boot_db_probe(void) {
+    @autoreleasepool {
+        NSInteger owner = readHomeOwnerStamp();
+        NSMutableArray *homeDbs = [NSMutableArray array];
+        la_collect_sqlite([realHomePath() stringByAppendingPathComponent:@"Library"], homeDbs, 0);
+        la_collect_sqlite([realHomePath() stringByAppendingPathComponent:@"Documents"], homeDbs, 0);
+        la_flog([NSString stringWithFormat:@"[dbg] owner=%ld Home内DB(%lu): %@",
+                 (long)owner, (unsigned long)homeDbs.count,
+                 homeDbs.count ? [homeDbs componentsJoinedByString:@", "] : @"(空=干净)"]);
+        if (orig_containerURL) {
+            id fm = [NSFileManager defaultManager];
+            for (NSString *gid in la_groupDomainsToSwap()) {
+                if (![gid hasPrefix:@"group."]) continue;
+                NSURL *u = orig_containerURL(fm, @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
+                if (!u) continue;
+                NSMutableArray *gdbs = [NSMutableArray array];
+                la_collect_sqlite(u.path, gdbs, 0);
+                la_flog([NSString stringWithFormat:@"[dbg] 真实共享容器 %@ DB(%lu): %@",
+                         gid, (unsigned long)gdbs.count,
+                         gdbs.count ? [gdbs componentsJoinedByString:@", "] : @"(空)"]);
+            }
+        }
+    }
+}
+
 __attribute__((constructor))
 static void line_account_init(void) {
     (void)realHomePath();
@@ -4871,6 +4912,8 @@ static void line_account_init(void) {
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
     hookAppDelegate();
+
+    la_boot_db_probe();   // ★ 诊断：Home 内 DB vs 真实共享容器残留 DB，定位新号污染源
 
     // ★ 不在此处提前弹选择页：此刻场景/窗口尚未建立，绑不到 UIWindowScene 会黑屏。
     //   改由 hooked_didFinishLaunching / hooked_sceneWillConnect 在场景就绪后覆盖显示。
