@@ -3302,6 +3302,11 @@ static void eagerAdoptAtBoot(void) {
 //   - 若 pending!=owner：此刻没有任何账号被加载，安全地 drain 旧号 + fill 目标 → Home 成为目标账号。
 //   关键：LINE 真正运行时，Home 从启动那一刻就是完整、一致的目标账号 → 不会「无法正常处理」；
 //   且交换只发生在这里(无线程)→ 活线程绝不会把旧账号写回来污染。切不同账号靠「写 pending + 重启」。
+// ★ 换号后那次启动自动抓一次完整诊断([kc]+[dbg])的开关。平时安静(白名单)，
+//   只有刚执行过换号搬运的这次冷启动才置位 → 输出该次的 keychain 布局 + DB 分布，
+//   用来定位「新号为何仍被 KakaoTalk 强制重启」，且不会每次启动都刷屏。
+static BOOL g_diagCaptureBoot = NO;
+
 static void reconcileTargetAtBoot(void) {
     NSInteger owner = readHomeOwnerStamp();
     if (owner < 1) owner = readCurrentSlot();
@@ -3311,6 +3316,7 @@ static void reconcileTargetAtBoot(void) {
         NSLog(@"[LineAccount] 开机换号：Home(owner %ld) -> 目标 slot %ld（线程未起，安全搬运）",
               (long)owner, (long)pending);
         la_flog([NSString stringWithFormat:@"[sw] 开机换号 owner=%ld -> slot=%ld（安全搬运）", (long)owner, (long)pending]);
+        g_diagCaptureBoot = YES;   // ★ 这次是换号启动 → 抓一次完整诊断
         if (owner >= 1) drainHomeAllLayers(owner);   // 旧号三层搬回它的槽，Home 归零
         fillHomeAllLayers(pending);                  // 目标三层进 Home，current=stamp=pending
     } else {
@@ -3862,7 +3868,8 @@ static BOOL laShouldDropWhenQuiet(NSString *line) {
 
 static void la_flog(NSString *line) {
     if (!line) return;
-    if (laNetQuiet() && laShouldDropWhenQuiet(line)) return;   // ★ 静音：高频网络日志直接不写
+    // 换号那次启动(g_diagCaptureBoot)全量放行，便于抓 [kc]/[dbg]；平时按白名单静音。
+    if (!g_diagCaptureBoot && laNetQuiet() && laShouldDropWhenQuiet(line)) return;
     @autoreleasepool {
         NSString *rec = [NSString stringWithFormat:@"%.3f %@\n",
                          [[NSDate date] timeIntervalSince1970], line];
@@ -5013,7 +5020,7 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
-    if (!laNetQuiet()) la_dump_keychain_once();   // 诊断项：仅在建了 .netlog 的全量模式下才逐条 dump keychain
+    if (!laNetQuiet() || g_diagCaptureBoot) la_dump_keychain_once();   // 全量模式(.netlog)或换号启动才 dump keychain
     installPerAccountProxyHooks();
     installURLSessionRecon();          // ★ KakaoTalk：NSURLSession 层侦察，记录所有请求 URL
     installURLSessionProxyInjection(); // ★ KakaoTalk：全量 HTTP 代理注入（connectionProxyDictionary）
@@ -5022,7 +5029,7 @@ static void line_account_init(void) {
     installBGTaskCrashGuards();
     hookAppDelegate();
 
-    if (!laNetQuiet()) la_boot_db_probe();   // 诊断项：仅在建了 .netlog 的全量模式下才跑 DB 探针
+    if (!laNetQuiet() || g_diagCaptureBoot) la_boot_db_probe();   // 全量模式(.netlog)或换号启动才跑 DB 探针
 
     // ★ 不在此处提前弹选择页：此刻场景/窗口尚未建立，绑不到 UIWindowScene 会黑屏。
     //   改由 hooked_didFinishLaunching / hooked_sceneWillConnect 在场景就绪后覆盖显示。
