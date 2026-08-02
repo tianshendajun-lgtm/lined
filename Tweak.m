@@ -3207,7 +3207,9 @@ static void installWindowBlockHook(void) {
 }
 
 static void showAccountPicker(void) {
+    if (g_pickerShown) return;   // didFinishLaunching / scene:willConnect 可能都触发，只显示一次
     void (^present)(void) = ^{
+        if (g_pickerShown && pickerWindow && !pickerWindow.hidden) return;
         hideLINEWindows();
 
         UIWindowScene *scene = nil;
@@ -3303,38 +3305,32 @@ static void hooked_setDelegate(id self, SEL _cmd, id del) {
 }
 
 static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
-    // 需要选账号：暂缓 LINE 真正启动，只出选择页
-    if (g_needPicker && !g_launchResumed) {
-        g_blockLINEUI = YES;
-        g_launchDeferred = YES;
-        g_deferredDelegate = self;
-        g_deferredApp = app;
-        g_deferredOpts = opts;
-        showAccountPicker();
-        NSLog(@"[LineAccount] didFinishLaunching deferred until account selected");
-        return YES;
-    }
-
+    // ★ KakaoTalk：必须先让原生 didFinishLaunching 跑完（注册 Factory/DI 依赖），
+    //   否则场景 willResignActive 时 resolve 未注册依赖会触发 Swift fatalError（brk 1）。
+    //   启动完成后再把选择页作为高层覆盖窗口盖上去，不打断 KakaoTalk 生命周期。
+    BOOL r = YES;
     if (orig_didFinishLaunching) {
-        return ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(self, _cmd, app, opts);
+        r = ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(self, _cmd, app, opts);
     }
-    return YES;
+    if (g_needPicker && !g_launchResumed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_needPicker && !g_launchResumed) showAccountPicker();
+        });
+    }
+    return r;
 }
 
 static void hooked_sceneWillConnect(id self, SEL _cmd, UIScene *scene, UISceneSession *session, id opts) {
-    if (g_needPicker && !g_launchResumed) {
-        g_blockLINEUI = YES;
-        g_sceneDeferred = YES;
-        g_deferredSceneTarget = self;
-        g_deferredScene = scene;
-        g_deferredSceneSession = session;
-        g_deferredSceneOpts = opts;
-        showAccountPicker();
-        NSLog(@"[LineAccount] scene:willConnect deferred until account selected (%@)", [self class]);
-        return;
-    }
+    // ★ KakaoTalk：先让原生 scene:willConnect 跑完（建立窗口 + 场景内 DI），
+    //   再把选择页覆盖到同一场景上层。绝不再「挂起场景不建立」——那会让 KakaoTalk 的
+    //   _UISceneLifecycleMonitor 在 willResignActive 里 resolve 未初始化依赖而 fatalError。
     if (orig_sceneWillConnect) {
         ((void(*)(id,SEL,UIScene*,UISceneSession*,id))orig_sceneWillConnect)(self, _cmd, scene, session, opts);
+    }
+    if (g_needPicker && !g_launchResumed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_needPicker && !g_launchResumed) showAccountPicker();
+        });
     }
 }
 
@@ -4326,7 +4322,7 @@ static void line_account_init(void) {
                       encoding:NSUTF8StringEncoding error:nil];
 
     g_needPicker = YES;
-    g_blockLINEUI = YES;
+    g_blockLINEUI = NO;   // ★ KakaoTalk：不隐藏原生窗口，选择页只作高层覆盖，避免打断场景/DI
     g_selectedSlot = -1;
     g_launchResumed = NO;
     g_launchDeferred = NO;
@@ -4341,7 +4337,6 @@ static void line_account_init(void) {
     installBGTaskCrashGuards();
     hookAppDelegate();
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_needPicker && !g_launchResumed) showAccountPicker();
-    });
+    // ★ 不在此处提前弹选择页：此刻场景/窗口尚未建立，绑不到 UIWindowScene 会黑屏。
+    //   改由 hooked_didFinishLaunching / hooked_sceneWillConnect 在场景就绪后覆盖显示。
 }
