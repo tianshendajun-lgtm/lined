@@ -2,7 +2,7 @@ name: Build LineAccount.dylib
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, kakao]
   workflow_dispatch:
 
 jobs:
