@@ -3897,12 +3897,93 @@ static void la_pipe_one_way(int from, int to) {
     shutdown(to, SHUT_WR);
 }
 
+// ★ KakaoTalk：iOS 通过 connectionProxyDictionary 把请求发到本地中继，形式是标准 HTTP 代理协议：
+//    HTTPS → "CONNECT host:port"；HTTP → 绝对形式 "GET http://host/... "。
+//    中继解析出目标后，用与 LINE 相同的 la_http_connect_tunnel（CONNECT+Basic 认证）连上游代理。
+static void la_relay_handle_http_proxy_client(int clientFd) {
+    @autoreleasepool {
+        char buf[8192];
+        size_t filled = 0;
+        while (filled + 1 < sizeof(buf)) {
+            ssize_t n = recv(clientFd, buf + filled, sizeof(buf) - 1 - filled, 0);
+            if (n < 0) { if (errno == EINTR) continue; close(clientFd); return; }
+            if (n == 0) { close(clientFd); return; }
+            filled += (size_t)n;
+            buf[filled] = 0;
+            if (strstr(buf, "\r\n\r\n")) break;
+        }
+
+        // 当前账号的上游代理
+        NSInteger slot = (g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot;
+        NSString *pHost = nil, *pPort = nil, *pUser = nil, *pPass = nil;
+        @synchronized ([LARemoteAccount class]) {
+            LARemoteAccount *acc = accountForSlot(slot);
+            if (acc) { pHost = [acc.proxyHost copy]; pPort = [acc.proxyPort copy];
+                       pUser = [acc.proxyUser copy]; pPass = [acc.proxyPass copy]; }
+        }
+        if (pHost.length == 0 || pPort.length == 0) {
+            la_flog([NSString stringWithFormat:@"[proxy] slot=%ld 无代理→关连接", (long)slot]);
+            close(clientFd); return;
+        }
+        int upfd = la_tcp_connect_host(pHost.UTF8String, pPort.intValue, 12);
+        if (upfd < 0) {
+            la_flog([NSString stringWithFormat:@"[proxy] 上游连不上 %@:%@", pHost, pPort]);
+            close(clientFd); return;
+        }
+
+        if (strncmp(buf, "CONNECT ", 8) == 0) {
+            char host[300] = {0}; int port = 443;
+            if (sscanf(buf + 8, "%299[^: ]:%d", host, &port) < 1) { close(upfd); close(clientFd); return; }
+            int cret = la_http_connect_tunnel(upfd, host, (uint16_t)port, pUser, pPass);
+            if (cret != 0) {
+                la_flog([NSString stringWithFormat:@"[proxy] CONNECT 失败 %s:%d via %@ code=%d", host, port, pHost, cret]);
+                close(upfd); close(clientFd); return;
+            }
+            const char *ok = "HTTP/1.1 200 Connection established\r\n\r\n";
+            if (la_send_all(clientFd, ok, strlen(ok)) != 0) { close(upfd); close(clientFd); return; }
+            // 若 CONNECT 头后已带了数据（少见），先转给上游
+            char *hdrEnd = strstr(buf, "\r\n\r\n");
+            if (hdrEnd) { size_t hdrLen = (size_t)(hdrEnd - buf) + 4; if (filled > hdrLen) la_send_all(upfd, buf + hdrLen, filled - hdrLen); }
+            if (g_connLogLeft > 0) { g_connLogLeft--; la_flog([NSString stringWithFormat:@"[proxy] TUNNEL %s:%d via %@:%@ slot=%ld", host, port, pHost, pPort, (long)slot]); }
+        } else {
+            // 绝对形式 HTTP：把首行后插入 Proxy-Authorization，再原样转发已读到的头
+            char *eol = strstr(buf, "\r\n");
+            if (!eol) { close(upfd); close(clientFd); return; }
+            size_t lineLen = (size_t)(eol - buf) + 2;
+            NSMutableData *out = [NSMutableData dataWithBytes:buf length:lineLen];
+            if (pUser.length > 0) {
+                NSString *token = [NSString stringWithFormat:@"%@:%@", pUser, pPass ?: @""];
+                NSString *b64 = [[token dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+                NSString *h = [NSString stringWithFormat:@"Proxy-Authorization: Basic %@\r\n", b64];
+                [out appendData:[h dataUsingEncoding:NSUTF8StringEncoding]];
+            }
+            [out appendBytes:buf + lineLen length:filled - lineLen];
+            if (la_send_all(upfd, out.bytes, out.length) != 0) { close(upfd); close(clientFd); return; }
+            if (g_connLogLeft > 0) { g_connLogLeft--; la_flog([NSString stringWithFormat:@"[proxy] HTTP via %@:%@ slot=%ld", pHost, pPort, (long)slot]); }
+        }
+
+        struct timeval tv0 = {0, 0};
+        setsockopt(upfd, SOL_SOCKET, SO_SNDTIMEO, &tv0, sizeof(tv0));
+        setsockopt(upfd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+        setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv0, sizeof(tv0));
+        setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+
+        dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
+        dispatch_group_t g = dispatch_group_create();
+        dispatch_group_async(g, q, ^{ la_pipe_one_way(clientFd, upfd); });
+        dispatch_group_async(g, q, ^{ la_pipe_one_way(upfd, clientFd); });
+        dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+        close(clientFd);
+        close(upfd);
+    }
+}
+
 static void la_relay_handle_client(int clientFd) {
     @autoreleasepool {
         la_pending_dest_t dest;
         if (!la_pending_pop(&dest)) {
-            NSLog(@"[LineAccount][ProxyC] accept 但 pending 空");
-            close(clientFd);
+            // pending 空 = 不是 LINE 的透明重定向，而是 KakaoTalk 经 connectionProxyDictionary 发来的标准代理请求
+            la_relay_handle_http_proxy_client(clientFd);
             return;
         }
 
@@ -4383,33 +4464,39 @@ static LARemoteAccount *la_currentProxyAccount(void) {
 static void la_applyProxyToConfig(NSURLSessionConfiguration *cfg) {
     if (!cfg) return;
     if (la_proxyForceOff()) return;                 // .proxy_off 存在 → 纯直连
+    // ★ 尊重调用方已明确设置的代理：我们自己的配置拉取(fetchRemoteAccounts)用 @{} 表示「绝不走代理」，
+    //   绝不能覆盖，否则拉账号列表也被塞进代理 → 列表加载失败（先有鸡先有蛋）。
+    if (cfg.connectionProxyDictionary != nil) return;
     LARemoteAccount *acc = la_currentProxyAccount();
     if (!acc || acc.proxyHost.length == 0 || acc.proxyPort.length == 0) return;
-    NSInteger port = acc.proxyPort.integerValue;
-    if (port <= 0) return;
 
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
-    // HTTP
-    d[@"HTTPEnable"] = @YES;
-    d[@"HTTPProxy"]  = acc.proxyHost;
-    d[@"HTTPPort"]   = @(port);
-    // HTTPS（含 talk-pilsner 聊天长连接）
-    d[@"HTTPSEnable"] = @YES;
-    d[@"HTTPSProxy"]  = acc.proxyHost;
-    d[@"HTTPSPort"]   = @(port);
-    // 认证（节点需要账号密码时）
+
+    if (g_relay_port > 0) {
+        // ★ 首选：指向本地中继（127.0.0.1:relay），认证由中继用 CONNECT+Basic 带给上游——与 LINE 同路，认证一定生效。
+        d[@"HTTPEnable"]  = @YES; d[@"HTTPProxy"]  = @"127.0.0.1"; d[@"HTTPPort"]  = @(g_relay_port);
+        d[@"HTTPSEnable"] = @YES; d[@"HTTPSProxy"] = @"127.0.0.1"; d[@"HTTPSPort"] = @(g_relay_port);
+        cfg.connectionProxyDictionary = d;
+        if (g_connLogLeft > 0) { g_connLogLeft--;
+            la_flog([NSString stringWithFormat:@"[proxy] 会话→本地中继 127.0.0.1:%u（上游 %@:%@ 由中继认证）slot=%ld",
+                     (unsigned)g_relay_port, acc.proxyHost, acc.proxyPort,
+                     (long)((g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot)]); }
+        return;
+    }
+
+    // 退路：中继没起来，直连上游（iOS 自己带认证，可能不吃 407）
+    NSInteger port = acc.proxyPort.integerValue;
+    if (port <= 0) return;
+    d[@"HTTPEnable"]  = @YES; d[@"HTTPProxy"]  = acc.proxyHost; d[@"HTTPPort"]  = @(port);
+    d[@"HTTPSEnable"] = @YES; d[@"HTTPSProxy"] = acc.proxyHost; d[@"HTTPSPort"] = @(port);
     if (acc.proxyUser.length) {
         d[@"kCFProxyUsernameKey"] = acc.proxyUser;
         d[@"kCFProxyPasswordKey"] = acc.proxyPass ?: @"";
     }
     cfg.connectionProxyDictionary = d;
-
-    if (g_connLogLeft > 0) {
-        g_connLogLeft--;
-        la_flog([NSString stringWithFormat:@"[proxy] 会话→代理 %@:%ld auth=%@ slot=%ld",
-                 acc.proxyHost, (long)port, acc.proxyUser.length ? @"1" : @"0",
-                 (long)((g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot)]);
-    }
+    if (g_connLogLeft > 0) { g_connLogLeft--;
+        la_flog([NSString stringWithFormat:@"[proxy] 会话→直连上游 %@:%ld auth=%@（无中继退路）",
+                 acc.proxyHost, (long)port, acc.proxyUser.length ? @"1" : @"0"]); }
 }
 
 static void installURLSessionProxyInjection(void) {
