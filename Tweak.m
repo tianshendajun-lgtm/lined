@@ -2937,6 +2937,38 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
     return NO;
 }
 
+// 用 (klass, oldSvc, account="") 定位「纯 service 定位、空账号」的项(如 Kakao SSO 令牌
+// com.kakao.sdk.sso.key / com.kakao.sdk.sso.keychain.tokens)，把 service 改成 newSvc。
+// 这类项没有 account，按账号前缀改名(kcRenameAccount)命不中 → 必须改 service 才能按槽隔离。
+static BOOL kcRenameService(CFTypeRef klass, NSString *oldSvc, NSString *newSvc) {
+    if (oldSvc.length == 0 || newSvc.length == 0 || [oldSvc isEqualToString:newSvc]) return YES;
+    NSDictionary *query = @{
+        (__bridge id)kSecClass:              (__bridge id)klass,
+        (__bridge id)kSecAttrService:        oldSvc,
+        (__bridge id)kSecAttrAccount:        @"",   // 只命中空账号项，避免误伤同 service 下带账号的项
+        (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
+    };
+    NSDictionary *attrs = @{ (__bridge id)kSecAttrService: newSvc };
+    SecItemUpdate_t up = kcUpdate();
+    if (!up) return NO;
+    OSStatus st = up((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)attrs);
+    if (st == errSecSuccess || st == errSecItemNotFound) return YES;
+    if (st == errSecDuplicateItem) {
+        NSDictionary *delT = @{
+            (__bridge id)kSecClass:              (__bridge id)klass,
+            (__bridge id)kSecAttrService:        newSvc,
+            (__bridge id)kSecAttrAccount:        @"",
+            (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
+        };
+        SecItemDelete_t del = kcDelete();
+        if (del) del((__bridge CFDictionaryRef)delT);
+        OSStatus st2 = up((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)attrs);
+        return (st2 == errSecSuccess || st2 == errSecItemNotFound);
+    }
+    NSLog(@"[LineAccount] KC svc rename FAIL st=%d %@ -> %@", (int)st, oldSvc, newSvc);
+    return NO;
+}
+
 static void keychainSwap(NSInteger slot, BOOL addPrefix) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
     NSString *prefix = slotKeyPrefix(slot);   // line.slot.N.
@@ -2949,11 +2981,27 @@ static void keychainSwap(NSInteger slot, BOOL addPrefix) {
             id svceObj = it[(__bridge id)kSecAttrService];
             NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
             NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
-            if (acct.length == 0) continue;   // 只处理有 account 的项
 
             // ★ 我们自己的记账项(如 LineAccount.DeviceId=设备 UUID)不是 LINE 的登录凭证，
             //   绝不能参与按槽搬家/改名，否则会被搬进旧槽找不回 → 每次切槽 UUID 都变。
             if (svce.length > 0 && [svce hasPrefix:@"LineAccount."]) continue;
+
+            // ★★ 空账号项(纯 service 定位)：如 Kakao 账号 SDK 的单点登录令牌
+            //   com.kakao.sdk.sso.key / com.kakao.sdk.sso.keychain.tokens(base64)。
+            //   它们没有 account，按账号前缀改名命不中 → 之前被 `continue` 整个跳过 →
+            //   永不随号搬 → 谁最后登录 SSO 就一直是谁的 → 任何号(含全新空号)一读 SSO 就串成那个号。
+            //   解法：对空账号项改用「service 前缀」来 drain/fill，实现按槽隔离。
+            if (acct.length == 0) {
+                if (svce.length == 0) continue;
+                if (addPrefix) {
+                    if ([svce hasPrefix:@"line.slot."]) continue;   // 已停放(带任意槽前缀)
+                    if (kcRenameService(klass, svce, [prefix stringByAppendingString:svce])) changed++;
+                } else {
+                    if (![svce hasPrefix:prefix]) continue;          // 只搬本槽的
+                    if (kcRenameService(klass, svce, [svce substringFromIndex:prefix.length])) changed++;
+                }
+                continue;
+            }
 
             if (addPrefix) {
                 if (kcHasAnySlotPrefix(acct)) continue;         // 已带任意槽前缀 → 不是激活项，跳过
@@ -3309,12 +3357,15 @@ static void wipeSlotKeychain(NSInteger slot) {
             id svceObj = it[(__bridge id)kSecAttrService];
             NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
             NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
-            if (![acct hasPrefix:prefix]) continue;
+            // 本槽停放项：account 带前缀(常规项) 或 service 带前缀(空账号 SSO 项)
+            BOOL acctMatch = [acct hasPrefix:prefix];
+            BOOL svcMatch  = (acct.length == 0 && [svce hasPrefix:prefix]);
+            if (!acctMatch && !svcMatch) continue;
             NSMutableDictionary *q = [@{
                 (__bridge id)kSecClass:              (__bridge id)classes[ci],
-                (__bridge id)kSecAttrAccount:        acct,
                 (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
             } mutableCopy];
+            if (acct != nil) q[(__bridge id)kSecAttrAccount] = acct;
             if (svce.length > 0) q[(__bridge id)kSecAttrService] = svce;
             del((__bridge CFDictionaryRef)q);
         }
@@ -3332,14 +3383,18 @@ static void wipeActiveKeychain(void) {
             id svceObj = it[(__bridge id)kSecAttrService];
             NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
             NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
-            if (acct.length == 0) continue;
-            if ([acct hasPrefix:@"line.slot."]) continue;                       // 其他槽停放的，不动
             if (svce.length > 0 && [svce hasPrefix:@"LineAccount."]) continue;  // DeviceId 等自家项，保留
+            if (acct.length == 0) {
+                // 空账号项(Kakao SSO 令牌等)：激活态删除=SSO 登出；带槽前缀的是别的槽停放的，不动。
+                if (svce.length == 0 || [svce hasPrefix:@"line.slot."]) continue;
+            } else {
+                if ([acct hasPrefix:@"line.slot."]) continue;                   // 其他槽停放的，不动
+            }
             NSMutableDictionary *q = [@{
                 (__bridge id)kSecClass:              (__bridge id)classes[ci],
-                (__bridge id)kSecAttrAccount:        acct,
                 (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
             } mutableCopy];
+            if (acct != nil) q[(__bridge id)kSecAttrAccount] = acct;
             if (svce.length > 0) q[(__bridge id)kSecAttrService] = svce;
             del((__bridge CFDictionaryRef)q);
         }
