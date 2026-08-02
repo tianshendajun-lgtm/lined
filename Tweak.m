@@ -34,6 +34,8 @@
 
 // 前置声明：屏上日志（定义在文件后半段，诊断代码需提前用）
 static void la_flog(NSString *line);
+// 前置声明：App Group 偏好域登记（hooked_containerURL 定义在前，实现在后）
+static void la_recordAppGroup(NSString *gid);
 
 #define ACCOUNT_COUNT 100000
 #define SLOT_DIR_NAME @"LineAccountSlots"
@@ -651,7 +653,8 @@ static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
     if (groupId.length == 0) {
         return orig_containerURL ? orig_containerURL(self, _cmd, groupId) : nil;
     }
-    // 诊断：记录 App 请求的 App Group id（KakaoTalk 的 group 用于精确隔离偏好域）
+    // 登记 App 实际用到的每个 App Group，供偏好域按槽搬运（KakaoTalk 的 group 偏好域隔离靠这个）
+    la_recordAppGroup(groupId);
     static int g_grpLogLeft = 30;
     if (g_grpLogLeft > 0) { g_grpLogLeft--; la_flog([NSString stringWithFormat:@"[grp] containerURL group=%@", groupId]); }
     // ★ 必须放在 Library/ 下：容器根目录 <UUID>/ 禁止新建顶层目录(EPERM)，
@@ -2144,19 +2147,25 @@ static void laAppendLogLine(NSString *rec) {
     }
 }
 
-// 汇总当前所有日志文本；内存为空时回退读沙盒里的 proxy.log
+// 汇总日志文本。★ 优先读持久化的 proxy.log（跨重启存活），这样 KakaoTalk 迁移 forceQuit+relaunch
+//   后仍能看到上一次启动切号时的 [sw] 记录；内存缓冲只在磁盘读不到时兜底。
 static NSString *laRecentLogText(void) {
     NSMutableString *s = [NSMutableString string];
-    @synchronized([LALogViewController class]) {
-        for (NSString *l in g_laLogLines) [s appendString:l];
+    NSString *cpath = [slotsRootPath() stringByAppendingPathComponent:@"proxy.log"];
+    NSString *disk = [NSString stringWithContentsOfFile:cpath encoding:NSUTF8StringEncoding error:nil];
+    if (disk.length) {
+        // 只保留尾部 ~240KB，避免查看器卡（历史很长时看最近的即可）
+        const NSUInteger kMax = 240 * 1024;
+        if (disk.length > kMax) disk = [disk substringFromIndex:disk.length - kMax];
+        [s appendString:disk];
     }
     if (s.length == 0) {
-        NSString *cpath = [slotsRootPath() stringByAppendingPathComponent:@"proxy.log"];
-        NSString *disk = [NSString stringWithContentsOfFile:cpath encoding:NSUTF8StringEncoding error:nil];
-        if (disk.length) [s appendString:disk];
+        @synchronized([LALogViewController class]) {
+            for (NSString *l in g_laLogLines) [s appendString:l];
+        }
     }
     if (s.length == 0) {
-        [s appendString:@"（暂无日志）\n\n等 KakaoTalk 在后台联网 / 登录后，\n这里会实时出现 [connect] / [nwconn] 连接记录。\n点右上角「刷新」更新。\n"];
+        [s appendString:@"（暂无日志）\n\n等 KakaoTalk 在后台联网 / 登录后，\n这里会实时出现记录。\n点右上角「刷新」更新。\n"];
     }
     return s;
 }
@@ -2179,6 +2188,7 @@ static NSString *laRecentLogText(void) {
     UIButton *close   = [self barButton:@"关闭"   sel:@selector(onClose)];
     UIButton *refresh = [self barButton:@"刷新"   sel:@selector(reload)];
     UIButton *copy    = [self barButton:@"复制全部" sel:@selector(onCopy)];
+    UIButton *clear   = [self barButton:@"清空"   sel:@selector(onClear)];
     UILabel  *title   = [[UILabel alloc] init];
     title.text = @"代理连接日志";
     title.textColor = UIColor.whiteColor;
@@ -2196,6 +2206,8 @@ static NSString *laRecentLogText(void) {
         [refresh.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
         [copy.trailingAnchor constraintEqualToAnchor:refresh.leadingAnchor constant:-10],
         [copy.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+        [clear.trailingAnchor constraintEqualToAnchor:copy.leadingAnchor constant:-10],
+        [clear.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
 
         [tv.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:10],
         [tv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:8],
@@ -2227,6 +2239,21 @@ static NSString *laRecentLogText(void) {
 }
 
 - (void)onClose { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)onClear {
+    UIAlertController *c = [UIAlertController alertControllerWithTitle:@"清空日志？"
+        message:@"清除屏上缓冲与持久化 proxy.log 的全部记录（不影响账号数据）"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [c addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [c addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        @synchronized([LALogViewController class]) { [g_laLogLines removeAllObjects]; }
+        // 用 POSIX 直删，绕开被 hook 的 NSFileManager；proxy.log 在 slots 根(不参与搬运)
+        removePathPOSIX([slotsRootPath() stringByAppendingPathComponent:@"proxy.log"]);
+        [self reload];
+    }]];
+    [self presentViewController:c animated:YES completion:nil];
+}
 
 - (void)onCopy {
     UIPasteboard.generalPasteboard.string = self.tv.text ?: @"";
@@ -2681,6 +2708,7 @@ static NSArray<NSString *> *swapRelItemsUnder(NSString *base) {
     ]];
     for (NSString *name in listChildrenPOSIX(base)) {
         if ([skipTop containsObject:name]) continue;
+        if ([name hasPrefix:@".gp."]) continue;   // ★ 按域存的 group 偏好文件(槽内元数据)，绝不进文件交换集
         [items addObject:name];
     }
     NSSet *skipLib = [NSSet setWithArray:@[@"LineSlots", @"Preferences"]];
@@ -2795,6 +2823,7 @@ static void drainHomeToSlot(NSInteger slot) {
         moveOne(homeRel(rel), slotRel(slot, rel));
     }
     NSLog(@"[LineAccount] SWAP drained Home -> slot %ld (%lu items)", (long)slot, (unsigned long)items.count);
+    la_flog([NSString stringWithFormat:@"[sw] 文件 drained Home→slot %ld (%lu项)", (long)slot, (unsigned long)items.count]);
 }
 // 把 slot 里的账号数据搬回 Home（幂等，可重复执行）。枚举槽内现有内容为准。
 static void fillHomeFromSlot(NSInteger slot) {
@@ -2807,6 +2836,7 @@ static void fillHomeFromSlot(NSInteger slot) {
     mkdirp(homeRel(@"Library/Application Support"));
     mkdirp(homeRel(@"Documents"));
     NSLog(@"[LineAccount] SWAP filled slot %ld -> Home (%lu items)", (long)slot, (unsigned long)items.count);
+    la_flog([NSString stringWithFormat:@"[sw] 文件 filled slot %ld→Home (%lu项)", (long)slot, (unsigned long)items.count]);
 }
 
 #pragma mark - Keychain 交换（激活槽用原生无前缀凭证；非激活槽存 line.slot.N.*）
@@ -2863,8 +2893,10 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
         //   LINE 的 cte-<mid>(频道令牌)/部分 e2ee 是可同步的 → 匹配不到 → errSecItemNotFound
         //   被当成功 → 实际没搬走，残留在 Home → 下个账号带着它登录 → 看得到别人的群/聊天。
         (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
-        // ★ 同样避免 ACL 条目在切号搬运时弹授权框/阻塞
-        (__bridge id)kSecUseAuthenticationUI: (__bridge id)kSecUseAuthenticationUISkip,
+        // ★ 注意：kSecUseAuthenticationUISkip 只对 SecItemCopyMatching 合法；放进 SecItemUpdate/Delete
+        //   查询会导致 errSecParam(-50) → 改名全失败 changed=0 → Keychain 整个不按账号搬 → 令牌/设备ID
+        //   永远停在同一账号 → 切号后 DB(账号B)配令牌(账号A)不一致 → KakaoTalk 触发迁移弹「完全关闭重启」。
+        //   故这里【绝不能】加 UISkip（枚举 kcAllItems 里加才是对的）。
     } mutableCopy];
     if (svce.length > 0) query[(__bridge id)kSecAttrService] = svce;
 
@@ -2882,7 +2914,7 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
             (__bridge id)kSecClass:               (__bridge id)klass,
             (__bridge id)kSecAttrAccount:         newAcct,
             (__bridge id)kSecAttrSynchronizable:  (__bridge id)kSecAttrSynchronizableAny,
-            (__bridge id)kSecUseAuthenticationUI: (__bridge id)kSecUseAuthenticationUISkip,
+            // ★ 同理：Delete 查询不能带 UISkip（只对 Copy 合法），否则 errSecParam。
         } mutableCopy];
         if (svce.length > 0) delTarget[(__bridge id)kSecAttrService] = svce;
         SecItemDelete_t del = kcDelete();
@@ -2896,6 +2928,12 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
         return NO;
     }
     NSLog(@"[LineAccount] KC rename FAIL st=%d acct=%@ -> %@ svce=%@", (int)st, oldAcct, newAcct, svce);
+    // 把确切错误码打到屏上日志：-50=参数错(多为查询里混入非法键)，-34018=缺权限，-25308=需交互被拒。
+    static int s_kcFailLogged = 0;
+    if (s_kcFailLogged < 6) {   // 只记前几条，避免刷屏
+        s_kcFailLogged++;
+        la_flog([NSString stringWithFormat:@"[kc] rename FAIL st=%d acct=%@→%@", (int)st, oldAcct, newAcct]);
+    }
     return NO;
 }
 
@@ -2927,6 +2965,8 @@ static void keychainSwap(NSInteger slot, BOOL addPrefix) {
         }
     }
     NSLog(@"[LineAccount] KC swap slot %ld addPrefix=%d changed=%d", (long)slot, addPrefix, changed);
+    la_flog([NSString stringWithFormat:@"[sw] KC %@ slot %ld changed=%d",
+             addPrefix ? @"drain(加前缀)" : @"fill(去前缀)", (long)slot, changed]);
 }
 
 static void drainKeychainToSlot(NSInteger slot)  { keychainSwap(slot, YES); }
@@ -2974,6 +3014,44 @@ static NSString *slotGroupPrefsPath(NSInteger slot) {   // App Group 域(group.c
 //   既不在文件交换集、也不是 bundle 域 → v10 之前从没被交换 → 永远停在「最后登录的账号」。
 //   于是回到另一账号时：凭证=A、group域身份=B → 服务端拒连 → 「网络连接发生错误 / 无法正常处理」。
 #define LINE_GROUP_ID CFSTR("group.com.linecorp.line")
+
+// ★ App Group 偏好域登记表：hooked_containerURL 把 App 实际用到的每个 group id 记这里，
+//   存 slots 根(不参与文件搬运、跨账号切换存活)。偏好搬运时对所有 group 域逐个 drain/fill，
+//   从而对 KakaoTalk 的 group.com.iwilab.KakaoTalk[.<team>] 及任何 App 的 group 自动隔离。
+static NSString *la_appGroupsRegistryPath(void) { return swapStatePath(@".appgroups.plist"); }
+static NSArray<NSString *> *la_recordedAppGroups(void) {
+    NSArray *a = [NSArray arrayWithContentsOfFile:la_appGroupsRegistryPath()];
+    return [a isKindOfClass:[NSArray class]] ? a : @[];
+}
+static void la_recordAppGroup(NSString *gid) {
+    if (gid.length == 0) return;
+    static NSLock *lock; static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    [lock lock];
+    NSMutableArray *a = [la_recordedAppGroups() mutableCopy];
+    if (![a containsObject:gid]) { [a addObject:gid]; [a writeToFile:la_appGroupsRegistryPath() atomically:YES]; }
+    [lock unlock];
+}
+// 需要按槽搬运的所有 App Group 偏好域 = LINE 默认 ∪ 从 bundleId 派生(含/不含 team 后缀) ∪ 运行时登记表。
+// 从 bundleId 派生可覆盖首次启动(登记表还空)且不惧重签换 team：
+//   com.iwilab.KakaoTalk.9YV3UM7J6Z → group.com.iwilab.KakaoTalk.9YV3UM7J6Z + group.com.iwilab.KakaoTalk
+static NSArray<NSString *> *la_groupDomainsToSwap(void) {
+    NSMutableOrderedSet<NSString *> *s = [NSMutableOrderedSet orderedSet];
+    [s addObject:@"group.com.linecorp.line"];
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (bid.length) {
+        [s addObject:[@"group." stringByAppendingString:bid]];
+        NSString *base = [bid stringByDeletingPathExtension];   // 去掉最后一段(重签 team 后缀)
+        if (base.length && ![base isEqualToString:bid]) [s addObject:[@"group." stringByAppendingString:base]];
+    }
+    for (NSString *g in la_recordedAppGroups()) if (g.length) [s addObject:g];
+    return [s array];
+}
+// 每个 group 域在槽内的存储文件（按域名生成，互不覆盖；文件名以 .gp. 打头，swapRelItemsUnder 会跳过）
+static NSString *slotGroupPrefsPathForDomain(NSInteger slot, NSString *domain) {
+    return [slotHomePath(slot) stringByAppendingPathComponent:
+            [NSString stringWithFormat:@".gp.%@.plist", domain]];
+}
 
 // 通用：把某个偏好域整体「读出→存文件→从该域清空」
 static int drainDomainToPath(CFStringRef app, NSString *path) {
@@ -3031,8 +3109,15 @@ static void drainPrefsToSlot(NSInteger slot) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     int nb = 0, ng = 0;
     if (bid.length) nb = drainDomainToPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    ng = drainDomainToPath(LINE_GROUP_ID, slotGroupPrefsPath(slot));   // ★ group 域
-    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, group %d keys)", (long)slot, nb, ng);
+    // ★ 所有 App Group 偏好域逐个搬（KakaoTalk 的 group.com.iwilab.KakaoTalk[.team] 身份就在这里）
+    NSArray<NSString *> *domains = la_groupDomainsToSwap();
+    for (NSString *d in domains) {
+        ng += drainDomainToPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    }
+    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, %lu group域 共 %d keys)",
+          (long)slot, nb, (unsigned long)domains.count, ng);
+    la_flog([NSString stringWithFormat:@"[sw] PREF drained→slot %ld: bundle %d键, %lu个group域共 %d键",
+             (long)slot, nb, (unsigned long)domains.count, ng]);
 }
 
 static void fillPrefsFromSlot(NSInteger slot) {
@@ -3040,8 +3125,14 @@ static void fillPrefsFromSlot(NSInteger slot) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     int nb = 0, ng = 0;
     if (bid.length) nb = fillDomainFromPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    ng = fillDomainFromPath(LINE_GROUP_ID, slotGroupPrefsPath(slot));  // ★ group 域
-    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, group %d keys)", (long)slot, nb, ng);
+    NSArray<NSString *> *domains = la_groupDomainsToSwap();
+    for (NSString *d in domains) {
+        ng += fillDomainFromPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    }
+    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, %lu group域 共 %d keys)",
+          (long)slot, nb, (unsigned long)domains.count, ng);
+    la_flog([NSString stringWithFormat:@"[sw] PREF filled slot %ld→Home: bundle %d键, %lu个group域共 %d键",
+             (long)slot, nb, (unsigned long)domains.count, ng]);
 }
 
 #pragma mark - Home 归属章（跟着数据走的 owner 标记，交叉校验 .current）
@@ -3171,12 +3262,14 @@ static void reconcileTargetAtBoot(void) {
     if (pending >= 1 && pending != owner) {
         NSLog(@"[LineAccount] 开机换号：Home(owner %ld) -> 目标 slot %ld（线程未起，安全搬运）",
               (long)owner, (long)pending);
+        la_flog([NSString stringWithFormat:@"[sw] 开机换号 owner=%ld -> slot=%ld（安全搬运）", (long)owner, (long)pending]);
         if (owner >= 1) drainHomeAllLayers(owner);   // 旧号三层搬回它的槽，Home 归零
         fillHomeAllLayers(pending);                  // 目标三层进 Home，current=stamp=pending
     } else {
         NSInteger cur = readCurrentSlot();
         if (owner >= 1 && cur != owner) writeCurrentSlot(owner);   // 认领：校正 .current
         NSLog(@"[LineAccount] 开机对账：Home owner = slot %ld，原样保留(会话完好)", (long)(owner >= 1 ? owner : 0));
+        la_flog([NSString stringWithFormat:@"[sw] 开机对账 owner=%ld pending=%ld → 原样保留(不搬)", (long)owner, (long)pending]);
     }
 }
 
@@ -3281,7 +3374,7 @@ static void clearAccountSlot(NSInteger slot) {
         wipeActiveKeychain();
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         if (bid.length) clearPrefDomain((__bridge CFStringRef)bid);
-        clearPrefDomain(LINE_GROUP_ID);
+        for (NSString *d in la_groupDomainsToSwap()) clearPrefDomain((__bridge CFStringRef)d);
         writeCurrentSlot(0);
     }
 
@@ -3289,7 +3382,9 @@ static void clearAccountSlot(NSInteger slot) {
     removePathPOSIX(slotHomePath(slot));         // ① 文件（含 .used/归属章等）
     wipeSlotKeychain(slot);                       // ② keychain line.slot.<slot>.*
     removePathPOSIX(slotPrefsPath(slot));         // ③ 偏好（bundle 域）
-    removePathPOSIX(slotGroupPrefsPath(slot));    // ③ 偏好（group 域）
+    for (NSString *d in la_groupDomainsToSwap())  // ③ 偏好（所有 group 域）
+        removePathPOSIX(slotGroupPrefsPathForDomain(slot, d));
+    removePathPOSIX(slotGroupPrefsPath(slot));    // 兼容旧版单文件
 
     NSLog(@"[LineAccount] 已清空账号 slot %ld（activeInHome=%d）", (long)slot, activeInHome);
 }
@@ -3315,10 +3410,12 @@ static void enterAccountSlot(NSInteger slot) {
     NSInteger owner = readHomeOwnerStamp();
     if (owner < 1) owner = readCurrentSlot();
     if (owner >= 1 && owner != slot) {
+        la_flog([NSString stringWithFormat:@"[sw] 选号 slot=%ld，但 Home owner=%ld → 写 pending 重启换号", (long)slot, (long)owner]);
         writePending(slot);
         restartForAccountSwitch(slot);   // 弹提示 → exit(0)；不放行 LINE
         return;
     }
+    la_flog([NSString stringWithFormat:@"[sw] 选号 slot=%ld owner=%ld → 同号/全新，直接放行(不重启)", (long)slot, (long)owner]);
 
     g_selectedSlot = slot;   // Keychain 前缀 + NSUserDefaults suite 按此隔离
     la_setProxyActiveSlot(slot); // 代理槽与选中账号对齐
@@ -3410,7 +3507,10 @@ static void showAccountPicker(void) {
             if (!pickerWindow) {
                 pickerWindow = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
             }
-            pickerWindow.windowLevel = UIWindowLevelStatusBar + 200;
+            // ★ 必须高于 UIWindowLevelAlert(2000)：否则 KakaoTalk 自己的「完全关闭并重启」系统弹框
+            //   (在 Alert 级) 会盖住选择页 + 日志按钮，用户点不了 → 死锁。抬到 Alert+1000 稳压其上。
+            //   我们自己的二次确认/账号详情弹框由 picker VC present，落在本窗口内，不受影响。
+            pickerWindow.windowLevel = UIWindowLevelAlert + 1000;
             pickerWindow.backgroundColor = [UIColor colorWithRed:0.06 green:0.72 blue:0.35 alpha:1.0];
             pickerWindow.rootViewController = [LineAccountPickerController new];
         }
@@ -3679,8 +3779,32 @@ static BOOL la_append_file(const char *path, const char *bytes, size_t len) {
     return YES;
 }
 
+// 网络日志静音总开关：YES=只留切号诊断([sw]/[boot]/[kc])与一次性横幅/错误，丢弃高频网络行。
+// 想临时看网络流量：把 slotsRoot/.netlog 文件建出来即可（下方 laNetQuiet 读它）。
+static BOOL laNetQuiet(void) {
+    static int cached = -1;   // -1 未定；每次进程启动读一次标志文件
+    if (cached < 0) {
+        NSString *p = [slotsRootPath() stringByAppendingPathComponent:@".netlog"];
+        cached = [[NSFileManager defaultManager] fileExistsAtPath:p] ? 0 : 1; // 有 .netlog=不安静
+    }
+    return cached == 1;
+}
+// 安静模式下是否应丢弃这行（高频网络类）。保留：[sw]/[boot]/[kc]、含“已装”的一次性横幅、代理错误行。
+static BOOL laShouldDropWhenQuiet(NSString *line) {
+    if ([line hasPrefix:@"[sw]"] || [line hasPrefix:@"[boot]"] || [line hasPrefix:@"[kc]"] || [line hasPrefix:@"[dbg]"]) return NO;
+    if ([line rangeOfString:@"已装"].location != NSNotFound) return NO;      // 一次性安装横幅
+    if ([line rangeOfString:@"失败"].location != NSNotFound) return NO;      // 错误保留
+    if ([line rangeOfString:@"连不上"].location != NSNotFound) return NO;    // 错误保留
+    if ([line rangeOfString:@"无代理"].location != NSNotFound) return NO;    // 异常保留
+    if ([line hasPrefix:@"[url]"]  || [line hasPrefix:@"[grp]"] ||
+        [line hasPrefix:@"[dns]"]  || [line hasPrefix:@"[connect]"] ||
+        [line hasPrefix:@"[proxy]"]) return YES;                            // 高频网络行 → 丢
+    return NO;
+}
+
 static void la_flog(NSString *line) {
     if (!line) return;
+    if (laNetQuiet() && laShouldDropWhenQuiet(line)) return;   // ★ 静音：高频网络日志直接不写
     @autoreleasepool {
         NSString *rec = [NSString stringWithFormat:@"%.3f %@\n",
                          [[NSDate date] timeIntervalSince1970], line];
@@ -4696,11 +4820,81 @@ static void _rebind_nw_proxy_for_image(const struct mach_header *header, intptr_
     rebind_nw_proxy_for_image(header, slide);
 }
 
+// 递归收集某目录下的所有 *.sqlite/*.db/*.store（诊断用，限深防卡）
+static void la_collect_sqlite(NSString *dir, NSMutableArray *out, int depth) {
+    if (depth > 6 || dir.length == 0 || out.count > 60) return;
+    for (NSString *name in listChildrenPOSIX(dir)) {
+        NSString *p = [dir stringByAppendingPathComponent:name];
+        if (posixIsDir(p)) { la_collect_sqlite(p, out, depth + 1); }
+        else if ([name hasSuffix:@".sqlite"] || [name hasSuffix:@".db"] || [name hasSuffix:@".store"]) {
+            struct stat st; long long sz = (lstat([p fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
+            [out addObject:[NSString stringWithFormat:@"%@(%lldB)", name, sz]];
+        }
+    }
+}
+
+// ★ 诊断：开机(reconcile 后)同时探测「Home 内 DB」与「真实 App Group 共享容器内残留 DB」，
+//   定位新号被污染/完整性校验失败的真正数据源。新号本应两处都干净；若真实共享容器有旧 DB，
+//   说明重定向没盖住它(扩展进程写的 / 某路径绕过 hook) → 那才是弹「完全关闭重启」的元凶。
+static void la_boot_db_probe(void) {
+    @autoreleasepool {
+        NSInteger owner = readHomeOwnerStamp();
+        NSMutableArray *homeDbs = [NSMutableArray array];
+        la_collect_sqlite([realHomePath() stringByAppendingPathComponent:@"Library"], homeDbs, 0);
+        la_collect_sqlite([realHomePath() stringByAppendingPathComponent:@"Documents"], homeDbs, 0);
+        la_flog([NSString stringWithFormat:@"[dbg] owner=%ld Home内DB(%lu): %@",
+                 (long)owner, (unsigned long)homeDbs.count,
+                 homeDbs.count ? [homeDbs componentsJoinedByString:@", "] : @"(空=干净)"]);
+        if (orig_containerURL) {
+            id fm = [NSFileManager defaultManager];
+            for (NSString *gid in la_groupDomainsToSwap()) {
+                if (![gid hasPrefix:@"group."]) continue;
+                NSURL *u = orig_containerURL(fm, @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
+                if (!u) continue;
+                NSMutableArray *gdbs = [NSMutableArray array];
+                la_collect_sqlite(u.path, gdbs, 0);
+                la_flog([NSString stringWithFormat:@"[dbg] 真实共享容器 %@ DB(%lu): %@",
+                         gid, (unsigned long)gdbs.count,
+                         gdbs.count ? [gdbs componentsJoinedByString:@", "] : @"(空)"]);
+            }
+        }
+        // ★ 迁移版本探针：把 bundle 域 + 各 group 域里所有含 igration/ersion/nstalled 的键值打出来。
+        //   若切号后这些值与 DB 实际版本不符 → KakaoTalk 触发迁移 → 弹「完全关闭重启」。
+        NSMutableArray<NSString *> *probeDomains = [NSMutableArray array];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if (bid.length) [probeDomains addObject:bid];
+        [probeDomains addObjectsFromArray:la_groupDomainsToSwap()];
+        for (NSString *dom in probeDomains) {
+            CFArrayRef keys = CFPreferencesCopyKeyList((__bridge CFStringRef)dom,
+                                    kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            if (!keys) continue;
+            CFIndex cnt = CFArrayGetCount(keys);
+            for (CFIndex i = 0; i < cnt; i++) {
+                NSString *k = (__bridge NSString *)CFArrayGetValueAtIndex(keys, i);
+                if (![k isKindOfClass:[NSString class]]) continue;
+                if ([k rangeOfString:@"igration"].location == NSNotFound &&
+                    [k rangeOfString:@"ersion"].location == NSNotFound &&
+                    [k rangeOfString:@"nstalled"].location == NSNotFound) continue;
+                CFPropertyListRef v = CFPreferencesCopyValue((__bridge CFStringRef)k, (__bridge CFStringRef)dom,
+                                        kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+                NSString *vs = v ? [(__bridge id)v description] : @"(nil)";
+                if (vs.length > 60) vs = [vs substringToIndex:60];
+                la_flog([NSString stringWithFormat:@"[dbg] pref %@ %@=%@", dom, k, vs]);
+                if (v) CFRelease(v);
+            }
+            CFRelease(keys);
+        }
+    }
+}
+
 __attribute__((constructor))
 static void line_account_init(void) {
     (void)realHomePath();
     mkdirp(slotsRootPath());
     (void)deviceClientUUID();
+
+    la_flog([NSString stringWithFormat:@"[boot] ===== 启动 pid=%d owner=%ld pending=%ld current=%ld =====",
+             getpid(), (long)readHomeOwnerStamp(), (long)readPending(), (long)readCurrentSlot()]);
 
     recoverSwapJournalIfAny();
     reconcileTargetAtBoot();
@@ -4744,6 +4938,8 @@ static void line_account_init(void) {
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
     hookAppDelegate();
+
+    la_boot_db_probe();   // ★ 诊断：Home 内 DB vs 真实共享容器残留 DB，定位新号污染源
 
     // ★ 不在此处提前弹选择页：此刻场景/窗口尚未建立，绑不到 UIWindowScene 会黑屏。
     //   改由 hooked_didFinishLaunching / hooked_sceneWillConnect 在场景就绪后覆盖显示。
