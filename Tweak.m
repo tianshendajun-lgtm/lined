@@ -3410,7 +3410,10 @@ static void showAccountPicker(void) {
             if (!pickerWindow) {
                 pickerWindow = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
             }
-            pickerWindow.windowLevel = UIWindowLevelStatusBar + 200;
+            // ★ 必须高于 UIWindowLevelAlert(2000)：否则 KakaoTalk 自己的「完全关闭并重启」系统弹框
+            //   (在 Alert 级) 会盖住选择页 + 日志按钮，用户点不了 → 死锁。抬到 Alert+1000 稳压其上。
+            //   我们自己的二次确认/账号详情弹框由 picker VC present，落在本窗口内，不受影响。
+            pickerWindow.windowLevel = UIWindowLevelAlert + 1000;
             pickerWindow.backgroundColor = [UIColor colorWithRed:0.06 green:0.72 blue:0.35 alpha:1.0];
             pickerWindow.rootViewController = [LineAccountPickerController new];
         }
