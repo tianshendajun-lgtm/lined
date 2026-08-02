@@ -2893,8 +2893,10 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
         //   LINE 的 cte-<mid>(频道令牌)/部分 e2ee 是可同步的 → 匹配不到 → errSecItemNotFound
         //   被当成功 → 实际没搬走，残留在 Home → 下个账号带着它登录 → 看得到别人的群/聊天。
         (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
-        // ★ 同样避免 ACL 条目在切号搬运时弹授权框/阻塞
-        (__bridge id)kSecUseAuthenticationUI: (__bridge id)kSecUseAuthenticationUISkip,
+        // ★ 注意：kSecUseAuthenticationUISkip 只对 SecItemCopyMatching 合法；放进 SecItemUpdate/Delete
+        //   查询会导致 errSecParam(-50) → 改名全失败 changed=0 → Keychain 整个不按账号搬 → 令牌/设备ID
+        //   永远停在同一账号 → 切号后 DB(账号B)配令牌(账号A)不一致 → KakaoTalk 触发迁移弹「完全关闭重启」。
+        //   故这里【绝不能】加 UISkip（枚举 kcAllItems 里加才是对的）。
     } mutableCopy];
     if (svce.length > 0) query[(__bridge id)kSecAttrService] = svce;
 
@@ -2912,7 +2914,7 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
             (__bridge id)kSecClass:               (__bridge id)klass,
             (__bridge id)kSecAttrAccount:         newAcct,
             (__bridge id)kSecAttrSynchronizable:  (__bridge id)kSecAttrSynchronizableAny,
-            (__bridge id)kSecUseAuthenticationUI: (__bridge id)kSecUseAuthenticationUISkip,
+            // ★ 同理：Delete 查询不能带 UISkip（只对 Copy 合法），否则 errSecParam。
         } mutableCopy];
         if (svce.length > 0) delTarget[(__bridge id)kSecAttrService] = svce;
         SecItemDelete_t del = kcDelete();
@@ -2926,6 +2928,12 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
         return NO;
     }
     NSLog(@"[LineAccount] KC rename FAIL st=%d acct=%@ -> %@ svce=%@", (int)st, oldAcct, newAcct, svce);
+    // 把确切错误码打到屏上日志：-50=参数错(多为查询里混入非法键)，-34018=缺权限，-25308=需交互被拒。
+    static int s_kcFailLogged = 0;
+    if (s_kcFailLogged < 6) {   // 只记前几条，避免刷屏
+        s_kcFailLogged++;
+        la_flog([NSString stringWithFormat:@"[kc] rename FAIL st=%d acct=%@→%@", (int)st, oldAcct, newAcct]);
+    }
     return NO;
 }
 
