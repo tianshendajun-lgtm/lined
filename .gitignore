@@ -1,0 +1,6 @@
+build/
+*.dylib
+.DS_Store
+*.xcuserstate
+.idea/
+*.zip
