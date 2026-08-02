@@ -4279,11 +4279,96 @@ static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t add
     return orig_connect(sockfd, addr, addrlen);
 }
 
+// getaddrinfo 侦察：抓所有主机名解析（NW/BSD 都可能经它）
+typedef int (*la_gai_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+static la_gai_fn orig_getaddrinfo_fn = NULL;
+static int hooked_getaddrinfo(const char *node, const char *service,
+                              const struct addrinfo *hints, struct addrinfo **res) {
+    if (!g_la_in_relay && node && node[0] && g_connLogLeft > 0) {
+        g_connLogLeft--;
+        la_flog([NSString stringWithFormat:@"[dns] %s%s%s", node,
+                 (service && service[0]) ? ":" : "", (service && service[0]) ? service : ""]);
+    }
+    return orig_getaddrinfo_fn ? orig_getaddrinfo_fn(node, service, hints, res)
+                               : EAI_FAIL;
+}
+
 static void installRawConnectHook(void) {
     if (!orig_connect) orig_connect = (la_connect_fn)dlsym(RTLD_DEFAULT, "connect");
-    struct rebinding reb = { "connect", (void *)hooked_connect, (void **)&orig_connect };
-    rebind_symbols(&reb, 1);
-    la_flog(@"[connect] fishhook connect() 已装（侦察模式；.relay_all 存在才全量转发）");
+    if (!orig_getaddrinfo_fn) orig_getaddrinfo_fn = (la_gai_fn)dlsym(RTLD_DEFAULT, "getaddrinfo");
+    struct rebinding rebs[2] = {
+        { "connect",     (void *)hooked_connect,     (void **)&orig_connect },
+        { "getaddrinfo", (void *)hooked_getaddrinfo, (void **)&orig_getaddrinfo_fn },
+    };
+    rebind_symbols(rebs, 2);
+    la_flog(@"[connect] fishhook connect()+getaddrinfo() 已装（侦察模式；.relay_all 存在才全量转发）");
+}
+
+// ★ KakaoTalk 主力侦察：交换 NSURLSession 的建任务方法，记录每个请求的 URL（scheme/host/port/path）。
+//   KakaoTalk 的 HTTP(S)（配置/统计/登录/LOCO 引导）都走 NSURLSession，connect() 抓不到时用这个。
+static void la_log_url_recon(NSString *tag, NSURL *url) {
+    if (!url) return;
+    la_flog([NSString stringWithFormat:@"[url] %@ %@://%@%@%@",
+             tag,
+             url.scheme ?: @"?",
+             url.host ?: @"?",
+             url.port ? [NSString stringWithFormat:@":%@", url.port] : @"",
+             url.path.length ? url.path : @""]);
+}
+
+static void installURLSessionRecon(void) {
+    Class cls = [NSURLSession class];
+
+    #define LA_SWZ_REQ_CH(SELE, TAG) do { \
+        SEL sel = @selector(SELE); \
+        Method m = class_getInstanceMethod(cls, sel); \
+        if (m) { IMP o = method_getImplementation(m); \
+            id b = ^id(id me, NSURLRequest *req, id ch){ la_log_url_recon(TAG, req.URL); \
+                return ((id(*)(id,SEL,id,id))o)(me, sel, req, ch); }; \
+            method_setImplementation(m, imp_implementationWithBlock(b)); } \
+    } while(0)
+
+    #define LA_SWZ_URL_CH(SELE, TAG) do { \
+        SEL sel = @selector(SELE); \
+        Method m = class_getInstanceMethod(cls, sel); \
+        if (m) { IMP o = method_getImplementation(m); \
+            id b = ^id(id me, NSURL *url, id ch){ la_log_url_recon(TAG, url); \
+                return ((id(*)(id,SEL,id,id))o)(me, sel, url, ch); }; \
+            method_setImplementation(m, imp_implementationWithBlock(b)); } \
+    } while(0)
+
+    #define LA_SWZ_REQ(SELE, TAG) do { \
+        SEL sel = @selector(SELE); \
+        Method m = class_getInstanceMethod(cls, sel); \
+        if (m) { IMP o = method_getImplementation(m); \
+            id b = ^id(id me, NSURLRequest *req){ la_log_url_recon(TAG, req.URL); \
+                return ((id(*)(id,SEL,id))o)(me, sel, req); }; \
+            method_setImplementation(m, imp_implementationWithBlock(b)); } \
+    } while(0)
+
+    #define LA_SWZ_URL(SELE, TAG) do { \
+        SEL sel = @selector(SELE); \
+        Method m = class_getInstanceMethod(cls, sel); \
+        if (m) { IMP o = method_getImplementation(m); \
+            id b = ^id(id me, NSURL *url){ la_log_url_recon(TAG, url); \
+                return ((id(*)(id,SEL,id))o)(me, sel, url); }; \
+            method_setImplementation(m, imp_implementationWithBlock(b)); } \
+    } while(0)
+
+    LA_SWZ_REQ_CH(dataTaskWithRequest:completionHandler:,      @"data.req");
+    LA_SWZ_URL_CH(dataTaskWithURL:completionHandler:,          @"data.url");
+    LA_SWZ_REQ(dataTaskWithRequest:,                            @"data.req");
+    LA_SWZ_URL(dataTaskWithURL:,                                @"data.url");
+    LA_SWZ_REQ_CH(downloadTaskWithRequest:completionHandler:,  @"dl.req");
+    LA_SWZ_URL_CH(downloadTaskWithURL:completionHandler:,      @"dl.url");
+    LA_SWZ_REQ_CH(uploadTaskWithRequest:fromData:,             @"ul.req"); // 第二参非 CH 也无妨，只读 URL
+
+    #undef LA_SWZ_REQ_CH
+    #undef LA_SWZ_URL_CH
+    #undef LA_SWZ_REQ
+    #undef LA_SWZ_URL
+
+    la_flog(@"[url] NSURLSession 侦察已装（记录每个请求 URL）");
 }
 
 // 方案 B：把 LINE 的 GOT 槽 NWConnection.init(to:using:) 改指向 Swift 替身。
@@ -4469,6 +4554,7 @@ static void line_account_init(void) {
     installRuntimeHooks();
     installKeychainHooks();
     installPerAccountProxyHooks();
+    installURLSessionRecon();   // ★ KakaoTalk：NSURLSession 层侦察，记录所有请求 URL
     installUIApplicationMainHook();
     installIntentsCrashGuards();
     installBGTaskCrashGuards();
