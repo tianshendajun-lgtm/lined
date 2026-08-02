@@ -5034,14 +5034,53 @@ static void la_boot_db_probe(void) {
             }
         }
 
-        // ★ 确认真实 App Group 容器是否可访问(nil=重签丢了 entitlement → 泄漏不在真实容器)
-        if (orig_containerURL) {
+        // ★★ SharedTalk.sqlite 泄漏专项探针：好友/聊天缓存在 App Group 共享容器。
+        //   若「真实共享容器」重签后仍可访问、且某代码路径绕过我们的 containerURL 改道去读它，
+        //   则所有槽共用同一份 → 切到干净号也会看到上个号的好友(闪好友+状态冲突→弹重启)。
+        //   这里对每个 KakaoTalk group：①真实容器是否可访问 + 其中 SharedTalk.sqlite 大小；
+        //   ②Home 内改道容器里那份 SharedTalk.sqlite 大小。两者对比即可判定泄漏是否在真实容器。
+        {
             id fm2 = [NSFileManager defaultManager];
-            NSString *g0 = nil;
-            for (NSString *gid in la_groupDomainsToSwap()) { if ([gid hasPrefix:@"group."]) { g0 = gid; break; } }
-            if (g0) {
-                NSURL *u = orig_containerURL(fm2, @selector(containerURLForSecurityApplicationGroupIdentifier:), g0);
-                la_flog([NSString stringWithFormat:@"[dbg] 真实容器可访问? %@ -> %@", g0, u ? u.path : @"nil(无entitlement)"]);
+            for (NSString *gid in la_groupDomainsToSwap()) {
+                if (![gid hasPrefix:@"group."]) continue;
+                if ([gid hasPrefix:@"group.com.linecorp.line"]) continue;   // 非本 app 的 LINE 默认项，跳过
+                // ① 真实共享容器
+                NSString *realPath = nil;
+                if (orig_containerURL) {
+                    NSURL *u = orig_containerURL(fm2, @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
+                    realPath = u.path;
+                }
+                if (realPath.length) {
+                    NSMutableArray *dbs = [NSMutableArray array];
+                    la_collect_sqlite(realPath, dbs, 0);
+                    long long sharedSz = -1; NSString *sharedRel = nil;
+                    for (NSString *full in dbs) {
+                        if ([[full lastPathComponent] isEqualToString:@"SharedTalk.sqlite"]) {
+                            struct stat st; sharedSz = (lstat([full fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
+                            sharedRel = (full.length > realPath.length + 1) ? [full substringFromIndex:realPath.length + 1] : full;
+                            break;
+                        }
+                    }
+                    la_flog([NSString stringWithFormat:@"[dbg] 真实容器 %@ 可访问(DB共%lu)：SharedTalk=%@ (%lldB) @%@",
+                             gid, (unsigned long)dbs.count,
+                             sharedSz >= 0 ? @"有" : @"无", sharedSz, sharedRel ?: @"-"]);
+                } else {
+                    la_flog([NSString stringWithFormat:@"[dbg] 真实容器 %@ 不可访问(nil，无entitlement) → 泄漏不在真实容器", gid]);
+                }
+                // ② Home 内改道容器(realHome/Library/AppGroup/<gid>)里那份
+                NSString *homeGrp = [[[realHomePath() stringByAppendingPathComponent:@"Library"]
+                                      stringByAppendingPathComponent:@"AppGroup"] stringByAppendingPathComponent:gid];
+                NSMutableArray *hdbs = [NSMutableArray array];
+                la_collect_sqlite(homeGrp, hdbs, 0);
+                long long hSz = -1;
+                for (NSString *full in hdbs) {
+                    if ([[full lastPathComponent] isEqualToString:@"SharedTalk.sqlite"]) {
+                        struct stat st; hSz = (lstat([full fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
+                        break;
+                    }
+                }
+                la_flog([NSString stringWithFormat:@"[dbg] Home改道容器 %@：SharedTalk=%@ (%lldB)",
+                         gid, hSz >= 0 ? @"有" : @"无", hSz]);
             }
         }
     }
