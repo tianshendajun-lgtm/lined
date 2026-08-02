@@ -4974,6 +4974,38 @@ static void la_boot_db_probe(void) {
             }
             CFRelease(keys);
         }
+
+        // ★★ 泄漏定位探针（照搬 LINE 解法的前置）：列出 Library/Preferences 里所有偏好域 plist。
+        //   我们只按 bundle 域 + group 域搬 cfprefs；若这里出现「非 bundle、非 group」的域
+        //   (如某个 com.kakao.* / 自定义 suite)，它就是全局共享、不随号搬的 → 空号也继承其中的
+        //   会话/已安装标记 → KakaoTalk 判定需迁移 → 弹「完全关闭重启」。★未搬 的域即元凶，
+        //   拿到域名后加进 remapAppID 改道 + drain/fill 列表即可（就是 LINE 治 mid 泄漏的原样做法）。
+        {
+            NSString *prefsDir = [realHomePath() stringByAppendingPathComponent:@"Library/Preferences"];
+            NSString *bidNow = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+            NSArray<NSString *> *grps = la_groupDomainsToSwap();
+            for (NSString *name in listChildrenPOSIX(prefsDir)) {
+                if (![name hasSuffix:@".plist"]) continue;
+                NSString *dom = [name substringToIndex:name.length - 6]; // 去 .plist
+                BOOL covered = [dom isEqualToString:bidNow] || [grps containsObject:dom];
+                struct stat st;
+                long long sz = (lstat([[prefsDir stringByAppendingPathComponent:name] fileSystemRepresentation], &st) == 0)
+                               ? (long long)st.st_size : -1;
+                la_flog([NSString stringWithFormat:@"[dbg] prefsDir %@ %@ (%lldB)",
+                         covered ? @"✓" : @"★未搬", dom, sz]);
+            }
+        }
+
+        // ★ 确认真实 App Group 容器是否可访问(nil=重签丢了 entitlement → 泄漏不在真实容器)
+        if (orig_containerURL) {
+            id fm2 = [NSFileManager defaultManager];
+            NSString *g0 = nil;
+            for (NSString *gid in la_groupDomainsToSwap()) { if ([gid hasPrefix:@"group."]) { g0 = gid; break; } }
+            if (g0) {
+                NSURL *u = orig_containerURL(fm2, @selector(containerURLForSecurityApplicationGroupIdentifier:), g0);
+                la_flog([NSString stringWithFormat:@"[dbg] 真实容器可访问? %@ -> %@", g0, u ? u.path : @"nil(无entitlement)"]);
+            }
+        }
     }
 }
 
