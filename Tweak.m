@@ -3095,6 +3095,26 @@ static NSArray<NSString *> *la_groupDomainsToSwap(void) {
     for (NSString *g in la_recordedAppGroups()) if (g.length) [s addObject:g];
     return [s array];
 }
+// ★★ 需要按槽隔离的「所有 app 偏好域」= Home/Library/Preferences 里除 com.apple.* 系统域外的全部。
+//   KakaoTalk 把注册身份/认证/会话/迁移态撒在一堆兄弟域：
+//   com.iwilab.KakaoTalk.<team>.RegistProperties/.Auth/.SubDevice/.LocoConfig/.AppConfig…、
+//   KAKAOPAY::ACCOUNT/MIGRATION、com.kakao.tiaraSDK、firebase 等。只搬 bundle+group 远远不够 →
+//   空号会继承上个号这些域里的身份 → 以为已登录 → 与空 DB 冲突 → 弹「完全关闭重启」。
+//   故动态扫描 Preferences 目录全量搬（与文件层「除系统外全隔离」同思路）。com.apple.* 绝不动。
+static NSArray<NSString *> *la_allHomeAppPrefDomains(void) {
+    NSString *prefsDir = [realHomePath() stringByAppendingPathComponent:@"Library/Preferences"];
+    NSMutableOrderedSet<NSString *> *s = [NSMutableOrderedSet orderedSet];
+    for (NSString *name in listChildrenPOSIX(prefsDir)) {
+        if (![name hasSuffix:@".plist"]) continue;
+        NSString *dom = [name substringToIndex:name.length - 6];   // 去 .plist
+        if (dom.length == 0) continue;
+        if ([dom hasPrefix:@"com.apple."]) continue;   // 系统域(含 AppAttest 等)，绝不动
+        [s addObject:dom];
+    }
+    for (NSString *g in la_groupDomainsToSwap()) if (g.length) [s addObject:g];  // 兜底并入 group 域
+    return [s array];
+}
+
 // 每个 group 域在槽内的存储文件（按域名生成，互不覆盖；文件名以 .gp. 打头，swapRelItemsUnder 会跳过）
 static NSString *slotGroupPrefsPathForDomain(NSInteger slot, NSString *domain) {
     return [slotHomePath(slot) stringByAppendingPathComponent:
@@ -3155,32 +3175,50 @@ static void drainPrefsToSlot(NSInteger slot) {
     if (slot < 1) return;
     mkdirp(slotHomePath(slot));
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    int nb = 0, ng = 0;
-    if (bid.length) nb = drainDomainToPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    // ★ 所有 App Group 偏好域逐个搬（KakaoTalk 的 group.com.iwilab.KakaoTalk[.team] 身份就在这里）
-    NSArray<NSString *> *domains = la_groupDomainsToSwap();
-    for (NSString *d in domains) {
-        ng += drainDomainToPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    int nb = 0, nd = 0, ndoms = 0;
+    // ★ 全量：Home/Library/Preferences 里除 com.apple.* 外的每个 app 域都 drain 进槽。
+    for (NSString *dom in la_allHomeAppPrefDomains()) {
+        BOOL isBundle = (bid.length && [dom isEqualToString:bid]);
+        NSString *path = isBundle ? slotPrefsPath(slot) : slotGroupPrefsPathForDomain(slot, dom);
+        int k = drainDomainToPath((__bridge CFStringRef)dom, path);
+        if (isBundle) nb += k; else { nd += k; ndoms++; }
     }
-    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, %lu group域 共 %d keys)",
-          (long)slot, nb, (unsigned long)domains.count, ng);
-    la_flog([NSString stringWithFormat:@"[sw] PREF drained→slot %ld: bundle %d键, %lu个group域共 %d键",
-             (long)slot, nb, (unsigned long)domains.count, ng]);
+    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, %d域 共 %d keys)", (long)slot, nb, ndoms, nd);
+    la_flog([NSString stringWithFormat:@"[sw] PREF drained→slot %ld: bundle %d键, 其余%d域共 %d键",
+             (long)slot, nb, ndoms, nd]);
 }
 
 static void fillPrefsFromSlot(NSInteger slot) {
     if (slot < 1) return;
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    int nb = 0, ng = 0;
-    if (bid.length) nb = fillDomainFromPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    NSArray<NSString *> *domains = la_groupDomainsToSwap();
-    for (NSString *d in domains) {
-        ng += fillDomainFromPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    // ① 先清掉 Home 当前所有 app 域(除 com.apple.*)：防上个号残留域没被新号覆盖 → 串号/弹重启。
+    for (NSString *dom in la_allHomeAppPrefDomains()) {
+        CFStringRef app = (__bridge CFStringRef)dom;
+        CFArrayRef ex = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        if (ex) {
+            CFIndex c = CFArrayGetCount(ex);
+            for (CFIndex i = 0; i < c; i++) {
+                CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(ex, i);
+                if (k) CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            }
+            CFRelease(ex);
+            CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        }
     }
-    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, %lu group域 共 %d keys)",
-          (long)slot, nb, (unsigned long)domains.count, ng);
-    la_flog([NSString stringWithFormat:@"[sw] PREF filled slot %ld→Home: bundle %d键, %lu个group域共 %d键",
-             (long)slot, nb, (unsigned long)domains.count, ng]);
+    // ② bundle 域从槽回填
+    int nb = 0, nd = 0, ndoms = 0;
+    if (bid.length) nb = fillDomainFromPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
+    // ③ 槽内保存的其余域(.gp.<domain>.plist)逐个回填
+    for (NSString *name in listChildrenPOSIX(slotHomePath(slot))) {
+        if (![name hasPrefix:@".gp."] || ![name hasSuffix:@".plist"]) continue;
+        NSString *dom = [name substringWithRange:NSMakeRange(4, name.length - 4 - 6)];  // 去 .gp. 和 .plist
+        if (dom.length == 0) continue;
+        nd += fillDomainFromPath((__bridge CFStringRef)dom, slotGroupPrefsPathForDomain(slot, dom));
+        ndoms++;
+    }
+    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, %d域 共 %d keys)", (long)slot, nb, ndoms, nd);
+    la_flog([NSString stringWithFormat:@"[sw] PREF filled slot %ld→Home: bundle %d键, 其余%d域共 %d键",
+             (long)slot, nb, ndoms, nd]);
 }
 
 #pragma mark - Home 归属章（跟着数据走的 owner 标记，交叉校验 .current）
@@ -3433,9 +3471,8 @@ static void clearAccountSlot(NSInteger slot) {
             removePathPOSIX(homeRel(rel));
         }
         wipeActiveKeychain();
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        if (bid.length) clearPrefDomain((__bridge CFStringRef)bid);
-        for (NSString *d in la_groupDomainsToSwap()) clearPrefDomain((__bridge CFStringRef)d);
+        // 清掉 Home 里全部 app 偏好域(除 com.apple.*)：含 RegistProperties/Auth/KAKAOPAY:: 等身份域
+        for (NSString *dom in la_allHomeAppPrefDomains()) clearPrefDomain((__bridge CFStringRef)dom);
         writeCurrentSlot(0);
     }
 
