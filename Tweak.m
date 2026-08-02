@@ -3779,8 +3779,32 @@ static BOOL la_append_file(const char *path, const char *bytes, size_t len) {
     return YES;
 }
 
+// 网络日志静音总开关：YES=只留切号诊断([sw]/[boot]/[kc])与一次性横幅/错误，丢弃高频网络行。
+// 想临时看网络流量：把 slotsRoot/.netlog 文件建出来即可（下方 laNetQuiet 读它）。
+static BOOL laNetQuiet(void) {
+    static int cached = -1;   // -1 未定；每次进程启动读一次标志文件
+    if (cached < 0) {
+        NSString *p = [slotsRootPath() stringByAppendingPathComponent:@".netlog"];
+        cached = [[NSFileManager defaultManager] fileExistsAtPath:p] ? 0 : 1; // 有 .netlog=不安静
+    }
+    return cached == 1;
+}
+// 安静模式下是否应丢弃这行（高频网络类）。保留：[sw]/[boot]/[kc]、含“已装”的一次性横幅、代理错误行。
+static BOOL laShouldDropWhenQuiet(NSString *line) {
+    if ([line hasPrefix:@"[sw]"] || [line hasPrefix:@"[boot]"] || [line hasPrefix:@"[kc]"]) return NO;
+    if ([line rangeOfString:@"已装"].location != NSNotFound) return NO;      // 一次性安装横幅
+    if ([line rangeOfString:@"失败"].location != NSNotFound) return NO;      // 错误保留
+    if ([line rangeOfString:@"连不上"].location != NSNotFound) return NO;    // 错误保留
+    if ([line rangeOfString:@"无代理"].location != NSNotFound) return NO;    // 异常保留
+    if ([line hasPrefix:@"[url]"]  || [line hasPrefix:@"[grp]"] ||
+        [line hasPrefix:@"[dns]"]  || [line hasPrefix:@"[connect]"] ||
+        [line hasPrefix:@"[proxy]"]) return YES;                            // 高频网络行 → 丢
+    return NO;
+}
+
 static void la_flog(NSString *line) {
     if (!line) return;
+    if (laNetQuiet() && laShouldDropWhenQuiet(line)) return;   // ★ 静音：高频网络日志直接不写
     @autoreleasepool {
         NSString *rec = [NSString stringWithFormat:@"%.3f %@\n",
                          [[NSDate date] timeIntervalSince1970], line];
