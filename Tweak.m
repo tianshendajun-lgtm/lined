@@ -34,6 +34,8 @@
 
 // 前置声明：屏上日志（定义在文件后半段，诊断代码需提前用）
 static void la_flog(NSString *line);
+// 前置声明：App Group 偏好域登记（hooked_containerURL 定义在前，实现在后）
+static void la_recordAppGroup(NSString *gid);
 
 #define ACCOUNT_COUNT 100000
 #define SLOT_DIR_NAME @"LineAccountSlots"
@@ -651,7 +653,8 @@ static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
     if (groupId.length == 0) {
         return orig_containerURL ? orig_containerURL(self, _cmd, groupId) : nil;
     }
-    // 诊断：记录 App 请求的 App Group id（KakaoTalk 的 group 用于精确隔离偏好域）
+    // 登记 App 实际用到的每个 App Group，供偏好域按槽搬运（KakaoTalk 的 group 偏好域隔离靠这个）
+    la_recordAppGroup(groupId);
     static int g_grpLogLeft = 30;
     if (g_grpLogLeft > 0) { g_grpLogLeft--; la_flog([NSString stringWithFormat:@"[grp] containerURL group=%@", groupId]); }
     // ★ 必须放在 Library/ 下：容器根目录 <UUID>/ 禁止新建顶层目录(EPERM)，
@@ -2681,6 +2684,7 @@ static NSArray<NSString *> *swapRelItemsUnder(NSString *base) {
     ]];
     for (NSString *name in listChildrenPOSIX(base)) {
         if ([skipTop containsObject:name]) continue;
+        if ([name hasPrefix:@".gp."]) continue;   // ★ 按域存的 group 偏好文件(槽内元数据)，绝不进文件交换集
         [items addObject:name];
     }
     NSSet *skipLib = [NSSet setWithArray:@[@"LineSlots", @"Preferences"]];
@@ -2975,6 +2979,44 @@ static NSString *slotGroupPrefsPath(NSInteger slot) {   // App Group 域(group.c
 //   于是回到另一账号时：凭证=A、group域身份=B → 服务端拒连 → 「网络连接发生错误 / 无法正常处理」。
 #define LINE_GROUP_ID CFSTR("group.com.linecorp.line")
 
+// ★ App Group 偏好域登记表：hooked_containerURL 把 App 实际用到的每个 group id 记这里，
+//   存 slots 根(不参与文件搬运、跨账号切换存活)。偏好搬运时对所有 group 域逐个 drain/fill，
+//   从而对 KakaoTalk 的 group.com.iwilab.KakaoTalk[.<team>] 及任何 App 的 group 自动隔离。
+static NSString *la_appGroupsRegistryPath(void) { return swapStatePath(@".appgroups.plist"); }
+static NSArray<NSString *> *la_recordedAppGroups(void) {
+    NSArray *a = [NSArray arrayWithContentsOfFile:la_appGroupsRegistryPath()];
+    return [a isKindOfClass:[NSArray class]] ? a : @[];
+}
+static void la_recordAppGroup(NSString *gid) {
+    if (gid.length == 0) return;
+    static NSLock *lock; static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    [lock lock];
+    NSMutableArray *a = [la_recordedAppGroups() mutableCopy];
+    if (![a containsObject:gid]) { [a addObject:gid]; [a writeToFile:la_appGroupsRegistryPath() atomically:YES]; }
+    [lock unlock];
+}
+// 需要按槽搬运的所有 App Group 偏好域 = LINE 默认 ∪ 从 bundleId 派生(含/不含 team 后缀) ∪ 运行时登记表。
+// 从 bundleId 派生可覆盖首次启动(登记表还空)且不惧重签换 team：
+//   com.iwilab.KakaoTalk.9YV3UM7J6Z → group.com.iwilab.KakaoTalk.9YV3UM7J6Z + group.com.iwilab.KakaoTalk
+static NSArray<NSString *> *la_groupDomainsToSwap(void) {
+    NSMutableOrderedSet<NSString *> *s = [NSMutableOrderedSet orderedSet];
+    [s addObject:@"group.com.linecorp.line"];
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (bid.length) {
+        [s addObject:[@"group." stringByAppendingString:bid]];
+        NSString *base = [bid stringByDeletingPathExtension];   // 去掉最后一段(重签 team 后缀)
+        if (base.length && ![base isEqualToString:bid]) [s addObject:[@"group." stringByAppendingString:base]];
+    }
+    for (NSString *g in la_recordedAppGroups()) if (g.length) [s addObject:g];
+    return [s array];
+}
+// 每个 group 域在槽内的存储文件（按域名生成，互不覆盖；文件名以 .gp. 打头，swapRelItemsUnder 会跳过）
+static NSString *slotGroupPrefsPathForDomain(NSInteger slot, NSString *domain) {
+    return [slotHomePath(slot) stringByAppendingPathComponent:
+            [NSString stringWithFormat:@".gp.%@.plist", domain]];
+}
+
 // 通用：把某个偏好域整体「读出→存文件→从该域清空」
 static int drainDomainToPath(CFStringRef app, NSString *path) {
     CFArrayRef keys = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
@@ -3031,8 +3073,13 @@ static void drainPrefsToSlot(NSInteger slot) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     int nb = 0, ng = 0;
     if (bid.length) nb = drainDomainToPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    ng = drainDomainToPath(LINE_GROUP_ID, slotGroupPrefsPath(slot));   // ★ group 域
-    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, group %d keys)", (long)slot, nb, ng);
+    // ★ 所有 App Group 偏好域逐个搬（KakaoTalk 的 group.com.iwilab.KakaoTalk[.team] 身份就在这里）
+    NSArray<NSString *> *domains = la_groupDomainsToSwap();
+    for (NSString *d in domains) {
+        ng += drainDomainToPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    }
+    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, %lu group域 共 %d keys)",
+          (long)slot, nb, (unsigned long)domains.count, ng);
 }
 
 static void fillPrefsFromSlot(NSInteger slot) {
@@ -3040,8 +3087,12 @@ static void fillPrefsFromSlot(NSInteger slot) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     int nb = 0, ng = 0;
     if (bid.length) nb = fillDomainFromPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    ng = fillDomainFromPath(LINE_GROUP_ID, slotGroupPrefsPath(slot));  // ★ group 域
-    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, group %d keys)", (long)slot, nb, ng);
+    NSArray<NSString *> *domains = la_groupDomainsToSwap();
+    for (NSString *d in domains) {
+        ng += fillDomainFromPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    }
+    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, %lu group域 共 %d keys)",
+          (long)slot, nb, (unsigned long)domains.count, ng);
 }
 
 #pragma mark - Home 归属章（跟着数据走的 owner 标记，交叉校验 .current）
@@ -3281,7 +3332,7 @@ static void clearAccountSlot(NSInteger slot) {
         wipeActiveKeychain();
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         if (bid.length) clearPrefDomain((__bridge CFStringRef)bid);
-        clearPrefDomain(LINE_GROUP_ID);
+        for (NSString *d in la_groupDomainsToSwap()) clearPrefDomain((__bridge CFStringRef)d);
         writeCurrentSlot(0);
     }
 
@@ -3289,7 +3340,9 @@ static void clearAccountSlot(NSInteger slot) {
     removePathPOSIX(slotHomePath(slot));         // ① 文件（含 .used/归属章等）
     wipeSlotKeychain(slot);                       // ② keychain line.slot.<slot>.*
     removePathPOSIX(slotPrefsPath(slot));         // ③ 偏好（bundle 域）
-    removePathPOSIX(slotGroupPrefsPath(slot));    // ③ 偏好（group 域）
+    for (NSString *d in la_groupDomainsToSwap())  // ③ 偏好（所有 group 域）
+        removePathPOSIX(slotGroupPrefsPathForDomain(slot, d));
+    removePathPOSIX(slotGroupPrefsPath(slot));    // 兼容旧版单文件
 
     NSLog(@"[LineAccount] 已清空账号 slot %ld（activeInHome=%d）", (long)slot, activeInHome);
 }
