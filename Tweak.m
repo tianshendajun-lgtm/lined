@@ -3338,26 +3338,46 @@ static void hooked_sceneWillConnect(id self, SEL _cmd, UIScene *scene, UISceneSe
     }
 }
 
+// 从 Info.plist 的 UIApplicationSceneManifest 读出 scene delegate 类名（窗口角色）。
+// ★ 关键：绝不调用 objc_copyClassList / objc_getClassList —— 那会强制 realize 进程内
+//    所有类，在 iOS 26 arm64e 上触碰到 KakaoMapsSDK 等框架的只读方法列表会写崩（SIGBUS）。
+static NSArray<NSString *> *sceneDelegateClassNamesFromPlist(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    @try {
+        NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
+        NSDictionary *manifest = info[@"UIApplicationSceneManifest"];
+        NSDictionary *configs = manifest[@"UISceneConfigurations"];
+        // 只取窗口角色（CarPlay 等 delegate 不响应 scene:willConnect: 也无所谓，避免多余 hook）
+        id windowRole = configs[@"UIWindowSceneSessionRoleApplication"];
+        NSArray *arr = [windowRole isKindOfClass:[NSArray class]] ? windowRole : nil;
+        for (NSDictionary *cfg in arr) {
+            NSString *cn = cfg[@"UISceneDelegateClassName"];
+            if ([cn isKindOfClass:[NSString class]] && cn.length > 0) [out addObject:cn];
+        }
+    } @catch (__unused id e) {}
+    return out;
+}
+
 static void hookSceneDelegates(void) {
     if (orig_sceneWillConnect) return;
     SEL sel = @selector(scene:willConnectToSession:options:);
-    // 不再全表扫描：只碰名字像 LINE Scene 的类，且必须是本类自有方法
-    unsigned int n = 0;
-    Class *list = objc_copyClassList(&n);
-    for (unsigned int i = 0; i < n; i++) {
-        Class cls = list[i];
-        NSString *name = NSStringFromClass(cls);
-        if ([name hasPrefix:@"UI"] || [name hasPrefix:@"_"] || [name hasPrefix:@"NS"]) continue;
-        if (![name containsString:@"Scene"] && ![name containsString:@"LINE"] && ![name containsString:@"Line"]) {
+    // 只按 Info.plist 里声明的 delegate 类名精确 hook，不枚举全表
+    NSArray<NSString *> *names = sceneDelegateClassNamesFromPlist();
+    for (NSString *name in names) {
+        Class cls = NSClassFromString(name);   // Swift 类支持 "Module.Class" 形式
+        if (!cls) {
+            NSLog(@"[LineAccount] scene delegate 类未就绪: %@", name);
             continue;
         }
         Method m = ownInstanceMethod(cls, sel);
-        if (!m) continue;
+        if (!m) {
+            NSLog(@"[LineAccount] %@ 无自有 scene:willConnect:，跳过", name);
+            continue;
+        }
         orig_sceneWillConnect = method_setImplementation(m, (IMP)hooked_sceneWillConnect);
         NSLog(@"[LineAccount] hooked scene:willConnect on %@", name);
         break; // 只 hook 一个
     }
-    if (list) free(list);
 }
 
 typedef int (*UIApplicationMain_t)(int, char **, NSString *, NSString *);
