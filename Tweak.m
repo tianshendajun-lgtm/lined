@@ -2119,6 +2119,120 @@ static void clearAccountSlot(NSInteger slot);
 static NSInteger readCurrentSlot(void);
 static NSInteger readPending(void);
 
+#pragma mark - 屏上日志（沙盒无法写系统 CrashReporter，直接在选择页里看）
+
+@interface LALogViewController : UIViewController
+@property(nonatomic, strong) UITextView *tv;
+@end
+
+static NSMutableArray<NSString *> *g_laLogLines = nil;
+
+// 线程安全追加一条日志（la_flog 每写一行就调用），内存里最多留 1000 行
+static void laAppendLogLine(NSString *rec) {
+    if (!rec) return;
+    @synchronized([LALogViewController class]) {
+        if (!g_laLogLines) g_laLogLines = [NSMutableArray array];
+        [g_laLogLines addObject:rec];
+        NSInteger over = (NSInteger)g_laLogLines.count - 1000;
+        if (over > 0) [g_laLogLines removeObjectsInRange:NSMakeRange(0, over)];
+    }
+}
+
+// 汇总当前所有日志文本；内存为空时回退读沙盒里的 proxy.log
+static NSString *laRecentLogText(void) {
+    NSMutableString *s = [NSMutableString string];
+    @synchronized([LALogViewController class]) {
+        for (NSString *l in g_laLogLines) [s appendString:l];
+    }
+    if (s.length == 0) {
+        NSString *cpath = [slotsRootPath() stringByAppendingPathComponent:@"proxy.log"];
+        NSString *disk = [NSString stringWithContentsOfFile:cpath encoding:NSUTF8StringEncoding error:nil];
+        if (disk.length) [s appendString:disk];
+    }
+    if (s.length == 0) {
+        [s appendString:@"（暂无日志）\n\n等 KakaoTalk 在后台联网 / 登录后，\n这里会实时出现 [connect] / [nwconn] 连接记录。\n点右上角「刷新」更新。\n"];
+    }
+    return s;
+}
+
+@implementation LALogViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
+    tv.translatesAutoresizingMaskIntoConstraints = NO;
+    tv.editable = NO;
+    tv.backgroundColor = UIColor.blackColor;
+    tv.textColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.35 alpha:1.0];
+    tv.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    self.tv = tv;
+    [self.view addSubview:tv];
+
+    UIButton *close   = [self barButton:@"关闭"   sel:@selector(onClose)];
+    UIButton *refresh = [self barButton:@"刷新"   sel:@selector(reload)];
+    UIButton *copy    = [self barButton:@"复制全部" sel:@selector(onCopy)];
+    UILabel  *title   = [[UILabel alloc] init];
+    title.text = @"代理连接日志";
+    title.textColor = UIColor.whiteColor;
+    title.font = [UIFont boldSystemFontOfSize:15];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:title];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [title.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
+
+        [close.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-14],
+        [close.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+        [refresh.trailingAnchor constraintEqualToAnchor:close.leadingAnchor constant:-10],
+        [refresh.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+        [copy.trailingAnchor constraintEqualToAnchor:refresh.leadingAnchor constant:-10],
+        [copy.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+
+        [tv.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:10],
+        [tv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:8],
+        [tv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8],
+        [tv.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8],
+    ]];
+
+    [self reload];
+}
+
+- (UIButton *)barButton:(NSString *)t sel:(SEL)s {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:14];
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.18];
+    b.layer.cornerRadius = 7;
+    b.contentEdgeInsets = UIEdgeInsetsMake(5, 10, 5, 10);
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:b];
+    return b;
+}
+
+- (void)reload {
+    self.tv.text = laRecentLogText();
+    NSUInteger len = self.tv.text.length;
+    if (len > 0) [self.tv scrollRangeToVisible:NSMakeRange(len - 1, 1)];
+}
+
+- (void)onClose { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)onCopy {
+    UIPasteboard.generalPasteboard.string = self.tv.text ?: @"";
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已复制"
+                                                              message:@"日志已复制到剪贴板"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+@end
+
 @interface LineAccountPickerController : UIViewController
 @property(nonatomic, strong) UIScrollView *scroll;
 @property(nonatomic, strong) UIStackView *stack;
@@ -2142,6 +2256,22 @@ static NSInteger readPending(void);
     title.textAlignment = NSTextAlignmentCenter;
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:title];
+
+    // 右上角「日志」按钮：屏上直看代理连接日志（无需 SSH / 分析数据）
+    UIButton *logBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [logBtn setTitle:@"日志" forState:UIControlStateNormal];
+    [logBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    logBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    logBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.28];
+    logBtn.layer.cornerRadius = 8;
+    logBtn.contentEdgeInsets = UIEdgeInsetsMake(6, 14, 6, 14);
+    logBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [logBtn addTarget:self action:@selector(onShowLog) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:logBtn];
+    [NSLayoutConstraint activateConstraints:@[
+        [logBtn.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
+        [logBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+    ]];
 
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectZero];
     sub.text = @"点选进入；长按可看代理 IP";
@@ -2296,6 +2426,12 @@ static NSInteger readPending(void);
 
 - (void)onSelect:(UIButton *)sender {
     enterAccountSlot(sender.tag);
+}
+
+- (void)onShowLog {
+    LALogViewController *vc = [LALogViewController new];
+    vc.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:vc animated:YES completion:nil];
 }
 
 - (void)onLongPress:(UILongPressGestureRecognizer *)gr {
@@ -3207,7 +3343,9 @@ static void installWindowBlockHook(void) {
 }
 
 static void showAccountPicker(void) {
+    if (g_pickerShown) return;   // didFinishLaunching / scene:willConnect 可能都触发，只显示一次
     void (^present)(void) = ^{
+        if (g_pickerShown && pickerWindow && !pickerWindow.hidden) return;
         hideLINEWindows();
 
         UIWindowScene *scene = nil;
@@ -3303,61 +3441,75 @@ static void hooked_setDelegate(id self, SEL _cmd, id del) {
 }
 
 static BOOL hooked_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
-    // 需要选账号：暂缓 LINE 真正启动，只出选择页
-    if (g_needPicker && !g_launchResumed) {
-        g_blockLINEUI = YES;
-        g_launchDeferred = YES;
-        g_deferredDelegate = self;
-        g_deferredApp = app;
-        g_deferredOpts = opts;
-        showAccountPicker();
-        NSLog(@"[LineAccount] didFinishLaunching deferred until account selected");
-        return YES;
-    }
-
+    // ★ KakaoTalk：必须先让原生 didFinishLaunching 跑完（注册 Factory/DI 依赖），
+    //   否则场景 willResignActive 时 resolve 未注册依赖会触发 Swift fatalError（brk 1）。
+    //   启动完成后再把选择页作为高层覆盖窗口盖上去，不打断 KakaoTalk 生命周期。
+    BOOL r = YES;
     if (orig_didFinishLaunching) {
-        return ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(self, _cmd, app, opts);
+        r = ((BOOL(*)(id,SEL,UIApplication*,NSDictionary*))orig_didFinishLaunching)(self, _cmd, app, opts);
     }
-    return YES;
+    if (g_needPicker && !g_launchResumed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_needPicker && !g_launchResumed) showAccountPicker();
+        });
+    }
+    return r;
 }
 
 static void hooked_sceneWillConnect(id self, SEL _cmd, UIScene *scene, UISceneSession *session, id opts) {
-    if (g_needPicker && !g_launchResumed) {
-        g_blockLINEUI = YES;
-        g_sceneDeferred = YES;
-        g_deferredSceneTarget = self;
-        g_deferredScene = scene;
-        g_deferredSceneSession = session;
-        g_deferredSceneOpts = opts;
-        showAccountPicker();
-        NSLog(@"[LineAccount] scene:willConnect deferred until account selected (%@)", [self class]);
-        return;
-    }
+    // ★ KakaoTalk：先让原生 scene:willConnect 跑完（建立窗口 + 场景内 DI），
+    //   再把选择页覆盖到同一场景上层。绝不再「挂起场景不建立」——那会让 KakaoTalk 的
+    //   _UISceneLifecycleMonitor 在 willResignActive 里 resolve 未初始化依赖而 fatalError。
     if (orig_sceneWillConnect) {
         ((void(*)(id,SEL,UIScene*,UISceneSession*,id))orig_sceneWillConnect)(self, _cmd, scene, session, opts);
     }
+    if (g_needPicker && !g_launchResumed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_needPicker && !g_launchResumed) showAccountPicker();
+        });
+    }
+}
+
+// 从 Info.plist 的 UIApplicationSceneManifest 读出 scene delegate 类名（窗口角色）。
+// ★ 关键：绝不调用 objc_copyClassList / objc_getClassList —— 那会强制 realize 进程内
+//    所有类，在 iOS 26 arm64e 上触碰到 KakaoMapsSDK 等框架的只读方法列表会写崩（SIGBUS）。
+static NSArray<NSString *> *sceneDelegateClassNamesFromPlist(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    @try {
+        NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
+        NSDictionary *manifest = info[@"UIApplicationSceneManifest"];
+        NSDictionary *configs = manifest[@"UISceneConfigurations"];
+        // 只取窗口角色（CarPlay 等 delegate 不响应 scene:willConnect: 也无所谓，避免多余 hook）
+        id windowRole = configs[@"UIWindowSceneSessionRoleApplication"];
+        NSArray *arr = [windowRole isKindOfClass:[NSArray class]] ? windowRole : nil;
+        for (NSDictionary *cfg in arr) {
+            NSString *cn = cfg[@"UISceneDelegateClassName"];
+            if ([cn isKindOfClass:[NSString class]] && cn.length > 0) [out addObject:cn];
+        }
+    } @catch (__unused id e) {}
+    return out;
 }
 
 static void hookSceneDelegates(void) {
     if (orig_sceneWillConnect) return;
     SEL sel = @selector(scene:willConnectToSession:options:);
-    // 不再全表扫描：只碰名字像 LINE Scene 的类，且必须是本类自有方法
-    unsigned int n = 0;
-    Class *list = objc_copyClassList(&n);
-    for (unsigned int i = 0; i < n; i++) {
-        Class cls = list[i];
-        NSString *name = NSStringFromClass(cls);
-        if ([name hasPrefix:@"UI"] || [name hasPrefix:@"_"] || [name hasPrefix:@"NS"]) continue;
-        if (![name containsString:@"Scene"] && ![name containsString:@"LINE"] && ![name containsString:@"Line"]) {
+    // 只按 Info.plist 里声明的 delegate 类名精确 hook，不枚举全表
+    NSArray<NSString *> *names = sceneDelegateClassNamesFromPlist();
+    for (NSString *name in names) {
+        Class cls = NSClassFromString(name);   // Swift 类支持 "Module.Class" 形式
+        if (!cls) {
+            NSLog(@"[LineAccount] scene delegate 类未就绪: %@", name);
             continue;
         }
         Method m = ownInstanceMethod(cls, sel);
-        if (!m) continue;
+        if (!m) {
+            NSLog(@"[LineAccount] %@ 无自有 scene:willConnect:，跳过", name);
+            continue;
+        }
         orig_sceneWillConnect = method_setImplementation(m, (IMP)hooked_sceneWillConnect);
         NSLog(@"[LineAccount] hooked scene:willConnect on %@", name);
         break; // 只 hook 一个
     }
-    if (list) free(list);
 }
 
 typedef int (*UIApplicationMain_t)(int, char **, NSString *, NSString *);
@@ -3496,6 +3648,7 @@ static void la_flog(NSString *line) {
     @autoreleasepool {
         NSString *rec = [NSString stringWithFormat:@"%.3f %@\n",
                          [[NSDate date] timeIntervalSince1970], line];
+        laAppendLogLine(rec);   // ★ 同步进内存缓冲，供选择页「日志」窗口实时查看
         const char *b = rec.UTF8String;
         size_t blen = strlen(b);
 
@@ -4306,7 +4459,7 @@ static void line_account_init(void) {
                       encoding:NSUTF8StringEncoding error:nil];
 
     g_needPicker = YES;
-    g_blockLINEUI = YES;
+    g_blockLINEUI = NO;   // ★ KakaoTalk：不隐藏原生窗口，选择页只作高层覆盖，避免打断场景/DI
     g_selectedSlot = -1;
     g_launchResumed = NO;
     g_launchDeferred = NO;
@@ -4321,7 +4474,6 @@ static void line_account_init(void) {
     installBGTaskCrashGuards();
     hookAppDelegate();
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_needPicker && !g_launchResumed) showAccountPicker();
-    });
+    // ★ 不在此处提前弹选择页：此刻场景/窗口尚未建立，绑不到 UIWindowScene 会黑屏。
+    //   改由 hooked_didFinishLaunching / hooked_sceneWillConnect 在场景就绪后覆盖显示。
 }
