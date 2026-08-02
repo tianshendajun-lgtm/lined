@@ -2188,6 +2188,7 @@ static NSString *laRecentLogText(void) {
     UIButton *close   = [self barButton:@"关闭"   sel:@selector(onClose)];
     UIButton *refresh = [self barButton:@"刷新"   sel:@selector(reload)];
     UIButton *copy    = [self barButton:@"复制全部" sel:@selector(onCopy)];
+    UIButton *clear   = [self barButton:@"清空"   sel:@selector(onClear)];
     UILabel  *title   = [[UILabel alloc] init];
     title.text = @"代理连接日志";
     title.textColor = UIColor.whiteColor;
@@ -2205,6 +2206,8 @@ static NSString *laRecentLogText(void) {
         [refresh.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
         [copy.trailingAnchor constraintEqualToAnchor:refresh.leadingAnchor constant:-10],
         [copy.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+        [clear.trailingAnchor constraintEqualToAnchor:copy.leadingAnchor constant:-10],
+        [clear.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
 
         [tv.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:10],
         [tv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:8],
@@ -2236,6 +2239,21 @@ static NSString *laRecentLogText(void) {
 }
 
 - (void)onClose { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)onClear {
+    UIAlertController *c = [UIAlertController alertControllerWithTitle:@"清空日志？"
+        message:@"清除屏上缓冲与持久化 proxy.log 的全部记录（不影响账号数据）"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [c addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [c addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        @synchronized([LALogViewController class]) { [g_laLogLines removeAllObjects]; }
+        // 用 POSIX 直删，绕开被 hook 的 NSFileManager；proxy.log 在 slots 根(不参与搬运)
+        removePathPOSIX([slotsRootPath() stringByAppendingPathComponent:@"proxy.log"]);
+        [self reload];
+    }]];
+    [self presentViewController:c animated:YES completion:nil];
+}
 
 - (void)onCopy {
     UIPasteboard.generalPasteboard.string = self.tv.text ?: @"";
