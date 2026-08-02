@@ -2717,6 +2717,17 @@ static NSArray<NSString *> *swapRelItemsUnder(NSString *base) {
         if ([skipLib containsObject:name]) continue;
         [items addObject:[@"Library" stringByAppendingPathComponent:name]];
     }
+    // ★★ Preferences 目录整体仍靠 CFPreferences 重定向隔离(cfprefsd 域换文件无效)，但 KakaoTalk 把
+    //   「注册身份/登录设备/配置」写成自有文件 *.properties.plist(RegistProperties/Auth/SubDevice/
+    //   AppConfig/AppPolicy…)，这些【不是 cfprefsd 域】(CFPreferencesCopyKeyList 返回 nil)，
+    //   CF 层搬不动也清不掉 → 全局共享 → 空槽继承上个号身份 → 闪登录页+弹「完全关闭」。
+    //   故把这些 .properties.plist 当普通文件按槽搬(真正的 cfprefs 域 plist 仍不搬)。
+    NSString *prefs = [lib stringByAppendingPathComponent:@"Preferences"];
+    for (NSString *name in listChildrenPOSIX(prefs)) {
+        if ([name hasSuffix:@".properties.plist"]) {
+            [items addObject:[@"Library/Preferences" stringByAppendingPathComponent:name]];
+        }
+    }
     return items;
 }
 
@@ -2828,6 +2839,17 @@ static void drainHomeToSlot(NSInteger slot) {
 // 把 slot 里的账号数据搬回 Home（幂等，可重复执行）。枚举槽内现有内容为准。
 static void fillHomeFromSlot(NSInteger slot) {
     if (slot < 1) return;
+    // ★ 先清掉 Home 里残留的 *.properties.plist：旧版本从不搬这些文件，会遗留在 Home →
+    //   切到空槽/别的号时若不清，就会继承上个号的注册身份(RegistProperties 等) → 闪登录页+弹重启。
+    //   fill 只在 drain 之后或 Home 本就空时执行，删这些是安全的(本槽自己的会在下面从槽内回填)。
+    {
+        NSString *homePrefs = homeRel(@"Library/Preferences");
+        for (NSString *name in listChildrenPOSIX(homePrefs)) {
+            if ([name hasSuffix:@".properties.plist"]) {
+                removePathPOSIX([homePrefs stringByAppendingPathComponent:name]);
+            }
+        }
+    }
     NSArray *items = swapRelItemsUnder(slotHomePath(slot));
     for (NSString *rel in items) {
         moveOne(slotRel(slot, rel), homeRel(rel));
@@ -3095,6 +3117,27 @@ static NSArray<NSString *> *la_groupDomainsToSwap(void) {
     for (NSString *g in la_recordedAppGroups()) if (g.length) [s addObject:g];
     return [s array];
 }
+// ★★ 需要按槽隔离的「所有 app 偏好域」= Home/Library/Preferences 里除 com.apple.* 系统域外的全部。
+//   KakaoTalk 把注册身份/认证/会话/迁移态撒在一堆兄弟域：
+//   com.iwilab.KakaoTalk.<team>.RegistProperties/.Auth/.SubDevice/.LocoConfig/.AppConfig…、
+//   KAKAOPAY::ACCOUNT/MIGRATION、com.kakao.tiaraSDK、firebase 等。只搬 bundle+group 远远不够 →
+//   空号会继承上个号这些域里的身份 → 以为已登录 → 与空 DB 冲突 → 弹「完全关闭重启」。
+//   故动态扫描 Preferences 目录全量搬（与文件层「除系统外全隔离」同思路）。com.apple.* 绝不动。
+static NSArray<NSString *> *la_allHomeAppPrefDomains(void) {
+    NSString *prefsDir = [realHomePath() stringByAppendingPathComponent:@"Library/Preferences"];
+    NSMutableOrderedSet<NSString *> *s = [NSMutableOrderedSet orderedSet];
+    for (NSString *name in listChildrenPOSIX(prefsDir)) {
+        if (![name hasSuffix:@".plist"]) continue;
+        NSString *dom = [name substringToIndex:name.length - 6];   // 去 .plist
+        if (dom.length == 0) continue;
+        if ([dom hasPrefix:@"com.apple."]) continue;   // 系统域(含 AppAttest 等)，绝不动
+        if ([dom hasSuffix:@".properties"]) continue;  // ★ KakaoTalk 自有文件，改由文件层按槽搬(见 swapRelItemsUnder)
+        [s addObject:dom];
+    }
+    for (NSString *g in la_groupDomainsToSwap()) if (g.length) [s addObject:g];  // 兜底并入 group 域
+    return [s array];
+}
+
 // 每个 group 域在槽内的存储文件（按域名生成，互不覆盖；文件名以 .gp. 打头，swapRelItemsUnder 会跳过）
 static NSString *slotGroupPrefsPathForDomain(NSInteger slot, NSString *domain) {
     return [slotHomePath(slot) stringByAppendingPathComponent:
@@ -3155,32 +3198,50 @@ static void drainPrefsToSlot(NSInteger slot) {
     if (slot < 1) return;
     mkdirp(slotHomePath(slot));
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    int nb = 0, ng = 0;
-    if (bid.length) nb = drainDomainToPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    // ★ 所有 App Group 偏好域逐个搬（KakaoTalk 的 group.com.iwilab.KakaoTalk[.team] 身份就在这里）
-    NSArray<NSString *> *domains = la_groupDomainsToSwap();
-    for (NSString *d in domains) {
-        ng += drainDomainToPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    int nb = 0, nd = 0, ndoms = 0;
+    // ★ 全量：Home/Library/Preferences 里除 com.apple.* 外的每个 app 域都 drain 进槽。
+    for (NSString *dom in la_allHomeAppPrefDomains()) {
+        BOOL isBundle = (bid.length && [dom isEqualToString:bid]);
+        NSString *path = isBundle ? slotPrefsPath(slot) : slotGroupPrefsPathForDomain(slot, dom);
+        int k = drainDomainToPath((__bridge CFStringRef)dom, path);
+        if (isBundle) nb += k; else { nd += k; ndoms++; }
     }
-    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, %lu group域 共 %d keys)",
-          (long)slot, nb, (unsigned long)domains.count, ng);
-    la_flog([NSString stringWithFormat:@"[sw] PREF drained→slot %ld: bundle %d键, %lu个group域共 %d键",
-             (long)slot, nb, (unsigned long)domains.count, ng]);
+    NSLog(@"[LineAccount] PREF drained -> slot %ld (bundle %d keys, %d域 共 %d keys)", (long)slot, nb, ndoms, nd);
+    la_flog([NSString stringWithFormat:@"[sw] PREF drained→slot %ld: bundle %d键, 其余%d域共 %d键",
+             (long)slot, nb, ndoms, nd]);
 }
 
 static void fillPrefsFromSlot(NSInteger slot) {
     if (slot < 1) return;
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    int nb = 0, ng = 0;
-    if (bid.length) nb = fillDomainFromPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
-    NSArray<NSString *> *domains = la_groupDomainsToSwap();
-    for (NSString *d in domains) {
-        ng += fillDomainFromPath((__bridge CFStringRef)d, slotGroupPrefsPathForDomain(slot, d));
+    // ① 先清掉 Home 当前所有 app 域(除 com.apple.*)：防上个号残留域没被新号覆盖 → 串号/弹重启。
+    for (NSString *dom in la_allHomeAppPrefDomains()) {
+        CFStringRef app = (__bridge CFStringRef)dom;
+        CFArrayRef ex = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        if (ex) {
+            CFIndex c = CFArrayGetCount(ex);
+            for (CFIndex i = 0; i < c; i++) {
+                CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(ex, i);
+                if (k) CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            }
+            CFRelease(ex);
+            CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        }
     }
-    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, %lu group域 共 %d keys)",
-          (long)slot, nb, (unsigned long)domains.count, ng);
-    la_flog([NSString stringWithFormat:@"[sw] PREF filled slot %ld→Home: bundle %d键, %lu个group域共 %d键",
-             (long)slot, nb, (unsigned long)domains.count, ng]);
+    // ② bundle 域从槽回填
+    int nb = 0, nd = 0, ndoms = 0;
+    if (bid.length) nb = fillDomainFromPath((__bridge CFStringRef)bid, slotPrefsPath(slot));
+    // ③ 槽内保存的其余域(.gp.<domain>.plist)逐个回填
+    for (NSString *name in listChildrenPOSIX(slotHomePath(slot))) {
+        if (![name hasPrefix:@".gp."] || ![name hasSuffix:@".plist"]) continue;
+        NSString *dom = [name substringWithRange:NSMakeRange(4, name.length - 4 - 6)];  // 去 .gp. 和 .plist
+        if (dom.length == 0) continue;
+        nd += fillDomainFromPath((__bridge CFStringRef)dom, slotGroupPrefsPathForDomain(slot, dom));
+        ndoms++;
+    }
+    NSLog(@"[LineAccount] PREF filled slot %ld -> (bundle %d keys, %d域 共 %d keys)", (long)slot, nb, ndoms, nd);
+    la_flog([NSString stringWithFormat:@"[sw] PREF filled slot %ld→Home: bundle %d键, 其余%d域共 %d键",
+             (long)slot, nb, ndoms, nd]);
 }
 
 #pragma mark - Home 归属章（跟着数据走的 owner 标记，交叉校验 .current）
@@ -3433,9 +3494,8 @@ static void clearAccountSlot(NSInteger slot) {
             removePathPOSIX(homeRel(rel));
         }
         wipeActiveKeychain();
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        if (bid.length) clearPrefDomain((__bridge CFStringRef)bid);
-        for (NSString *d in la_groupDomainsToSwap()) clearPrefDomain((__bridge CFStringRef)d);
+        // 清掉 Home 里全部 app 偏好域(除 com.apple.*)：含 RegistProperties/Auth/KAKAOPAY:: 等身份域
+        for (NSString *dom in la_allHomeAppPrefDomains()) clearPrefDomain((__bridge CFStringRef)dom);
         writeCurrentSlot(0);
     }
 
@@ -4982,12 +5042,13 @@ static void la_boot_db_probe(void) {
         //   拿到域名后加进 remapAppID 改道 + drain/fill 列表即可（就是 LINE 治 mid 泄漏的原样做法）。
         {
             NSString *prefsDir = [realHomePath() stringByAppendingPathComponent:@"Library/Preferences"];
-            NSString *bidNow = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-            NSArray<NSString *> *grps = la_groupDomainsToSwap();
+            // ★ 判定改用真实搬运集 la_allHomeAppPrefDomains()(= 非 com.apple.* 全量)，
+            //   与 drain/fill 完全一致；否则会把已搬的域误标 ★未搬。
+            NSArray<NSString *> *covSet = la_allHomeAppPrefDomains();
             for (NSString *name in listChildrenPOSIX(prefsDir)) {
                 if (![name hasSuffix:@".plist"]) continue;
                 NSString *dom = [name substringToIndex:name.length - 6]; // 去 .plist
-                BOOL covered = [dom isEqualToString:bidNow] || [grps containsObject:dom];
+                BOOL covered = [covSet containsObject:dom];
                 struct stat st;
                 long long sz = (lstat([[prefsDir stringByAppendingPathComponent:name] fileSystemRepresentation], &st) == 0)
                                ? (long long)st.st_size : -1;
@@ -4996,14 +5057,53 @@ static void la_boot_db_probe(void) {
             }
         }
 
-        // ★ 确认真实 App Group 容器是否可访问(nil=重签丢了 entitlement → 泄漏不在真实容器)
-        if (orig_containerURL) {
+        // ★★ SharedTalk.sqlite 泄漏专项探针：好友/聊天缓存在 App Group 共享容器。
+        //   若「真实共享容器」重签后仍可访问、且某代码路径绕过我们的 containerURL 改道去读它，
+        //   则所有槽共用同一份 → 切到干净号也会看到上个号的好友(闪好友+状态冲突→弹重启)。
+        //   这里对每个 KakaoTalk group：①真实容器是否可访问 + 其中 SharedTalk.sqlite 大小；
+        //   ②Home 内改道容器里那份 SharedTalk.sqlite 大小。两者对比即可判定泄漏是否在真实容器。
+        {
             id fm2 = [NSFileManager defaultManager];
-            NSString *g0 = nil;
-            for (NSString *gid in la_groupDomainsToSwap()) { if ([gid hasPrefix:@"group."]) { g0 = gid; break; } }
-            if (g0) {
-                NSURL *u = orig_containerURL(fm2, @selector(containerURLForSecurityApplicationGroupIdentifier:), g0);
-                la_flog([NSString stringWithFormat:@"[dbg] 真实容器可访问? %@ -> %@", g0, u ? u.path : @"nil(无entitlement)"]);
+            for (NSString *gid in la_groupDomainsToSwap()) {
+                if (![gid hasPrefix:@"group."]) continue;
+                if ([gid hasPrefix:@"group.com.linecorp.line"]) continue;   // 非本 app 的 LINE 默认项，跳过
+                // ① 真实共享容器
+                NSString *realPath = nil;
+                if (orig_containerURL) {
+                    NSURL *u = orig_containerURL(fm2, @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
+                    realPath = u.path;
+                }
+                if (realPath.length) {
+                    NSMutableArray *dbs = [NSMutableArray array];
+                    la_collect_sqlite(realPath, dbs, 0);
+                    long long sharedSz = -1; NSString *sharedRel = nil;
+                    for (NSString *full in dbs) {
+                        if ([[full lastPathComponent] isEqualToString:@"SharedTalk.sqlite"]) {
+                            struct stat st; sharedSz = (lstat([full fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
+                            sharedRel = (full.length > realPath.length + 1) ? [full substringFromIndex:realPath.length + 1] : full;
+                            break;
+                        }
+                    }
+                    la_flog([NSString stringWithFormat:@"[dbg] 真实容器 %@ 可访问(DB共%lu)：SharedTalk=%@ (%lldB) @%@",
+                             gid, (unsigned long)dbs.count,
+                             sharedSz >= 0 ? @"有" : @"无", sharedSz, sharedRel ?: @"-"]);
+                } else {
+                    la_flog([NSString stringWithFormat:@"[dbg] 真实容器 %@ 不可访问(nil，无entitlement) → 泄漏不在真实容器", gid]);
+                }
+                // ② Home 内改道容器(realHome/Library/AppGroup/<gid>)里那份
+                NSString *homeGrp = [[[realHomePath() stringByAppendingPathComponent:@"Library"]
+                                      stringByAppendingPathComponent:@"AppGroup"] stringByAppendingPathComponent:gid];
+                NSMutableArray *hdbs = [NSMutableArray array];
+                la_collect_sqlite(homeGrp, hdbs, 0);
+                long long hSz = -1;
+                for (NSString *full in hdbs) {
+                    if ([[full lastPathComponent] isEqualToString:@"SharedTalk.sqlite"]) {
+                        struct stat st; hSz = (lstat([full fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
+                        break;
+                    }
+                }
+                la_flog([NSString stringWithFormat:@"[dbg] Home改道容器 %@：SharedTalk=%@ (%lldB)",
+                         gid, hSz >= 0 ? @"有" : @"无", hSz]);
             }
         }
     }
@@ -5043,7 +5143,9 @@ static void line_account_init(void) {
                       encoding:NSUTF8StringEncoding error:nil];
 
     g_needPicker = YES;
-    g_blockLINEUI = NO;   // ★ KakaoTalk：不隐藏原生窗口，选择页只作高层覆盖，避免打断场景/DI
+    // ★ 回退遮挡：KakaoTalk 不隐藏原生窗口，选择页只作高层覆盖。
+    //   代价=启动会先闪一下当前账号再出选择页(纯观感)；数据隔离由偏好/keychain 层保证，不受影响。
+    g_blockLINEUI = NO;
     g_selectedSlot = -1;
     g_launchResumed = NO;
     g_launchDeferred = NO;
