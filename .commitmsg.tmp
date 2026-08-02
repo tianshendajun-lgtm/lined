@@ -1,7 +1,0 @@
-按槽隔离全部 app 偏好域(除 com.apple.*)：修空号继承登录态弹重启
-
-探针确认 KakaoTalk 把注册/认证/会话/迁移身份撒在一堆兄弟偏好域
-(com.iwilab.KakaoTalk.<team>.RegistProperties/.Auth/.SubDevice/.LocoConfig、
-KAKAOPAY::ACCOUNT/MIGRATION 等)，此前只搬 bundle+group → 空号继承上号身份
-→ 与空 DB 冲突 → 弹「完全关闭重启」。改为动态扫描 Preferences 全量 drain/fill，
-com.apple.* 系统域除外；fill 前先清 Home 全部 app 域防串号。
