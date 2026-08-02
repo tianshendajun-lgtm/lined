@@ -2836,6 +2836,9 @@ static NSArray *kcAllItems(CFTypeRef klass) {
         (__bridge id)kSecMatchLimit:        (__bridge id)kSecMatchLimitAll,
         (__bridge id)kSecReturnAttributes:  (__bridge id)kCFBooleanTrue,
         (__bridge id)kSecAttrSynchronizable:(__bridge id)kSecAttrSynchronizableAny,
+        // ★ 致命修复：不加这条，枚举撞到「受 ACL 保护(需生物识别/密码)」的条目会同步弹授权框并阻塞，
+        //   开机构造器里就会触发 → 20 秒启动看门狗 0x8BADF00D 杀进程。UISkip = 遇到需授权的项静默跳过、绝不弹框。
+        (__bridge id)kSecUseAuthenticationUI:(__bridge id)kSecUseAuthenticationUISkip,
     };
     SecItemCopyMatching_t f = kcCopy();
     if (!f) return @[];
@@ -2860,6 +2863,8 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
         //   LINE 的 cte-<mid>(频道令牌)/部分 e2ee 是可同步的 → 匹配不到 → errSecItemNotFound
         //   被当成功 → 实际没搬走，残留在 Home → 下个账号带着它登录 → 看得到别人的群/聊天。
         (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
+        // ★ 同样避免 ACL 条目在切号搬运时弹授权框/阻塞
+        (__bridge id)kSecUseAuthenticationUI: (__bridge id)kSecUseAuthenticationUISkip,
     } mutableCopy];
     if (svce.length > 0) query[(__bridge id)kSecAttrService] = svce;
 
@@ -2877,6 +2882,7 @@ static BOOL kcRenameAccount(CFTypeRef klass, NSString *oldAcct, NSString *svce, 
             (__bridge id)kSecClass:               (__bridge id)klass,
             (__bridge id)kSecAttrAccount:         newAcct,
             (__bridge id)kSecAttrSynchronizable:  (__bridge id)kSecAttrSynchronizableAny,
+            (__bridge id)kSecUseAuthenticationUI: (__bridge id)kSecUseAuthenticationUISkip,
         } mutableCopy];
         if (svce.length > 0) delTarget[(__bridge id)kSecAttrService] = svce;
         SecItemDelete_t del = kcDelete();
