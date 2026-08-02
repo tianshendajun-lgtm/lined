@@ -4822,13 +4822,12 @@ static void _rebind_nw_proxy_for_image(const struct mach_header *header, intptr_
 
 // 递归收集某目录下的所有 *.sqlite/*.db/*.store（诊断用，限深防卡）
 static void la_collect_sqlite(NSString *dir, NSMutableArray *out, int depth) {
-    if (depth > 6 || dir.length == 0 || out.count > 60) return;
+    if (depth > 8 || dir.length == 0 || out.count > 400) return;
     for (NSString *name in listChildrenPOSIX(dir)) {
         NSString *p = [dir stringByAppendingPathComponent:name];
         if (posixIsDir(p)) { la_collect_sqlite(p, out, depth + 1); }
         else if ([name hasSuffix:@".sqlite"] || [name hasSuffix:@".db"] || [name hasSuffix:@".store"]) {
-            struct stat st; long long sz = (lstat([p fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
-            [out addObject:[NSString stringWithFormat:@"%@(%lldB)", name, sz]];
+            [out addObject:p];   // 存完整路径，probe 里再按目录归类
         }
     }
 }
@@ -4839,12 +4838,36 @@ static void la_collect_sqlite(NSString *dir, NSMutableArray *out, int depth) {
 static void la_boot_db_probe(void) {
     @autoreleasepool {
         NSInteger owner = readHomeOwnerStamp();
+        NSString *home = realHomePath();
         NSMutableArray *homeDbs = [NSMutableArray array];
-        la_collect_sqlite([realHomePath() stringByAppendingPathComponent:@"Library"], homeDbs, 0);
-        la_collect_sqlite([realHomePath() stringByAppendingPathComponent:@"Documents"], homeDbs, 0);
-        la_flog([NSString stringWithFormat:@"[dbg] owner=%ld Home内DB(%lu): %@",
-                 (long)owner, (unsigned long)homeDbs.count,
-                 homeDbs.count ? [homeDbs componentsJoinedByString:@", "] : @"(空=干净)"]);
+        la_collect_sqlite([home stringByAppendingPathComponent:@"Library"], homeDbs, 0);
+        la_collect_sqlite([home stringByAppendingPathComponent:@"Documents"], homeDbs, 0);
+        // 按「相对 Home 的父目录」归类：每个目录报 DB 数 + 是否含 Talk.sqlite/MigrationVersion.sqlite（体积）
+        NSMutableDictionary<NSString *, NSMutableArray *> *byDir = [NSMutableDictionary dictionary];
+        NSUInteger homeLen = home.length + 1;
+        for (NSString *full in homeDbs) {
+            NSString *rel = full.length > homeLen ? [full substringFromIndex:homeLen] : full;
+            NSString *d = [rel stringByDeletingLastPathComponent];
+            NSString *fn = [rel lastPathComponent];
+            NSMutableArray *arr = byDir[d]; if (!arr) { arr = [NSMutableArray array]; byDir[d] = arr; }
+            if ([fn isEqualToString:@"Talk.sqlite"] || [fn isEqualToString:@"MigrationVersion.sqlite"] ||
+                [fn isEqualToString:@"SharedTalk.sqlite"]) {
+                struct stat st; long long sz = (lstat([full fileSystemRepresentation], &st) == 0) ? (long long)st.st_size : -1;
+                [arr addObject:[NSString stringWithFormat:@"★%@(%lldB)", fn, sz]];
+            } else {
+                [arr addObject:fn];
+            }
+        }
+        la_flog([NSString stringWithFormat:@"[dbg] owner=%ld Home内DB共%lu个，散布在%lu个目录：",
+                 (long)owner, (unsigned long)homeDbs.count, (unsigned long)byDir.count]);
+        for (NSString *d in byDir) {
+            NSArray *arr = byDir[d];
+            // 只详列含核心库(★)的目录，其余只报数量，避免刷屏
+            BOOL hasCore = NO; for (NSString *x in arr) if ([x hasPrefix:@"★"]) { hasCore = YES; break; }
+            if (hasCore) la_flog([NSString stringWithFormat:@"[dbg]   %@/ (%lu): %@",
+                                  d, (unsigned long)arr.count, [arr componentsJoinedByString:@","]]);
+            else la_flog([NSString stringWithFormat:@"[dbg]   %@/ (%lu个DB)", d, (unsigned long)arr.count]);
+        }
         if (orig_containerURL) {
             id fm = [NSFileManager defaultManager];
             for (NSString *gid in la_groupDomainsToSwap()) {
@@ -4853,10 +4876,38 @@ static void la_boot_db_probe(void) {
                 if (!u) continue;
                 NSMutableArray *gdbs = [NSMutableArray array];
                 la_collect_sqlite(u.path, gdbs, 0);
+                NSMutableArray *names = [NSMutableArray array];
+                for (NSString *full in gdbs) [names addObject:[full lastPathComponent]];
                 la_flog([NSString stringWithFormat:@"[dbg] 真实共享容器 %@ DB(%lu): %@",
-                         gid, (unsigned long)gdbs.count,
-                         gdbs.count ? [gdbs componentsJoinedByString:@", "] : @"(空)"]);
+                         gid, (unsigned long)names.count,
+                         names.count ? [names componentsJoinedByString:@", "] : @"(空)"]);
             }
+        }
+        // ★ 迁移版本探针：把 bundle 域 + 各 group 域里所有含 igration/ersion/nstalled 的键值打出来。
+        //   若切号后这些值与 DB 实际版本不符 → KakaoTalk 触发迁移 → 弹「完全关闭重启」。
+        NSMutableArray<NSString *> *probeDomains = [NSMutableArray array];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if (bid.length) [probeDomains addObject:bid];
+        [probeDomains addObjectsFromArray:la_groupDomainsToSwap()];
+        for (NSString *dom in probeDomains) {
+            CFArrayRef keys = CFPreferencesCopyKeyList((__bridge CFStringRef)dom,
+                                    kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            if (!keys) continue;
+            CFIndex cnt = CFArrayGetCount(keys);
+            for (CFIndex i = 0; i < cnt; i++) {
+                NSString *k = (__bridge NSString *)CFArrayGetValueAtIndex(keys, i);
+                if (![k isKindOfClass:[NSString class]]) continue;
+                if ([k rangeOfString:@"igration"].location == NSNotFound &&
+                    [k rangeOfString:@"ersion"].location == NSNotFound &&
+                    [k rangeOfString:@"nstalled"].location == NSNotFound) continue;
+                CFPropertyListRef v = CFPreferencesCopyValue((__bridge CFStringRef)k, (__bridge CFStringRef)dom,
+                                        kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+                NSString *vs = v ? [(__bridge id)v description] : @"(nil)";
+                if (vs.length > 60) vs = [vs substringToIndex:60];
+                la_flog([NSString stringWithFormat:@"[dbg] pref %@ %@=%@", dom, k, vs]);
+                if (v) CFRelease(v);
+            }
+            CFRelease(keys);
         }
     }
 }
