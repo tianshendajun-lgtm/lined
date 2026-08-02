@@ -35,7 +35,7 @@
 #define ACCOUNT_COUNT 100000
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"got-swift-b v30"
+#define LINE_BUILD_ID @"got-swift-b v31"
 // ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（仅调试）
 #define LA_DISABLE_ALL_PROXY_INJECT 0
 // ★ v28：方案 B（GOT 重绑 Swift NWConnection.init → 本地中继）。1=用 B（26 安全，不写 __TEXT）
@@ -2115,6 +2115,7 @@ static void fetchRemoteAccounts(void (^completion)(BOOL ok, NSString *err)) {
 #pragma mark - 账号选择 UI
 
 static void enterAccountSlot(NSInteger slot);
+static void clearAccountSlot(NSInteger slot);
 static NSInteger readCurrentSlot(void);
 static NSInteger readPending(void);
 
@@ -2314,7 +2315,34 @@ static NSInteger readPending(void);
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:acc.name
                                                                    message:ipInfo
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    // 清空此账号：点了先弹二次确认（确认 / 取消），确认后才真正删除
+    [alert addAction:[UIAlertAction actionWithTitle:@"清空此账号数据"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a1) {
+        __strong typeof(weakSelf) sself = weakSelf;
+        if (!sself) return;
+        UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清空？"
+            message:[NSString stringWithFormat:
+                     @"将删除「%@」(ID:%ld) 在本机的全部本地数据（登录态/聊天/凭证），不可恢复。清空后需重新登录。",
+                     acc.name, (long)slot]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"确认清空"
+                                                    style:UIAlertActionStyleDestructive
+                                                  handler:^(UIAlertAction *a2) {
+            clearAccountSlot(slot);
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:@"已清空"
+                message:@"该账号本地数据已删除，请重新打开 LINE。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"重开" style:UIAlertActionStyleDefault
+                                                   handler:^(UIAlertAction *a3) { exit(0); }]];
+            __strong typeof(weakSelf) s2 = weakSelf;
+            [s2 presentViewController:done animated:YES completion:nil];
+        }]];
+        [sself presentViewController:confirm animated:YES completion:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -3003,6 +3031,97 @@ static void restartForAccountSwitch(NSInteger to) {
     });
 }
 
+// —— 清空某账号本地数据（三层：文件 / keychain / 偏好）——
+// 删除某槽停放的 keychain（account 以 line.slot.<slot>. 开头）
+static void wipeSlotKeychain(NSInteger slot) {
+    NSString *prefix = slotKeyPrefix(slot);   // line.slot.N.
+    CFTypeRef classes[] = { kSecClassGenericPassword, kSecClassInternetPassword };
+    SecItemDelete_t del = kcDelete();
+    if (!del) return;
+    for (int ci = 0; ci < 2; ci++) {
+        for (NSDictionary *it in kcAllItems(classes[ci])) {
+            id acctObj = it[(__bridge id)kSecAttrAccount];
+            id svceObj = it[(__bridge id)kSecAttrService];
+            NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
+            NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
+            if (![acct hasPrefix:prefix]) continue;
+            NSMutableDictionary *q = [@{
+                (__bridge id)kSecClass:              (__bridge id)classes[ci],
+                (__bridge id)kSecAttrAccount:        acct,
+                (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
+            } mutableCopy];
+            if (svce.length > 0) q[(__bridge id)kSecAttrService] = svce;
+            del((__bridge CFDictionaryRef)q);
+        }
+    }
+}
+
+// 删除当前激活(Home)的 keychain：无前缀且非我们自己的记账项(LineAccount.*，保住 DeviceId)
+static void wipeActiveKeychain(void) {
+    CFTypeRef classes[] = { kSecClassGenericPassword, kSecClassInternetPassword };
+    SecItemDelete_t del = kcDelete();
+    if (!del) return;
+    for (int ci = 0; ci < 2; ci++) {
+        for (NSDictionary *it in kcAllItems(classes[ci])) {
+            id acctObj = it[(__bridge id)kSecAttrAccount];
+            id svceObj = it[(__bridge id)kSecAttrService];
+            NSString *acct = [acctObj isKindOfClass:[NSString class]] ? acctObj : nil;
+            NSString *svce = [svceObj isKindOfClass:[NSString class]] ? svceObj : nil;
+            if (acct.length == 0) continue;
+            if ([acct hasPrefix:@"line.slot."]) continue;                       // 其他槽停放的，不动
+            if (svce.length > 0 && [svce hasPrefix:@"LineAccount."]) continue;  // DeviceId 等自家项，保留
+            NSMutableDictionary *q = [@{
+                (__bridge id)kSecClass:              (__bridge id)classes[ci],
+                (__bridge id)kSecAttrAccount:        acct,
+                (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny,
+            } mutableCopy];
+            if (svce.length > 0) q[(__bridge id)kSecAttrService] = svce;
+            del((__bridge CFDictionaryRef)q);
+        }
+    }
+}
+
+// 清空一个偏好域（把所有键置 NULL）
+static void clearPrefDomain(CFStringRef app) {
+    CFArrayRef keys = CFPreferencesCopyKeyList(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (keys) {
+        CFIndex c = CFArrayGetCount(keys);
+        for (CFIndex i = 0; i < c; i++) {
+            CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
+            if (k) CFPreferencesSetValue(k, NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        }
+        CFRelease(keys);
+    }
+    CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+}
+
+static void clearAccountSlot(NSInteger slot) {
+    if (slot < 1) return;
+    NSInteger owner = readHomeOwnerStamp();
+    if (owner < 1) owner = readCurrentSlot();
+    BOOL activeInHome = (owner == slot);
+
+    // 若该号当前正占着 Home（活账号）→ 先把 Home 三层清掉，等于本地登出
+    if (activeInHome) {
+        for (NSString *rel in swapRelItemsUnder(realHomePath())) {
+            removePathPOSIX(homeRel(rel));
+        }
+        wipeActiveKeychain();
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if (bid.length) clearPrefDomain((__bridge CFStringRef)bid);
+        clearPrefDomain(LINE_GROUP_ID);
+        writeCurrentSlot(0);
+    }
+
+    // 删该槽存储三层
+    removePathPOSIX(slotHomePath(slot));         // ① 文件（含 .used/归属章等）
+    wipeSlotKeychain(slot);                       // ② keychain line.slot.<slot>.*
+    removePathPOSIX(slotPrefsPath(slot));         // ③ 偏好（bundle 域）
+    removePathPOSIX(slotGroupPrefsPath(slot));    // ③ 偏好（group 域）
+
+    NSLog(@"[LineAccount] 已清空账号 slot %ld（activeInHome=%d）", (long)slot, activeInHome);
+}
+
 static void enterAccountSlot(NSInteger slot) {
     if (slot < 1 || slot > ACCOUNT_COUNT) return;
     // 必须是后台下发的账号
@@ -3353,6 +3472,55 @@ static int g_relay_listen_fd = -1;
 static uint16_t g_relay_port = 0;
 static BOOL g_relay_started = NO;
 
+// ★ KakaoTalk 改造：侦察/免 frida
+static int g_connLogLeft = 400;                 // proxy.log 侦察日志限量，防刷爆
+static __thread int g_la_in_relay = 0;          // 中继自身出站连接：绕过 connect hook 防递归
+
+// 文件日志。
+// 目标：让日志出现在「设置→隐私与安全性→分析与改进→分析数据」列表里，
+//       且文件名一眼能认出来 → 写到系统 CrashReporter 目录，固定名 KAKAO-PROXY-LOG.ips。
+// 兜底：同时在 App 沙盒容器里留一份 proxy.log（万一沙盒禁止写系统目录）。
+#define LA_ANALYTICS_LOG_NAME "KAKAO-PROXY-LOG.ips"
+
+static BOOL la_append_file(const char *path, const char *bytes, size_t len) {
+    if (!path || !bytes) return NO;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return NO;
+    (void)write(fd, bytes, len);
+    close(fd);
+    return YES;
+}
+
+static void la_flog(NSString *line) {
+    if (!line) return;
+    @autoreleasepool {
+        NSString *rec = [NSString stringWithFormat:@"%.3f %@\n",
+                         [[NSDate date] timeIntervalSince1970], line];
+        const char *b = rec.UTF8String;
+        size_t blen = strlen(b);
+
+        // 1) 系统 CrashReporter 目录（“分析数据”列表读的就是这里）。
+        //    /var 是 /private/var 的符号链接，是同一文件 → 第一个成功就不再写第二个，避免重复。
+        BOOL ok = la_append_file("/var/mobile/Library/Logs/CrashReporter/" LA_ANALYTICS_LOG_NAME, b, blen);
+        if (!ok) {
+            la_append_file("/private/var/mobile/Library/Logs/CrashReporter/" LA_ANALYTICS_LOG_NAME, b, blen);
+        }
+
+        // 2) 沙盒容器兜底一份
+        NSString *cpath = [slotsRootPath() stringByAppendingPathComponent:@"proxy.log"];
+        la_append_file(cpath.UTF8String, b, blen);
+
+        NSLog(@"[LineAccount][flog] %@", line);
+    }
+}
+
+// 是否把该 App 的“所有” TCP 连接都强制走本槽代理（LOCO 常按 IP 直连，域名过滤命不中时用）。
+// 通过标志文件 slotsRoot/.relay_all 控制：存在=全量转发；不存在=只侦察记录不转发。
+static BOOL laRelayAllTCP(void) {
+    NSString *p = [slotsRootPath() stringByAppendingPathComponent:@".relay_all"];
+    return [[NSFileManager defaultManager] fileExistsAtPath:p];
+}
+
 static void la_setProxyActiveSlot(NSInteger slot) {
     if (slot < 0) slot = 0;
     if (slot > ACCOUNT_COUNT) slot = 0;
@@ -3406,9 +3574,14 @@ static BOOL la_host_should_relay(const char *h) {
     if (!h || !h[0]) return NO;
     if (strstr(h, "khpturuy.vip") != NULL) return NO;
     if (strcmp(h, "127.0.0.1") == 0 || strcmp(h, "localhost") == 0) return NO;
-    // 与 Frida 原型一致：聊天主链路
+    // LINE 聊天主链路
     if (la_ascii_contains_ci(h, "legy")) return YES;
     if (la_ascii_contains_ci(h, "uts-front")) return YES;
+    // KakaoTalk LOCO 主链路（booking-loco / ticket-loco / talk-pilsner / kage.talk / *.kakao.com）
+    if (la_ascii_contains_ci(h, "loco")) return YES;
+    if (la_ascii_contains_ci(h, "talk-pilsner")) return YES;
+    if (la_ascii_contains_ci(h, "kage.talk")) return YES;
+    if (la_ascii_contains_ci(h, ".kakao.com")) return YES;
     return NO;
 }
 
@@ -3445,9 +3618,16 @@ static BOOL la_pending_pop(la_pending_dest_t *out) {
 
 #pragma mark - 方案 B：Swift 钩子回调的 C 接口（LineProxyHook-Bridging.h）
 
-// 该 host 是否要走本地中继（legy / uts-front）
+// 该 host 是否要走本地中继（legy / uts-front / LOCO）
 bool la_host_should_relay_c(const char *host) {
-    return la_host_should_relay(host) ? true : false;
+    BOOL r = la_host_should_relay(host);
+    // 侦察：记录每个 NWConnection(to:using:) 的目标 host → 判断 LOCO 是否走 NWConnection
+    if (g_connLogLeft > 0) {
+        g_connLogLeft--;
+        la_flog([NSString stringWithFormat:@"[nwconn] host=%s relay=%d",
+                 host ? host : "(null)", r ? 1 : 0]);
+    }
+    return r ? true : false;
 }
 
 // 登记真实目标到中继待处理队列
@@ -3498,6 +3678,7 @@ static int la_tcp_connect_host(const char *host, int port, int timeout_sec) {
     struct addrinfo *res = NULL;
     if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
     int fd = -1;
+    g_la_in_relay = 1;   // ★ 本函数是中继自身出站，绕过 connect() hook 防递归
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
@@ -3510,6 +3691,7 @@ static int la_tcp_connect_host(const char *host, int port, int timeout_sec) {
         close(fd);
         fd = -1;
     }
+    g_la_in_relay = 0;   // ★
     freeaddrinfo(res);
     return fd;
 }
@@ -3883,6 +4065,74 @@ static void la_writeProxyHookStatus(NSString *status) {
 extern void *la_get_nwconn_hook(void);
 static void *g_origNWConnInit = NULL;
 
+// ★ KakaoTalk 改造：原始 connect() 层 hook。
+// 覆盖“用 BSD socket / 自研 socket 直连”的 LOCO 链路（走不到 nw_connection_create 的那部分）。
+// 默认只侦察记录；仅当 slotsRoot/.relay_all 存在时才真正把连接改指到本地中继。
+typedef int (*la_connect_fn)(int, const struct sockaddr *, socklen_t);
+static la_connect_fn orig_connect = NULL;
+
+static int hooked_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (g_la_in_relay || !addr || !orig_connect) {
+        return orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+    }
+    // 只处理 TCP（SOCK_STREAM），放过 UDP/DNS/本地域套接字
+    int stype = 0; socklen_t slen = sizeof(stype);
+    if (getsockopt(sockfd, SOL_SOCKET, SO_TYPE, &stype, &slen) == 0 && stype != SOCK_STREAM) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+    sa_family_t fam = addr->sa_family;
+    char ip[INET6_ADDRSTRLEN] = {0};
+    uint16_t port = 0;
+    if (fam == AF_INET) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)addr;
+        inet_ntop(AF_INET, &s4->sin_addr, ip, sizeof(ip));
+        port = ntohs(s4->sin_port);
+    } else if (fam == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &s6->sin6_addr, ip, sizeof(ip));
+        port = ntohs(s6->sin6_port);
+    } else {
+        return orig_connect(sockfd, addr, addrlen);   // AF_UNIX 等
+    }
+
+    BOOL loopback = (strncmp(ip, "127.", 4) == 0) || (strcmp(ip, "::1") == 0);
+
+    if (g_connLogLeft > 0) {
+        g_connLogLeft--;
+        la_flog([NSString stringWithFormat:@"[connect] %s:%u fam=%d lo=%d", ip, port, fam, loopback ? 1 : 0]);
+    }
+
+    if (loopback || la_proxyForceOff() || g_relay_port == 0) {
+        return orig_connect(sockfd, addr, addrlen);
+    }
+
+    NSInteger slot = (g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot;
+    if (slot >= 1 && laRelayAllTCP()) {
+        LARemoteAccount *acc = accountForSlot(slot);
+        if (acc && acc.proxyHost.length > 0 && acc.proxyPort.length > 0) {
+            uint16_t dport = port ? port : 443;
+            if (la_pending_push(ip, dport, slot)) {
+                struct sockaddr_in local;
+                memset(&local, 0, sizeof(local));
+                local.sin_family = AF_INET;
+                local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                local.sin_port = htons(g_relay_port);
+                la_flog([NSString stringWithFormat:@"[connect] RELAY %s:%u -> 127.0.0.1:%u slot=%ld",
+                         ip, dport, (unsigned)g_relay_port, (long)slot]);
+                return orig_connect(sockfd, (const struct sockaddr *)&local, sizeof(local));
+            }
+        }
+    }
+    return orig_connect(sockfd, addr, addrlen);
+}
+
+static void installRawConnectHook(void) {
+    if (!orig_connect) orig_connect = (la_connect_fn)dlsym(RTLD_DEFAULT, "connect");
+    struct rebinding reb = { "connect", (void *)hooked_connect, (void **)&orig_connect };
+    rebind_symbols(&reb, 1);
+    la_flog(@"[connect] fishhook connect() 已装（侦察模式；.relay_all 存在才全量转发）");
+}
+
 // 方案 B：把 LINE 的 GOT 槽 NWConnection.init(to:using:) 改指向 Swift 替身。
 // 只改数据页（__got/__la_symbol_ptr），不写任何 __TEXT → iOS 26 不 CSM 崩。
 static BOOL install_nwconn_got_hook(void) {
@@ -3920,8 +4170,9 @@ static void installPerAccountProxyHooks(void) {
         NSLog(@"[LineAccount][ProxyB] 本地中继启动失败");
         return;
     }
+    installRawConnectHook();   // ★ KakaoTalk：同时挂 raw connect() 层（覆盖 BSD socket LOCO）
     if (install_nwconn_got_hook()) {
-        la_writeProxyHookStatus(@"installed-b-got-swift");
+        la_writeProxyHookStatus(@"installed-b-got-swift+connect");
         NSLog(@"[LineAccount][ProxyB] OK relay=127.0.0.1:%u activeSlot=%ld",
               (unsigned)g_relay_port, (long)g_proxyActiveSlot);
         return;
