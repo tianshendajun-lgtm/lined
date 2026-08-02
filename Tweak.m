@@ -32,6 +32,9 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
 
+// 前置声明：屏上日志（定义在文件后半段，诊断代码需提前用）
+static void la_flog(NSString *line);
+
 #define ACCOUNT_COUNT 100000
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
@@ -648,6 +651,9 @@ static NSURL *hooked_containerURL(id self, SEL _cmd, NSString *groupId) {
     if (groupId.length == 0) {
         return orig_containerURL ? orig_containerURL(self, _cmd, groupId) : nil;
     }
+    // 诊断：记录 App 请求的 App Group id（KakaoTalk 的 group 用于精确隔离偏好域）
+    static int g_grpLogLeft = 30;
+    if (g_grpLogLeft > 0) { g_grpLogLeft--; la_flog([NSString stringWithFormat:@"[grp] containerURL group=%@", groupId]); }
     // ★ 必须放在 Library/ 下：容器根目录 <UUID>/ 禁止新建顶层目录(EPERM)，
     //   否则 <UUID>/AppGroup 建不出来 → 其下所有 mkdir ENOENT → MessageExt CoreData 崩。
     NSString *path = [[[realHomePath() stringByAppendingPathComponent:@"Library"]
@@ -2920,6 +2926,30 @@ static void keychainSwap(NSInteger slot, BOOL addPrefix) {
 static void drainKeychainToSlot(NSInteger slot)  { keychainSwap(slot, YES); }
 static void fillKeychainFromSlot(NSInteger slot) { keychainSwap(slot, NO); }
 
+// ★ 只读诊断：开机把当前 Keychain 全部条目打进日志（class/service/account/accessGroup/sync），
+//   用来定位 KakaoTalk 的 SQLCipher 密钥/登录令牌到底放在哪个 service + access group，
+//   以便把按槽隔离精确覆盖到它（不再瞎猜）。account 只打长度，不泄露内容。
+static void la_dump_keychain_once(void) {
+    static BOOL done = NO;
+    if (done) return; done = YES;
+    CFTypeRef classes[] = { kSecClassGenericPassword, kSecClassInternetPassword };
+    const char *cnames[] = { "genp", "inet" };
+    int shown = 0;
+    for (int ci = 0; ci < 2; ci++) {
+        for (NSDictionary *it in kcAllItems(classes[ci])) {
+            if (shown >= 120) break;
+            shown++;
+            NSString *svc = [it[(__bridge id)kSecAttrService] isKindOfClass:[NSString class]] ? it[(__bridge id)kSecAttrService] : @"";
+            NSString *acct = [it[(__bridge id)kSecAttrAccount] isKindOfClass:[NSString class]] ? it[(__bridge id)kSecAttrAccount] : @"";
+            NSString *grp = [it[(__bridge id)kSecAttrAccessGroup] isKindOfClass:[NSString class]] ? it[(__bridge id)kSecAttrAccessGroup] : @"";
+            id sync = it[(__bridge id)kSecAttrSynchronizable];
+            la_flog([NSString stringWithFormat:@"[kc] %s svc=%@ acct=%@(len%lu) grp=%@ sync=%@",
+                     cnames[ci], svc, acct, (unsigned long)acct.length, grp, sync ?: @"0"]);
+        }
+    }
+    la_flog([NSString stringWithFormat:@"[kc] dump 完成，共 %d 条", shown]);
+}
+
 #pragma mark - 偏好域交换（第③层：把 cfprefsd 共享 bundle 域按槽搬进/搬出，堵 mid 泄漏）
 
 // mid 等登录态实际写在 cfprefsd 管理的共享 bundle 域(Library/Preferences/<bundleid>.plist)，
@@ -4700,6 +4730,7 @@ static void line_account_init(void) {
 
     installRuntimeHooks();
     installKeychainHooks();
+    la_dump_keychain_once();   // ★ 诊断：把当前 Keychain 布局打进日志，定位 KakaoTalk 密钥所在 service/access group
     installPerAccountProxyHooks();
     installURLSessionRecon();          // ★ KakaoTalk：NSURLSession 层侦察，记录所有请求 URL
     installURLSessionProxyInjection(); // ★ KakaoTalk：全量 HTTP 代理注入（connectionProxyDictionary）
