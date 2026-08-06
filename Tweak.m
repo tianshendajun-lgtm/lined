@@ -14,6 +14,7 @@
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <dlfcn.h>
 #import <sys/stat.h>
 #import <sys/socket.h>
@@ -1981,6 +1982,55 @@ static NSString *deviceClientUUID(void) {
         }
     });
     return cached;
+}
+
+#pragma mark - IDFV(identifierForVendor)按槽伪装
+
+// ★ 目标(③)：KakaoTalk 读 -[UIDevice identifierForVendor] 当 kakao_vendor_id / [SID] 上送 Kakao，
+//   系统给的是「设备+厂商」级、所有槽共享的固定值 → 多账号会被服务端关联成同一设备。
+//   这里按当前激活槽确定性派生一个稳定的假 IDFV：
+//     IDFV(slot) = 前16字节( SHA256("IDFV.v1|" + 本机LineAccount.DeviceId + "|slot=N") ) → 拼成 UUID
+//   性质：①同槽每次启动/重装恒定不变(纯函数，无随机)；②不同槽不同；③掺入本机设备ID → 换台手机
+//   即使同槽号也不同，避免两机相撞。绝不触碰你自己的 LineAccount.DeviceId(①，仍设备级共享给你后台)。
+static NSInteger readCurrentSlot(void);   // 前置声明（定义在后文）
+
+static NSUUID *slotVendorUUID(NSInteger slot) {
+    NSString *seed = [NSString stringWithFormat:@"IDFV.v1|%@|slot=%ld",
+                      deviceClientUUID() ?: @"nodev", (long)slot];
+    NSData *d = [seed dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char h[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(d.bytes, (CC_LONG)d.length, h);
+    unsigned char uu[16];
+    memcpy(uu, h, 16);
+    // 打上 RFC4122 v4 版本/variant 位，格式更像真 IDFV（KakaoTalk 只当字符串用，纯为逼真）
+    uu[6] = (uu[6] & 0x0F) | 0x40;
+    uu[8] = (uu[8] & 0x3F) | 0x80;
+    return [[NSUUID alloc] initWithUUIDBytes:uu];
+}
+
+typedef NSUUID *(*IDFV_t)(id, SEL);
+static IDFV_t orig_identifierForVendor = NULL;
+static NSUUID *hooked_identifierForVendor(id self, SEL _cmd) {
+    NSInteger slot = readCurrentSlot();
+    NSUUID *u = slotVendorUUID(slot);
+    // 一次性把伪装值打到屏上日志（[sw] 前缀在安静模式白名单内，一定可见）；之后同值不再刷。
+    static NSInteger s_loggedSlot = -999999;   // 槽号实际为 0 或正数，此哨兵永不相等
+    if (s_loggedSlot != slot) {
+        s_loggedSlot = slot;
+        la_flog([NSString stringWithFormat:@"[sw] IDFV 伪装 slot=%ld → %@", (long)slot, u.UUIDString]);
+    }
+    return u;
+}
+
+static void installIDFVHook(void) {
+    Class dev = [UIDevice class];
+    Method m = class_getInstanceMethod(dev, @selector(identifierForVendor));
+    if (m) {
+        orig_identifierForVendor = (IDFV_t)method_setImplementation(m, (IMP)hooked_identifierForVendor);
+        NSLog(@"[LineAccount] IDFV hook installed (identifierForVendor 按槽伪装)");
+    } else {
+        NSLog(@"[LineAccount] IDFV hook 失败：找不到 -[UIDevice identifierForVendor]");
+    }
 }
 
 static LARemoteAccount *accountForSlot(NSInteger slot) {
@@ -5048,12 +5098,20 @@ static void la_boot_db_probe(void) {
             for (NSString *name in listChildrenPOSIX(prefsDir)) {
                 if (![name hasSuffix:@".plist"]) continue;
                 NSString *dom = [name substringToIndex:name.length - 6]; // 去 .plist
-                BOOL covered = [covSet containsObject:dom];
                 struct stat st;
                 long long sz = (lstat([[prefsDir stringByAppendingPathComponent:name] fileSystemRepresentation], &st) == 0)
                                ? (long long)st.st_size : -1;
-                la_flog([NSString stringWithFormat:@"[dbg] prefsDir %@ %@ (%lldB)",
-                         covered ? @"✓" : @"★未搬", dom, sz]);
+                // 三态标签(避免误判)：
+                //  ✓cfprefs = 走 CFPreferences 按槽 drain/fill(bundle+group+其余非系统域)
+                //  ✓文件层  = KakaoTalk 自有 .properties 文件，走 swapRelItemsUnder 文件搬运隔离
+                //  系统域   = com.apple.*，故意不隔离(碰了破坏系统证明/风控)，全局共享是正常的
+                //  ★未搬    = 以上都不是 → 真·泄漏源，需要处理
+                NSString *tag;
+                if ([covSet containsObject:dom])          tag = @"✓cfprefs";
+                else if ([dom hasSuffix:@".properties"])  tag = @"✓文件层";
+                else if ([dom hasPrefix:@"com.apple."])   tag = @"系统域(不隔离)";
+                else                                       tag = @"★未搬";
+                la_flog([NSString stringWithFormat:@"[dbg] prefsDir %@ %@ (%lldB)", tag, dom, sz]);
             }
         }
 
@@ -5153,6 +5211,7 @@ static void line_account_init(void) {
     NSLog(@"[LineAccount] realHome=%@ slots=%@", realHomePath(), slotsRootPath());
 
     installRuntimeHooks();
+    installIDFVHook();   // ★ ③ IDFV(identifierForVendor) 按槽伪装，堵 kakao_vendor_id 跨号泄漏
     installKeychainHooks();
     if (!laNetQuiet() || g_diagCaptureBoot) la_dump_keychain_once();   // 全量模式(.netlog)或换号启动才 dump keychain
     installPerAccountProxyHooks();
