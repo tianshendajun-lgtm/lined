@@ -35,7 +35,7 @@
 #define ACCOUNT_COUNT 100000
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
-#define LINE_BUILD_ID @"got-swift-b v31"
+#define LINE_BUILD_ID @"got-swift-b v32 (relay all LINE hosts)"
 // ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（仅调试）
 #define LA_DISABLE_ALL_PROXY_INJECT 0
 // ★ v28：方案 B（GOT 重绑 Swift NWConnection.init → 本地中继）。1=用 B（26 安全，不写 __TEXT）
@@ -3523,11 +3523,26 @@ static BOOL la_ascii_contains_ci(const char *hay, const char *needle) {
 
 static BOOL la_host_should_relay(const char *h) {
     if (!h || !h[0]) return NO;
+    // 多登后端自有配置域名：保持直连（不是 LINE 流量）
     if (strstr(h, "khpturuy.vip") != NULL) return NO;
     if (strcmp(h, "127.0.0.1") == 0 || strcmp(h, "localhost") == 0) return NO;
-    // 与 Frida 原型一致：聊天主链路
-    if (la_ascii_contains_ci(h, "legy")) return YES;
-    if (la_ascii_contains_ci(h, "uts-front")) return YES;
+    // ★ v32：不再只代走聊天主链路，改为覆盖所有 LINE 自有域名，
+    //   把媒体/OBS/CDN/贴图/头像/统计一并走代理，杜绝真实 IP 从这些渠道穿透。
+    //   非 LINE 域名（Apple/系统/第三方）仍直连，避免误伤与回环。
+    static const char *kLineHostTokens[] = {
+        "legy",         // 聊天/事件主网关
+        "uts-front",    // UTS 前端
+        "line-apps",    // legy/uts/gw 等 *.line-apps.com
+        "line-scdn",    // 图片/头像/贴图/文件 OBS CDN
+        "line-cdn",
+        "line.naver",   // gw/gd2/sdl-stickershop.line.naver.jp
+        "naver.jp",     // LINE 的 JP 基础设施
+        "linecorp",     // nelo 崩溃/公司域
+        "line.me",
+    };
+    for (size_t i = 0; i < sizeof(kLineHostTokens) / sizeof(kLineHostTokens[0]); i++) {
+        if (la_ascii_contains_ci(h, kLineHostTokens[i])) return YES;
+    }
     return NO;
 }
 
