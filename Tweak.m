@@ -36,8 +36,9 @@
 #define SLOT_DIR_NAME @"LineAccountSlots"
 #define SELECTED_SLOT_KEY @"LineAccount.SelectedSlot"
 #define LINE_BUILD_ID @"got-swift-b v32 (relay all LINE hosts)"
-// ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（仅调试）
-#define LA_DISABLE_ALL_PROXY_INJECT 0
+// ★ v27：方案 C（本地 HTTP CONNECT 中继）。0=启用；1=完全不装（纯直连）
+// 代理已过期，强制关闭，登录不再走上游代理
+#define LA_DISABLE_ALL_PROXY_INJECT 1
 // ★ v28：方案 B（GOT 重绑 Swift NWConnection.init → 本地中继）。1=用 B（26 安全，不写 __TEXT）
 #define LA_USE_SCHEME_B 1
 // LINE 导入的 Swift 符号：NWConnection.__allocating_init(to:using:)
