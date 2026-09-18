@@ -3887,10 +3887,10 @@ static void hookAppDelegate(void) {
     });
 }
 
-#pragma mark - 每账号 HTTP 代理（方案 C：本地 CONNECT 中继 + 改写端点）
+#pragma mark - 每账号 HTTP/SOCKS5 代理（方案 C：本地 CONNECT 中继 + 改写端点）
 
-// Frida probe_proxyC 已验证：改写 legy/uts → 127.0.0.1 本地中继，再 HTTP CONNECT
-// 上游代理。代理 host/port/user/pass 仍来自远程 JSON（按账号槽）。
+// Frida probe_proxyC 已验证：改写 legy/uts → 127.0.0.1 本地中继，再按 proxyType
+// 走 HTTP CONNECT 或 SOCKS5。代理 host/port/user/pass/type 仍来自远程 JSON（按账号槽）。
 // 方案 A（nw PAC）已弃用：prohibit=0 会直连，=1 不稳定。
 
 typedef void *la_nw_object_t;
@@ -4217,6 +4217,188 @@ static int la_http_connect_tunnel(int upfd, const char *destHost, uint16_t destP
     return (code == 200) ? 0 : code;
 }
 
+static BOOL la_proxy_is_socks5(NSString *type) {
+    NSString *t = [type lowercaseString];
+    return [t isEqualToString:@"socks5"] || [t isEqualToString:@"socks"] || [t isEqualToString:@"socks5h"];
+}
+
+static int la_recv_exact(int fd, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = recv(fd, p + off, len - off, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+// SOCKS5 CONNECT（RFC 1928）+ 用户名密码（RFC 1929）。成功返回 0。
+static int la_socks5_connect_tunnel(int upfd, const char *destHost, uint16_t destPort,
+                                    NSString *user, NSString *pass) {
+    if (!destHost || destHost[0] == 0 || destPort == 0) return -1;
+
+    uint8_t greet[4];
+    size_t greetLen;
+    if (user.length > 0) {
+        greet[0] = 0x05; greet[1] = 0x02; greet[2] = 0x00; greet[3] = 0x02;
+        greetLen = 4;
+    } else {
+        greet[0] = 0x05; greet[1] = 0x01; greet[2] = 0x00;
+        greetLen = 3;
+    }
+    if (la_send_all(upfd, greet, greetLen) != 0) return -1;
+
+    uint8_t gresp[2];
+    if (la_recv_exact(upfd, gresp, 2) != 0) return -1;
+    if (gresp[0] != 0x05) return -2;
+    if (gresp[1] == 0xFF) return -3;
+
+    if (gresp[1] == 0x02) {
+        const char *u = user.UTF8String ?: "";
+        const char *pw = pass.UTF8String ?: "";
+        size_t ulen = strlen(u);
+        size_t plen = strlen(pw);
+        if (ulen > 255 || plen > 255) return -4;
+        uint8_t abuf[1 + 1 + 255 + 1 + 255];
+        size_t off = 0;
+        abuf[off++] = 0x01;
+        abuf[off++] = (uint8_t)ulen;
+        memcpy(abuf + off, u, ulen);
+        off += ulen;
+        abuf[off++] = (uint8_t)plen;
+        memcpy(abuf + off, pw, plen);
+        off += plen;
+        if (la_send_all(upfd, abuf, off) != 0) return -1;
+        uint8_t aresp[2];
+        if (la_recv_exact(upfd, aresp, 2) != 0) return -1;
+        if (aresp[0] != 0x01 || aresp[1] != 0x00) return -5;
+    } else if (gresp[1] != 0x00) {
+        return -6;
+    }
+
+    uint8_t req[4 + 1 + 255 + 2];
+    size_t roff = 0;
+    req[roff++] = 0x05;
+    req[roff++] = 0x01;
+    req[roff++] = 0x00;
+
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET, destHost, &addr4) == 1) {
+        req[roff++] = 0x01;
+        memcpy(req + roff, &addr4, 4);
+        roff += 4;
+    } else if (inet_pton(AF_INET6, destHost, &addr6) == 1) {
+        req[roff++] = 0x04;
+        memcpy(req + roff, &addr6, 16);
+        roff += 16;
+    } else {
+        size_t hlen = strlen(destHost);
+        if (hlen == 0 || hlen > 255) return -7;
+        req[roff++] = 0x03;
+        req[roff++] = (uint8_t)hlen;
+        memcpy(req + roff, destHost, hlen);
+        roff += hlen;
+    }
+    uint16_t nport = htons(destPort);
+    memcpy(req + roff, &nport, 2);
+    roff += 2;
+    if (la_send_all(upfd, req, roff) != 0) return -1;
+
+    uint8_t rhead[4];
+    if (la_recv_exact(upfd, rhead, 4) != 0) return -1;
+    if (rhead[0] != 0x05) return -8;
+    if (rhead[1] != 0x00) return (int)rhead[1] ? (int)rhead[1] : -8;
+
+    size_t alen = 0;
+    if (rhead[3] == 0x01) {
+        alen = 4;
+    } else if (rhead[3] == 0x04) {
+        alen = 16;
+    } else if (rhead[3] == 0x03) {
+        uint8_t dlen = 0;
+        if (la_recv_exact(upfd, &dlen, 1) != 0) return -1;
+        alen = dlen;
+    } else {
+        return -9;
+    }
+    uint8_t skip[257];
+    if (alen + 2 > sizeof(skip)) return -9;
+    if (la_recv_exact(upfd, skip, alen + 2) != 0) return -1;
+    return 0;
+}
+
+static int la_upstream_open_tunnel(int upfd, const char *destHost, uint16_t destPort,
+                                   NSString *user, NSString *pass, NSString *type) {
+    if (la_proxy_is_socks5(type)) {
+        return la_socks5_connect_tunnel(upfd, destHost, destPort, user, pass);
+    }
+    return la_http_connect_tunnel(upfd, destHost, destPort, user, pass);
+}
+
+// 把本地中继收到的绝对形式 HTTP 请求改成源站形式，并解析 host:port。
+static BOOL la_http_abs_to_origin(const char *buf, size_t filled,
+                                  char *hostOut, size_t hostCap, int *portOut,
+                                  NSMutableData *originReq) {
+    if (!buf || !hostOut || !portOut || !originReq || hostCap < 2) return NO;
+    const char *eol = strstr(buf, "\r\n");
+    if (!eol) return NO;
+    char method[16] = {0};
+    char url[2048] = {0};
+    char ver[16] = {0};
+    if (sscanf(buf, "%15s %2047s %15s", method, url, ver) < 2) return NO;
+
+    const char *p = url;
+    int port = 80;
+    if (strncmp(p, "https://", 8) == 0) { p += 8; port = 443; }
+    else if (strncmp(p, "http://", 7) == 0) { p += 7; port = 80; }
+
+    const char *slash = strchr(p, '/');
+    const char *hostEnd = slash ? slash : p + strlen(p);
+    char hostport[300] = {0};
+    size_t hplen = (size_t)(hostEnd - p);
+    if (hplen == 0 || hplen >= sizeof(hostport)) return NO;
+    memcpy(hostport, p, hplen);
+    hostport[hplen] = 0;
+
+    char host[300] = {0};
+    if (hostport[0] == '[') {
+        const char *rb = strchr(hostport, ']');
+        if (!rb) return NO;
+        size_t hl = (size_t)(rb - hostport - 1);
+        if (hl == 0 || hl >= sizeof(host)) return NO;
+        memcpy(host, hostport + 1, hl);
+        if (rb[1] == ':') port = atoi(rb + 2);
+    } else {
+        const char *col = strrchr(hostport, ':');
+        if (col) {
+            size_t hl = (size_t)(col - hostport);
+            if (hl == 0 || hl >= sizeof(host)) return NO;
+            memcpy(host, hostport, hl);
+            port = atoi(col + 1);
+        } else {
+            strncpy(host, hostport, sizeof(host) - 1);
+        }
+    }
+    if (host[0] == 0) return NO;
+    strncpy(hostOut, host, hostCap - 1);
+    hostOut[hostCap - 1] = 0;
+    *portOut = port > 0 ? port : 80;
+
+    const char *path = slash ? slash : "/";
+    NSString *line = [NSString stringWithFormat:@"%s %s %s\r\n", method, path, ver[0] ? ver : "HTTP/1.1"];
+    [originReq appendData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    const char *rest = eol + 2;
+    size_t restOff = (size_t)(rest - buf);
+    if (filled > restOff) [originReq appendBytes:rest length:filled - restOff];
+    return YES;
+}
+
 static void la_pipe_one_way(int from, int to) {
     char buf[16384];
     while (1) {
@@ -4234,7 +4416,7 @@ static void la_pipe_one_way(int from, int to) {
 
 // ★ KakaoTalk：iOS 通过 connectionProxyDictionary 把请求发到本地中继，形式是标准 HTTP 代理协议：
 //    HTTPS → "CONNECT host:port"；HTTP → 绝对形式 "GET http://host/... "。
-//    中继解析出目标后，用与 LINE 相同的 la_http_connect_tunnel（CONNECT+Basic 认证）连上游代理。
+//    中继解析出目标后，按 proxyType 用 HTTP CONNECT 或 SOCKS5 连上游代理。
 static void la_relay_handle_http_proxy_client(int clientFd) {
     @autoreleasepool {
         char buf[8192];
@@ -4250,11 +4432,12 @@ static void la_relay_handle_http_proxy_client(int clientFd) {
 
         // 当前账号的上游代理
         NSInteger slot = (g_selectedSlot >= 1) ? g_selectedSlot : g_proxyActiveSlot;
-        NSString *pHost = nil, *pPort = nil, *pUser = nil, *pPass = nil;
+        NSString *pHost = nil, *pPort = nil, *pUser = nil, *pPass = nil, *pType = nil;
         @synchronized ([LARemoteAccount class]) {
             LARemoteAccount *acc = accountForSlot(slot);
             if (acc) { pHost = [acc.proxyHost copy]; pPort = [acc.proxyPort copy];
-                       pUser = [acc.proxyUser copy]; pPass = [acc.proxyPass copy]; }
+                       pUser = [acc.proxyUser copy]; pPass = [acc.proxyPass copy];
+                       pType = [acc.proxyType copy]; }
         }
         if (pHost.length == 0 || pPort.length == 0) {
             la_flog([NSString stringWithFormat:@"[proxy] slot=%ld 无代理→关连接", (long)slot]);
@@ -4269,9 +4452,10 @@ static void la_relay_handle_http_proxy_client(int clientFd) {
         if (strncmp(buf, "CONNECT ", 8) == 0) {
             char host[300] = {0}; int port = 443;
             if (sscanf(buf + 8, "%299[^: ]:%d", host, &port) < 1) { close(upfd); close(clientFd); return; }
-            int cret = la_http_connect_tunnel(upfd, host, (uint16_t)port, pUser, pPass);
+            int cret = la_upstream_open_tunnel(upfd, host, (uint16_t)port, pUser, pPass, pType);
             if (cret != 0) {
-                la_flog([NSString stringWithFormat:@"[proxy] CONNECT 失败 %s:%d via %@ code=%d", host, port, pHost, cret]);
+                la_flog([NSString stringWithFormat:@"[proxy] %@ 失败 %s:%d via %@ code=%d",
+                         la_proxy_is_socks5(pType) ? @"SOCKS5" : @"CONNECT", host, port, pHost, cret]);
                 close(upfd); close(clientFd); return;
             }
             const char *ok = "HTTP/1.1 200 Connection established\r\n\r\n";
@@ -4279,7 +4463,21 @@ static void la_relay_handle_http_proxy_client(int clientFd) {
             // 若 CONNECT 头后已带了数据（少见），先转给上游
             char *hdrEnd = strstr(buf, "\r\n\r\n");
             if (hdrEnd) { size_t hdrLen = (size_t)(hdrEnd - buf) + 4; if (filled > hdrLen) la_send_all(upfd, buf + hdrLen, filled - hdrLen); }
-            if (g_connLogLeft > 0) { g_connLogLeft--; la_flog([NSString stringWithFormat:@"[proxy] TUNNEL %s:%d via %@:%@ slot=%ld", host, port, pHost, pPort, (long)slot]); }
+            if (g_connLogLeft > 0) { g_connLogLeft--; la_flog([NSString stringWithFormat:@"[proxy] TUNNEL %s:%d via %@:%@ (%@) slot=%ld", host, port, pHost, pPort, la_proxy_is_socks5(pType) ? @"socks5" : @"http", (long)slot]); }
+        } else if (la_proxy_is_socks5(pType)) {
+            // 绝对形式 HTTP + SOCKS5 上游：先对目标建隧道，再改成源站形式发出（不能带 Proxy-Authorization）
+            char host[300] = {0}; int port = 80;
+            NSMutableData *origin = [NSMutableData data];
+            if (!la_http_abs_to_origin(buf, filled, host, sizeof(host), &port, origin)) {
+                close(upfd); close(clientFd); return;
+            }
+            int cret = la_upstream_open_tunnel(upfd, host, (uint16_t)port, pUser, pPass, pType);
+            if (cret != 0) {
+                la_flog([NSString stringWithFormat:@"[proxy] SOCKS5 失败 %s:%d via %@ code=%d", host, port, pHost, cret]);
+                close(upfd); close(clientFd); return;
+            }
+            if (la_send_all(upfd, origin.bytes, origin.length) != 0) { close(upfd); close(clientFd); return; }
+            if (g_connLogLeft > 0) { g_connLogLeft--; la_flog([NSString stringWithFormat:@"[proxy] HTTP via SOCKS5 %@:%@ slot=%ld", pHost, pPort, (long)slot]); }
         } else {
             // 绝对形式 HTTP：把首行后插入 Proxy-Authorization，再原样转发已读到的头
             char *eol = strstr(buf, "\r\n");
@@ -4323,7 +4521,7 @@ static void la_relay_handle_client(int clientFd) {
         }
 
         // 拷贝代理字段，避免后台线程长时间持有 remote 对象
-        NSString *pHost = nil, *pPort = nil, *pUser = nil, *pPass = nil;
+        NSString *pHost = nil, *pPort = nil, *pUser = nil, *pPass = nil, *pType = nil;
         @synchronized ([LARemoteAccount class]) {
             LARemoteAccount *acc = accountForSlot(dest.slot);
             if (acc) {
@@ -4331,6 +4529,7 @@ static void la_relay_handle_client(int clientFd) {
                 pPort = [acc.proxyPort copy];
                 pUser = [acc.proxyUser copy];
                 pPass = [acc.proxyPass copy];
+                pType = [acc.proxyType copy];
             }
         }
         if (pHost.length == 0 || pPort.length == 0) {
@@ -4349,9 +4548,10 @@ static void la_relay_handle_client(int clientFd) {
             return;
         }
 
-        int cret = la_http_connect_tunnel(upfd, dest.host, dest.port, pUser, pPass);
+        int cret = la_upstream_open_tunnel(upfd, dest.host, dest.port, pUser, pPass, pType);
         if (cret != 0) {
-            NSLog(@"[LineAccount][ProxyC] CONNECT 失败 %s:%u via %@:%@ code=%d",
+            NSLog(@"[LineAccount][ProxyC] %@ 失败 %s:%u via %@:%@ code=%d",
+                  la_proxy_is_socks5(pType) ? @"SOCKS5" : @"CONNECT",
                   dest.host, dest.port, pHost, pPort, cret);
             close(upfd);
             close(clientFd);
@@ -4360,8 +4560,9 @@ static void la_relay_handle_client(int clientFd) {
 
         if (g_proxyHookEnterLogLeft > 0) {
             g_proxyHookEnterLogLeft--;
-            NSLog(@"[LineAccount][ProxyC] TUNNEL OK slot=%ld %s:%u via %@:%@ (logleft=%d)",
+            NSLog(@"[LineAccount][ProxyC] TUNNEL OK slot=%ld %s:%u via %@:%@ (%@ logleft=%d)",
                   (long)dest.slot, dest.host, dest.port, pHost, pPort,
+                  la_proxy_is_socks5(pType) ? @"socks5" : @"http",
                   g_proxyHookEnterLogLeft);
         }
 
@@ -4820,6 +5021,8 @@ static void la_applyProxyToConfig(NSURLSessionConfiguration *cfg) {
     }
 
     // 退路：中继没起来，直连上游（iOS 自己带认证，可能不吃 407）
+    // SOCKS5 不能塞进 HTTPEnable，否则会把 SOCKS 服务器当 HTTP 代理用。
+    if (la_proxy_is_socks5(acc.proxyType)) return;
     NSInteger port = acc.proxyPort.integerValue;
     if (port <= 0) return;
     d[@"HTTPEnable"]  = @YES; d[@"HTTPProxy"]  = acc.proxyHost; d[@"HTTPPort"]  = @(port);
