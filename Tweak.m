@@ -27,6 +27,7 @@
 #import <unistd.h>
 #import <dirent.h>
 #import <errno.h>
+#import <signal.h>
 #import <stdlib.h>
 #import <stdio.h>
 
@@ -4140,11 +4141,33 @@ bool la_proxy_off_c(void) {
     return la_proxyForceOff() ? true : false;
 }
 
+// 对端已关闭时 send() 默认向进程发 SIGPIPE，系统会直接杀掉 App。
+// WiFi / PacketTunnel 再挂一层代理时，外层经常 RST/FIN，必须改成只返回 EPIPE。
+static void la_ignore_sigpipe(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_IGN;
+        sigaction(SIGPIPE, &sa, NULL);
+    });
+}
+
+static void la_set_nosigpipe(int fd) {
+    if (fd < 0) return;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+}
+
 static int la_send_all(int fd, const void *buf, size_t len) {
+    la_ignore_sigpipe();
     const char *p = (const char *)buf;
     size_t off = 0;
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
     while (off < len) {
-        ssize_t n = send(fd, p + off, len - off, 0);
+        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -4170,6 +4193,7 @@ static int la_tcp_connect_host(const char *host, int port, int timeout_sec) {
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
+        la_set_nosigpipe(fd);
         struct timeval tv;
         tv.tv_sec = timeout_sec;
         tv.tv_usec = 0;
@@ -4585,6 +4609,7 @@ static void la_relay_handle_client(int clientFd) {
 static BOOL la_start_local_relay(void) {
     if (g_relay_started && g_relay_port > 0) return YES;
 
+    la_ignore_sigpipe();
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         NSLog(@"[LineAccount][ProxyC] socket 失败 errno=%d", errno);
@@ -4627,6 +4652,7 @@ static BOOL la_start_local_relay(void) {
                 usleep(50000);
                 continue;
             }
+            la_set_nosigpipe(cfd);
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
                 la_relay_handle_client(cfd);
             });
